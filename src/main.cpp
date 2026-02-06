@@ -120,6 +120,9 @@ void setup() {
         Serial.println("PMU FAIL");
     }
     PMU.disableTSPinMeasure();
+    PMU.enableBattVoltageMeasure();
+    PMU.enableBattDetection();
+    PMU.enableCellbatteryCharge();
     
     loadSettings();
     settings.report_interval_mins = 1; // FORCE 1m for testing
@@ -141,7 +144,15 @@ void setup() {
     modemPowerOn();
     Serial.println("Starting GPS/GNSS...");
     modem.sendAT("+CGNSPWR=1"); // Turn on GNSS
-    modem.waitResponse();
+    if (modem.waitResponse() != 1) {
+        Serial.println("GNSS Power ON FAIL");
+    }
+    
+    // Debug: Check initial Battery
+    Serial.printf("[DEBUG] Initial Battery: %.2fV, %d%%, Inserted: %s\n", 
+        PMU.getBattVoltage() / 1000.0, 
+        PMU.getBatteryPercent(),
+        PMU.isBatteryConnect() ? "YES" : "NO");
 
     // Centralized BLE initialization
     // Standardize Name: "AE Tracker <MAC>" (Space instead of dash, matching requests)
@@ -195,6 +206,7 @@ void setup() {
                     status.lon = lon;
                     status.speed = speed;
                     status.sats = usat;
+                    status.hdop = acc; // Store Accuracy as HDOP
                     status.gps_fix = true;
                 } else {
                     status.gps_fix = false;
@@ -206,6 +218,10 @@ void setup() {
                 
                 if (status.gps_fix) status.gsm_status = "GPS Fix! Net: " + String(regStatus);
                 else status.gsm_status = "Searching GPS... Net: " + String(regStatus);
+
+                Serial.printf("[DEBUG] Loop Poll: Bat=%.2fV SOC=%d%% RSSI=%d GPS=%s SATS=%d\n",
+                    status.battery_voltage, status.battery_soc, status.rssi, 
+                    status.gps_fix ? "FIX" : "NO_FIX", status.sats);
 
                 // Push Updates
                 ble.updateStatus(status);
@@ -291,8 +307,9 @@ void setup() {
                 
                 float batt_volts = PMU.getBattVoltage() / 1000.0F;
                 int batt_soc = PMU.getBatteryPercent();
+                float vbus_volts = PMU.getVbusVoltage() / 1000.0F;
                 
-                doc["voltage"] = batt_volts; 
+                doc["voltage"] = vbus_volts; 
                 doc["device_voltage"] = batt_volts; 
                 doc["battery_voltage"] = batt_volts; 
                 doc["soc"] = batt_soc;

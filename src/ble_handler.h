@@ -18,6 +18,7 @@ struct TrackerStatus {
     int battery_soc;
     bool gps_fix;
     int sats;
+    float hdop; // Added
     float lat;
     float lon;
     float speed;

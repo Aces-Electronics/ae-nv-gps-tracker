@@ -184,9 +184,9 @@ void BLEHandler::updateStatus(const TrackerStatus& status) {
 
 void BLEHandler::updateGps(const TrackerStatus& status) {
     if (pGpsChar) {
-        // App expects "lat,lng,speed,sats"
+        // App expects "lat,lng,speed,sats,hdop"
         char buf[128];
-        snprintf(buf, sizeof(buf), "%.6f,%.6f,%.2f,%d", status.lat, status.lon, status.speed, status.sats);
+        snprintf(buf, sizeof(buf), "%.6f,%.6f,%.2f,%d,%.2f", status.lat, status.lon, status.speed, status.sats, status.hdop);
         
         size_t len = strlen(buf);
         Serial.printf("[BLE-DEBUG] GPS Payload (%d bytes): %s [HEX: ", len, buf);
