@@ -121,16 +121,11 @@ void setup() {
     }
     PMU.disableTSPinMeasure();
     
-    pinMode(0, INPUT_PULLUP); // Boot Button
-    if (digitalRead(0) == LOW) {
-        stay_awake = true;
-        Serial.println("DEBUG MODE: STAY AWAKE ENABLED");
-        settings.report_interval_mins = 1; // Force 1m even if not in NVS
-    }
-
     loadSettings();
-    settings.report_interval_mins = 1; // FORCE 60s for rapid testing
+    settings.report_interval_mins = 1; // FORCE 1m for testing
     Serial.println("Forcing 1-minute test interval (ADMIN MODE).");
+
+    pinMode(0, INPUT_PULLUP); // Boot Button
     
     strip.begin();
     strip.setPixelColor(0, 0, 0, 255); // Blue (BLE Mode)
@@ -142,6 +137,11 @@ void setup() {
     
     unsigned long ble_start = millis();
     while (millis() - ble_start < 90000 || ble.isConnected()) {
+        if (digitalRead(0) == LOW) {
+            stay_awake = true;
+            Serial.println("\n[DEBUG] Stay Awake Triggered by Button Press!");
+        }
+        
         if (ble.isConnected()) {
             strip.setPixelColor(0, 0, 255, 255); // Cyan (Connected)
             strip.show();
@@ -214,6 +214,8 @@ void setup() {
     modem.waitResponse();
 
     modem.sendAT("+CMNB=1"); // Set to Cat-M only for Telstra preference
+    modem.waitResponse();
+    modem.sendAT("+COPS=0"); // Force automatic registration
     modem.waitResponse();
     modem.setNetworkMode(2); // Automatic mode
     modem.setPreferredMode(3); // CAT-M/NB-IoT
