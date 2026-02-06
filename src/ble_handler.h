@@ -28,7 +28,7 @@ struct TrackerStatus {
 class BLEHandler {
 public:
     BLEHandler();
-    void begin(const String& deviceName, TrackerSettings& settings);
+    void begin(const String& deviceName, TrackerSettings& settings, float batteryVoltage);
     void updateStatus(const TrackerStatus& status);
     void updateGps(const TrackerStatus& status); // New method
     bool isConnected();

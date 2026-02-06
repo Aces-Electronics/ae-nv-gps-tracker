@@ -144,14 +144,20 @@ void setup() {
     modem.waitResponse();
 
     // Centralized BLE initialization
+    // Standardize Name: "AE Tracker <MAC>" (Space instead of dash, matching requests)
+    String bleName = "AE Tracker " + String((uint32_t)ESP.getEfuseMac(), HEX);
+    
     Serial.println("\n=== BLE Configuration Window (90 seconds + Connect) ===");
-    BLEDevice::init(("AE-Tracker-" + String((uint32_t)ESP.getEfuseMac(), HEX)).c_str());
+    BLEDevice::init(bleName.c_str());
     BLEDevice::setMTU(517);
     Serial.println("[BLE] NimBLE initialized with MTU=517");
     
+    // Get initial voltage for Manufacturer Data
+    float initialVolts = PMU.getBattVoltage() / 1000.0;
+    
     // BLE Window
-    ble.begin("AE-Tracker-" + String((uint32_t)ESP.getEfuseMac(), HEX), settings);
-    Serial.println("BLE Advertising...");
+    ble.begin(bleName, settings, initialVolts);
+    Serial.println("BLE Advertising (" + bleName + ")...");
     Serial.println("===========================================\n");
     
     unsigned long ble_start = millis();
@@ -277,9 +283,13 @@ void setup() {
                 doc["alt"] = alt;
                 doc["speed"] = speed;
                 doc["sats"] = usat;
-                doc["voltage"] = 0.00; // Supply voltage (placeholder for future hardware)
-                doc["device_voltage"] = PMU.getBattVoltage() / 1000.0F; // Internal battery voltage
-                doc["battery_voltage"] = PMU.getBattVoltage() / 1000.0F; // Internal battery voltage (Legacy alias)
+                
+                float batt_volts = PMU.getBattVoltage() / 1000.0F;
+                
+                doc["voltage"] = batt_volts; // FIX: Populate supply voltage for Web UI
+                doc["device_voltage"] = batt_volts; 
+                doc["battery_voltage"] = batt_volts; 
+                
                 doc["rssi"] = modem.getSignalQuality();
                 doc["interval"] = settings.report_interval_mins;
                 

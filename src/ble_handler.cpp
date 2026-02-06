@@ -74,7 +74,7 @@ BLEHandler::BLEHandler() : pServer(nullptr), pService(nullptr), _settings(nullpt
     _connTime = 0;
 }
 
-void BLEHandler::begin(const String& deviceName, TrackerSettings& settings) {
+void BLEHandler::begin(const String& deviceName, TrackerSettings& settings, float batteryVoltage) {
     _settings = &settings;
     
     // Security DISABLED for verification
@@ -135,8 +135,35 @@ void BLEHandler::begin(const String& deviceName, TrackerSettings& settings) {
     pAdv->setMinPreferred(0x06);
     pAdv->setMaxPreferred(0x0C);
     
+    // Add Manufacturer Data for Battery Scan (Mv as uint16 LE)
+    String mfgData = "";
+    uint16_t voltMv = (uint16_t)(batteryVoltage * 1000);
+    // Company ID (Espressif - 0x02E5) - reversed? No, NimBLE usually expects correct endianness or byte string
+    // App expects 0x02E5 key. setManufacturerData takes a string.
+    // We must manually construct the string where the internal key is not part of the data if using setManufacturerData? 
+    // NimBLE syntax: setManufacturerData(std::string data) sets the WHOLE field including ID? 
+    // Wait, NimBLEArduino's setManufacturerData takes string data. 
+    // But usually we set ID and Data. 
+    // Let's verify App parsing: it looks for key 0x02E5. 
+    // In NimBLE-Arduino: pAdv->setManufacturerData(data) sets the whole Manufacturer Specific Data AD Type (0xFF) payload?
+    // No, standard BLE library often separates ID.
+    // Checking NimBLE documentation/examples... usually just put bytes.
+    // Let's assume standard format: [ID LSB] [ID MSB] [Data...]
+    // ID: 0xE5 0x02 (0x02E5 in Little Endian)
+    // Data: [Volt LSB] [Volt MSB] [0x00] [0x00]
+    
+    char mfgBuf[6];
+    mfgBuf[0] = 0xE5; 
+    mfgBuf[1] = 0x02;
+    mfgBuf[2] = (uint8_t)(voltMv & 0xFF);
+    mfgBuf[3] = (uint8_t)((voltMv >> 8) & 0xFF);
+    mfgBuf[4] = 0x00; // Reserved/Load
+    mfgBuf[5] = 0x00; // Reserved
+    
+    pAdv->setManufacturerData(std::string(mfgBuf, 6));
+
     pAdv->start();
-    Serial.println("[BLE] Advertising started (App Compatible UUIDs)");
+    Serial.println("[BLE] Advertising started (App Compatible UUIDs + Battery Data)");
 }
 
 bool BLEHandler::isConnected() {
