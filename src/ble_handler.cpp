@@ -74,7 +74,7 @@ BLEHandler::BLEHandler() : pServer(nullptr), pService(nullptr), _settings(nullpt
     _connTime = 0;
 }
 
-void BLEHandler::begin(const String& deviceName, TrackerSettings& settings, float batteryVoltage) {
+void BLEHandler::begin(const String& deviceName, TrackerSettings& settings, float batteryVoltage, int batterySoc) {
     _settings = &settings;
     
     // Security DISABLED for verification
@@ -157,8 +157,8 @@ void BLEHandler::begin(const String& deviceName, TrackerSettings& settings, floa
     mfgBuf[1] = 0x02;
     mfgBuf[2] = (uint8_t)(voltMv & 0xFF);
     mfgBuf[3] = (uint8_t)((voltMv >> 8) & 0xFF);
-    mfgBuf[4] = 0x00; // Reserved/Load
-    mfgBuf[5] = 0x00; // Reserved
+    mfgBuf[4] = (uint8_t)batterySoc; 
+    mfgBuf[5] = 0x00; 
     
     pAdv->setManufacturerData(std::string(mfgBuf, 6));
 
@@ -172,16 +172,12 @@ bool BLEHandler::isConnected() {
 
 void BLEHandler::updateStatus(const TrackerStatus& status) {
     if (pStatusChar) {
-        // App expects "volts,gsmSignal,status"
+        // App expects "volts,rssi,status" or now "volts,soc,rssi,status"
         char buf[128]; 
-        snprintf(buf, sizeof(buf), "%.2f,%d,%s", status.battery_voltage, status.rssi, status.gsm_status.c_str());
+        snprintf(buf, sizeof(buf), "%.2f,%d,%d,%s", status.battery_voltage, status.battery_soc, status.rssi, status.gsm_status.c_str());
         
         size_t len = strlen(buf);
-        Serial.printf("[BLE-DEBUG] Status Payload (%d bytes): %s [HEX: ", len, buf);
-        for(size_t i=0; i<len; i++) Serial.printf("%02X ", buf[i]);
-        Serial.println("]");
-        
-        pStatusChar->setValue((uint8_t*)buf, len); // Explicit length
+        pStatusChar->setValue((uint8_t*)buf, len); 
         pStatusChar->notify();
     }
 }

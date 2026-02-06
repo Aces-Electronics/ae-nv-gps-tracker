@@ -156,7 +156,7 @@ void setup() {
     float initialVolts = PMU.getBattVoltage() / 1000.0;
     
     // BLE Window
-    ble.begin(bleName, settings, initialVolts);
+    ble.begin(bleName, settings, initialVolts, PMU.getBatteryPercent());
     Serial.println("BLE Advertising (" + bleName + ")...");
     Serial.println("===========================================\n");
     
@@ -186,9 +186,11 @@ void setup() {
                 
                 // 1. Get Battery
                 status.battery_voltage = PMU.getBattVoltage() / 1000.0;
+                status.battery_soc = PMU.getBatteryPercent();
                 
                 // 2. Get GPS
                 if (modem.getGPS(&lat, &lon, &speed, &alt, nullptr, &usat, &acc)) {
+                    if (usat < 0) usat = 0; // Sanitize Satellites
                     status.lat = lat;
                     status.lon = lon;
                     status.speed = speed;
@@ -288,10 +290,12 @@ void setup() {
                 doc["hdop"] = acc; // Using Accuracy (acc) as valid proxy for HDOP
                 
                 float batt_volts = PMU.getBattVoltage() / 1000.0F;
+                int batt_soc = PMU.getBatteryPercent();
                 
-                doc["voltage"] = batt_volts; // FIX: Populate supply voltage for Web UI
+                doc["voltage"] = batt_volts; 
                 doc["device_voltage"] = batt_volts; 
                 doc["battery_voltage"] = batt_volts; 
+                doc["soc"] = batt_soc;
                 
                 doc["rssi"] = modem.getSignalQuality();
                 doc["interval"] = settings.report_interval_mins;
