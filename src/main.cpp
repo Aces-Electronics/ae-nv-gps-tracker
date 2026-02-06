@@ -175,25 +175,32 @@ void setup() {
         // Try TinyGsm first for core coordinates
         if (modem.getGPS(&lat, &lon, &speed, &alt, nullptr, &usat, &acc)) {
             got_fix = true;
-            // Now get raw info for accurate satellite count
             modem.sendAT("+CGNSINF");
             if (modem.waitResponse(1000L, "+CGNSINF:") == 1) {
                 String res = modem.stream.readStringUntil('\n');
                 res.trim();
-                // Response: run,fix,date,lat,lon,alt,speed,course,mode,res,hdop,pdop,vdop,res,sats_view,sats_used,...
-                // Sats used is at 15th index (0-based)
-                int commaIndex = -1;
-                for(int i=0; i<15; i++) {
-                    commaIndex = res.indexOf(',', commaIndex + 1);
+                Serial.println("[DEBUG] Raw CGNSINF: " + res);
+                int comma14 = -1;
+                int tmpIdx = -1;
+                for(int i=0; i<14; i++) {
+                    tmpIdx = res.indexOf(',', tmpIdx + 1);
+                    if (tmpIdx == -1) break;
+                    comma14 = tmpIdx;
                 }
-                if (commaIndex != -1) {
-                    int nextComma = res.indexOf(',', commaIndex + 1);
-                    if (nextComma != -1) {
-                        usat = res.substring(commaIndex + 1, nextComma).toInt();
+                if (comma14 != -1) {
+                    int comma15 = res.indexOf(',', comma14 + 1);
+                    if (comma15 != -1) {
+                        int view = res.substring(comma14 + 1, comma15).toInt();
+                        int used = 0;
+                        int comma16 = res.indexOf(',', comma15 + 1);
+                        if (comma16 != -1) {
+                            used = res.substring(comma15 + 1, comma16).toInt();
+                        }
+                        usat = (used > 0) ? used : view;
                     }
                 }
             }
-            Serial.printf("GPS FIX! Sats: %d\n", usat);
+            Serial.printf("GPS FIX! Sats: %d (lat: %.5f, lon: %.5f)\n", usat, lat, lon);
             break;
         }
         Serial.print(".");
@@ -272,7 +279,9 @@ void setup() {
                 doc["alt"] = alt;
                 doc["speed"] = speed;
                 doc["sats"] = usat;
-                doc["battery_voltage"] = PMU.getBattVoltage() / 1000.0F;
+                doc["voltage"] = 0.00; // Supply voltage (placeholder for future hardware)
+                doc["device_voltage"] = PMU.getBattVoltage() / 1000.0F; // Internal battery voltage
+                doc["battery_voltage"] = PMU.getBattVoltage() / 1000.0F; // Internal battery voltage (Legacy alias)
                 doc["rssi"] = modem.getSignalQuality();
                 doc["interval"] = settings.report_interval_mins;
                 
