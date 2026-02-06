@@ -71,6 +71,76 @@ The tracker can be configured via BLE during the 90-second window on boot:
 - **Home Location**: Set via web UI
 - **Admin Mode**: Forces 1-minute intervals for testing
 
+## Debugging & Troubleshooting
+
+### Serial Monitor
+
+Monitor real-time debug output:
+
+```bash
+pio device monitor --port /dev/ttyACM0 -b 115200
+```
+
+### Debug Logging
+
+The firmware includes comprehensive diagnostic logging:
+
+**GPS Acquisition:**
+```
+[DEBUG] Raw CGNSINF: 1,1,20260206025753.000,-28.025740,153.387809,...
+GPS FIX! Sats: 10 (lat: -28.02574, lon: 153.38780)
+```
+
+**Network Registration:**
+```
+[DEBUG] Checking network status...
+[DEBUG] CEREG: +CEREG: 0,2  // 0,2 = registered on home network
+[DEBUG] COPS: +COPS: 0,0,"Telstra Mobile",7  // Connected operator
+[DEBUG] Signal Quality after registration: 20  // RSSI in dBm
+```
+
+**MQTT Publish:**
+```
+[DEBUG] Using Topic: ae-nv/tracker/860016043157614/up
+[MQTT] Publishing Payload: {"mac":"860016043157614",...}
+[MQTT] Publish OK
+```
+
+### Common Issues
+
+**No GPS Fix:**
+- Cold start can take 2-5 minutes
+- Ensure clear view of sky
+- Check antenna connection
+
+**Network Registration Fails:**
+- Verify SIM card is inserted and activated
+- Check CEREG response: `0,0` = not registered, `0,2` = registered
+- CSQ 99 = unknown signal (modem issue)
+- CSQ 0-31 = valid signal strength
+
+**MQTT Publish Fails:**
+- Verify network registration succeeded first
+- Check APN settings (default: `telstra.internet`)
+- Ensure MQTT broker is reachable
+
+**Device Not Appearing in UI:**
+- Check MQTT payload in serial output
+- Verify `mac` field matches device ID
+- Check backend worker logs for ingestion errors
+- Confirm device is claimed to your account
+
+### Enable TinyGSM Debug
+
+For detailed AT command logging, uncomment in `platformio.ini`:
+
+```ini
+build_flags = 
+    -DTINY_GSM_DEBUG=Serial
+```
+
+This will show all modem AT commands and responses.
+
 ## Architecture
 
 ### GPS Parsing
