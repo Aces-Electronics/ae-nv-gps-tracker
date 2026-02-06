@@ -32,7 +32,7 @@ void loadSettings() {
     settings.mqtt_broker = prefs.getString("broker", "mqtt.aceselectronics.com.au");
     settings.mqtt_user = prefs.getString("user", "aesmartshunt");
     settings.mqtt_pass = prefs.getString("pass", "AERemoteAccess2024!");
-    settings.report_interval_mins = prefs.getUInt("interval", 60);
+    settings.report_interval_mins = prefs.getUInt("interval", 2); // Shorten for testing
     prefs.end();
     Serial.println("Settings Loaded from NVS.");
 }
@@ -146,12 +146,12 @@ void setup() {
     unsigned long gps_start = millis();
     bool got_fix = false;
     float lat=0, lon=0, speed=0, alt=0, acc=0;
-    int sats=0;
+    int vsat=0, usat=0;
 
     while (millis() - gps_start < 300000) { // 5 min timeout
-        if (modem.getGPS(&lat, &lon, &speed, &alt, nullptr, &sats, &acc)) {
+        if (modem.getGPS(&lat, &lon, &speed, &alt, &vsat, &usat, &acc)) {
             got_fix = true;
-            Serial.printf("GPS FIX! Sats: %d\n", sats);
+            Serial.printf("GPS FIX! Sats: %d\n", usat);
             break;
         }
         Serial.print(".");
@@ -175,7 +175,7 @@ void setup() {
                 doc["lon"] = lon;
                 doc["alt"] = alt;
                 doc["speed"] = speed;
-                doc["sats"] = sats;
+                doc["sats"] = usat;
                 doc["battery_voltage"] = PMU.getBattVoltage() / 1000.0F;
                 doc["rssi"] = modem.getSignalQuality();
                 doc["interval"] = settings.report_interval_mins;
