@@ -131,118 +131,100 @@ void setup() {
     strip.setPixelColor(0, 0, 0, 255); // Blue (BLE Mode)
     strip.show();
 
+    // One-Shot Sequence
+    strip.setPixelColor(0, 255, 165, 0); // Orange (Modem/GPS)
+    strip.show();
+
+    Serial1.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
+    
+    // Power Up Modem & GPS *BEFORE* BLE Window for Live Status
+    modemPowerOn();
+    Serial.println("Starting GPS/GNSS...");
+    modem.sendAT("+CGNSPWR=1"); // Turn on GNSS
+    modem.waitResponse();
+
+    // Centralized BLE initialization
+    Serial.println("\n=== BLE Configuration Window (90 seconds + Connect) ===");
+    BLEDevice::init(("AE-Tracker-" + String((uint32_t)ESP.getEfuseMac(), HEX)).c_str());
+    BLEDevice::setMTU(517);
+    Serial.println("[BLE] NimBLE initialized with MTU=517");
+    
     // BLE Window
     ble.begin("AE-Tracker-" + String((uint32_t)ESP.getEfuseMac(), HEX), settings);
-    Serial.println("BLE Advertising (90s window)...");
+    Serial.println("BLE Advertising...");
+    Serial.println("===========================================\n");
     
     unsigned long ble_start = millis();
+    unsigned long last_poll = 0;
+    
+    // TRACKER STATUS VARIABLES
+    float lat=0, lon=0, speed=0, alt=0, acc=0;
+    int usat=0;
+
     while (millis() - ble_start < 90000 || ble.isConnected()) {
+        // Poll BLE for connection parameter updates
+        ble.loop();
+        
         if (digitalRead(0) == LOW) {
-            stay_awake = true;
+            stay_awake = true; 
             Serial.println("\n[DEBUG] Stay Awake Triggered by Button Press!");
         }
         
         if (ble.isConnected()) {
             strip.setPixelColor(0, 0, 255, 255); // Cyan (Connected)
             strip.show();
-            // Optional: Handle real-time telemetry updates to BLE app here
+            
+            // Poll Sensors every 2 seconds
+            if (millis() - last_poll > 2000) {
+                last_poll = millis();
+                
+                // 1. Get Battery
+                status.battery_voltage = PMU.getBattVoltage() / 1000.0;
+                
+                // 2. Get GPS
+                if (modem.getGPS(&lat, &lon, &speed, &alt, nullptr, &usat, &acc)) {
+                    status.lat = lat;
+                    status.lon = lon;
+                    status.speed = speed;
+                    status.sats = usat;
+                    status.gps_fix = true;
+                } else {
+                    status.gps_fix = false;
+                }
+                
+                // 3. Get Signal/Network
+                status.rssi = modem.getSignalQuality();
+                int regStatus = modem.getRegistrationStatus();
+                
+                if (status.gps_fix) status.gsm_status = "GPS Fix! Net: " + String(regStatus);
+                else status.gsm_status = "Searching GPS... Net: " + String(regStatus);
+
+                // Push Updates
+                ble.updateStatus(status);
+                ble.updateGps(status);
+            }
+        } else {
+            // Blink Blue if not connected
+             if ((millis() / 500) % 2 == 0) strip.setPixelColor(0, 0, 0, 255);
+             else strip.setPixelColor(0, 0, 0, 0);
+             strip.show();
         }
-        delay(100);
+        delay(10); // Small delay for stability
     }
     
-    saveSettings(); // Save any changes from BLE
-    
-    // One-Shot Sequence
-    strip.setPixelColor(0, 255, 165, 0); // Orange (Modem/GPS)
-    strip.show();
-
-    Serial1.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
-    modemPowerOn();
+    saveSettings(); 
     
     // Defer imei fetch until after registration to ensure modem is ready
+    // GPS Acquisition Loop (Existing logic continues here if not satisfied)
+    Serial.println("Proceeding to Network/MQTT...");
 
-    // GPS Acquisition
-    Serial.println("Waiting for GPS Fix (5 min max)...");
-    modem.sendAT("+CGNSPWR=1");
-    modem.waitResponse();
-    
-    unsigned long gps_start = millis();
-    bool got_fix = false;
-    float lat=0, lon=0, speed=0, alt=0, acc=0;
-    int usat=0;
-
-    while (millis() - gps_start < 300000) { // 5 min timeout
-        // Try TinyGsm first for core coordinates
-        if (modem.getGPS(&lat, &lon, &speed, &alt, nullptr, &usat, &acc)) {
-            got_fix = true;
-            modem.sendAT("+CGNSINF");
-            if (modem.waitResponse(1000L, "+CGNSINF:") == 1) {
-                String res = modem.stream.readStringUntil('\n');
-                res.trim();
-                Serial.println("[DEBUG] Raw CGNSINF: " + res);
-                int comma14 = -1;
-                int tmpIdx = -1;
-                for(int i=0; i<14; i++) {
-                    tmpIdx = res.indexOf(',', tmpIdx + 1);
-                    if (tmpIdx == -1) break;
-                    comma14 = tmpIdx;
-                }
-                if (comma14 != -1) {
-                    int comma15 = res.indexOf(',', comma14 + 1);
-                    if (comma15 != -1) {
-                        int view = res.substring(comma14 + 1, comma15).toInt();
-                        int used = 0;
-                        int comma16 = res.indexOf(',', comma15 + 1);
-                        if (comma16 != -1) {
-                            used = res.substring(comma15 + 1, comma16).toInt();
-                        }
-                        usat = (used > 0) ? used : view;
-                    }
-                }
-            }
-            Serial.printf("GPS FIX! Sats: %d (lat: %.5f, lon: %.5f)\n", usat, lat, lon);
-            break;
-        }
-        Serial.print(".");
-        delay(5000);
-    }
-
-    // Network & Send
-    int csq = modem.getSignalQuality();
-    Serial.printf("Connecting to Network (CSQ: %d)...\n", csq);
-    
-    // Diagnostic: Check registration status BEFORE attempting connection
-    Serial.println("[DEBUG] Checking network status...");
-    modem.sendAT("+CEREG?");
-    String ceregResp = "";
-    if (modem.waitResponse(5000L, ceregResp) == 1) {
-        Serial.println("[DEBUG] CEREG: " + ceregResp);
-    }
-    modem.sendAT("+COPS?");
-    String copsResp = "";
-    if (modem.waitResponse(5000L, copsResp) == 1) {
-        Serial.println("[DEBUG] COPS: " + copsResp);
-    }
-    modem.sendAT("+CGNAPN"); // Check if network provides an APN
-    String cgnapnResp = "";
-    if (modem.waitResponse(5000L, cgnapnResp) == 1) {
-        Serial.println("[DEBUG] CGNAPN: " + cgnapnResp);
-    }
-
-    Serial.println("[DEBUG] Configuring modem for Telstra...");
-    modem.sendAT("+CMNB=1"); // Set to Cat-M only for Telstra preference
-    modem.waitResponse();
-    modem.sendAT("+COPS=0"); // Force automatic registration
-    modem.waitResponse();
-    modem.setNetworkMode(2); // Automatic mode
-    modem.setPreferredMode(3); // CAT-M/NB-IoT
-    
+    // Already Powered On, just ensure settings check out
     Serial.println("[DEBUG] Waiting for network registration (3 min timeout)...");
     if (modem.waitForNetwork(180000L)) {
         Serial.println("Network Registered OK");
         
         // Re-check signal quality after registration
-        csq = modem.getSignalQuality();
+        int csq = modem.getSignalQuality();
         Serial.printf("[DEBUG] Signal Quality after registration: %d\n", csq);
         
         bool connected = false;

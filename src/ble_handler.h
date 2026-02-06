@@ -17,6 +17,11 @@ struct TrackerStatus {
     float battery_voltage;
     bool gps_fix;
     int sats;
+    float lat;
+    float lon;
+    float speed;
+    int rssi;
+    String gsm_status;
     String last_report;
 };
 
@@ -25,31 +30,50 @@ public:
     BLEHandler();
     void begin(const String& deviceName, TrackerSettings& settings);
     void updateStatus(const TrackerStatus& status);
+    void updateGps(const TrackerStatus& status); // New method
     bool isConnected();
     void loop();
 
     void setSettingsCallback(std::function<void(const TrackerSettings&)> callback);
 
     static const char* SERVICE_UUID;
-    static const char* APN_CHAR_UUID;
-    static const char* BROKER_CHAR_UUID;
-    static const char* USER_CHAR_UUID;
-    static const char* PASS_CHAR_UUID;
-    static const char* INTERVAL_CHAR_UUID;
-    static const char* STATUS_CHAR_UUID;
+    
+    // UUIDs matching ae-ble-app/lib/models/tracker.dart
+    static const char* GPS_DATA_CHAR_UUID;     // beb5483e-36e1-4688-b7f5-ea07361b2030
+    static const char* STATUS_CHAR_UUID;       // beb5483e-36e1-4688-b7f5-ea07361b2031
+    
+    static const char* WIFI_SSID_CHAR_UUID;    // beb5483e-36e1-4688-b7f5-ea07361b2640
+    static const char* BROKER_CHAR_UUID;       // beb5483e-36e1-4688-b7f5-ea07361b2645
+    static const char* USER_CHAR_UUID;         // beb5483e-36e1-4688-b7f5-ea07361b2646
+    static const char* PASS_CHAR_UUID;         // beb5483e-36e1-4688-b7f5-ea07361b2647
+    
+    // Custom/Legacy UUIDs (Not in App yet)
+    static const char* APN_CHAR_UUID;          // ae000101...
+    static const char* INTERVAL_CHAR_UUID;     // ae000105...
 
 private:
     BLEServer* pServer;
     BLEService* pService;
+    
+    BLECharacteristic* pGpsChar;
+    BLECharacteristic* pStatusChar;
+    BLECharacteristic* pWifiSsidChar;
+    
     BLECharacteristic* pApnChar;
     BLECharacteristic* pBrokerChar;
     BLECharacteristic* pUserChar;
     BLECharacteristic* pPassChar;
     BLECharacteristic* pIntervalChar;
-    BLECharacteristic* pStatusChar;
-
+    
     TrackerSettings* _settings;
     std::function<void(const TrackerSettings&)> _settingsCallback;
+    
+    // Connection parameter update tracking
+    uint16_t _pendingConnHandle;
+    unsigned long _connTime;
+
+public:
+    void scheduleConnParamsUpdate(uint16_t connHandle);
 };
 
 #endif
