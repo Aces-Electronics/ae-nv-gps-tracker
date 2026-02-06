@@ -7,6 +7,7 @@ const char* BLEHandler::SERVICE_UUID        = "4fafc203-1fb5-459e-8fcc-c5c9c3319
 
 const char* BLEHandler::GPS_DATA_CHAR_UUID  = "beb5483e-36e1-4688-b7f5-ea07361b2030";
 const char* BLEHandler::STATUS_CHAR_UUID    = "beb5483e-36e1-4688-b7f5-ea07361b2031";
+const char* BLEHandler::NAME_CHAR_UUID      = "beb5483e-36e1-4688-b7f5-ea07361b2040";
 
 const char* BLEHandler::WIFI_SSID_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b2640"; // Reusing WiFi SSID for potential future usage or fallback
 const char* BLEHandler::BROKER_CHAR_UUID    = "beb5483e-36e1-4688-b7f5-ea07361b2645";
@@ -28,7 +29,11 @@ public:
         std::string val = pChar->getValue();
         String uuid = pChar->getUUID().toString().c_str();
 
-        if (uuid == BLEHandler::APN_CHAR_UUID) _settings->apn = val.c_str();
+        if (uuid == BLEHandler::NAME_CHAR_UUID) {
+            _settings->name = val.c_str();
+            Serial.printf("[BLE] Device Name set: %s\n", _settings->name.c_str());
+        }
+        else if (uuid == BLEHandler::APN_CHAR_UUID) _settings->apn = val.c_str();
         else if (uuid == BLEHandler::BROKER_CHAR_UUID) _settings->mqtt_broker = val.c_str();
         else if (uuid == BLEHandler::USER_CHAR_UUID) _settings->mqtt_user = val.c_str();
         else if (uuid == BLEHandler::PASS_CHAR_UUID) _settings->mqtt_pass = val.c_str();
@@ -44,6 +49,9 @@ public:
         }
 
         Serial.printf("[BLE] Write to %s\n", uuid.c_str());
+        if (_handler->getSettingsCallback()) {
+            _handler->getSettingsCallback()(*_settings);
+        }
     }
 };
 
@@ -92,6 +100,11 @@ void BLEHandler::begin(const String& deviceName, TrackerSettings& settings, floa
 
     // Status (Notify | Read)
     pStatusChar = pService->createCharacteristic(STATUS_CHAR_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+    
+    // Name (Read | Write)
+    pNameChar = pService->createCharacteristic(NAME_CHAR_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+    pNameChar->setCallbacks(cb);
+    pNameChar->setValue(_settings->name.c_str());
 
     // Broker (Read | Write)
     pBrokerChar = pService->createCharacteristic(BROKER_CHAR_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
@@ -196,6 +209,10 @@ void BLEHandler::updateGps(const TrackerStatus& status) {
         pGpsChar->setValue((uint8_t*)buf, len); // Explicit length
         pGpsChar->notify();
     }
+}
+
+void BLEHandler::setSettingsCallback(std::function<void(const TrackerSettings&)> callback) {
+    _settingsCallback = callback;
 }
 
 void BLEHandler::scheduleConnParamsUpdate(uint16_t connHandle) {

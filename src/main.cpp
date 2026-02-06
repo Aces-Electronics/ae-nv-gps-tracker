@@ -29,6 +29,7 @@ bool stay_awake = true; // FORCE TRUE FOR DEFINITIVE DEBUGGING SESSION
 
 void loadSettings() {
     prefs.begin("tracker", false);
+    settings.name = prefs.getString("name", "");
     settings.apn = prefs.getString("apn", "hologram");
     settings.mqtt_broker = prefs.getString("broker", "mqtt.aceselectronics.com.au");
     settings.mqtt_user = prefs.getString("user", "aesmartshunt");
@@ -46,6 +47,7 @@ void loadSettings() {
 
 void saveSettings() {
     prefs.begin("tracker", false);
+    prefs.putString("name", settings.name);
     prefs.putString("apn", settings.apn);
     prefs.putString("broker", settings.mqtt_broker);
     prefs.putString("user", settings.mqtt_user);
@@ -155,8 +157,15 @@ void setup() {
         PMU.isBatteryConnect() ? "YES" : "NO");
 
     // Centralized BLE initialization
-    // Standardize Name: "AE Tracker <MAC>" (Space instead of dash, matching requests)
-    String bleName = "AE Tracker " + String((uint32_t)ESP.getEfuseMac(), HEX);
+    // Standardize Name: "AE Tracker - [Name/MAC]"
+    String suffix = settings.name;
+    if (suffix.length() == 0) {
+        String mac = String((uint32_t)ESP.getEfuseMac(), HEX);
+        mac.toUpperCase();
+        if (mac.length() > 6) mac = mac.substring(mac.length() - 6);
+        suffix = mac;
+    }
+    String bleName = "AE Tracker - " + suffix;
     
     Serial.println("\n=== BLE Configuration Window (90 seconds + Connect) ===");
     BLEDevice::init(bleName.c_str());
@@ -167,6 +176,11 @@ void setup() {
     float initialVolts = PMU.getBattVoltage() / 1000.0;
     
     // BLE Window
+    ble.setSettingsCallback([](const TrackerSettings& s) {
+        settings = s;
+        saveSettings();
+    });
+    
     ble.begin(bleName, settings, initialVolts, PMU.getBatteryPercent());
     Serial.println("BLE Advertising (" + bleName + ")...");
     Serial.println("===========================================\n");
@@ -295,7 +309,16 @@ void setup() {
             if (mqtt.connect(imei.c_str(), settings.mqtt_user.c_str(), settings.mqtt_pass.c_str())) {
                 StaticJsonDocument<512> doc;
                 doc["mac"] = imei;
-                doc["model"] = "ae-sim7080g-tracker";
+                
+                // Use standardized name for MQTT model/name
+                String suffix = settings.name;
+                if (suffix.length() == 0) {
+                    String mac = String((uint32_t)ESP.getEfuseMac(), HEX);
+                    mac.toUpperCase();
+                    if (mac.length() > 6) mac = mac.substring(mac.length() - 6);
+                    suffix = mac;
+                }
+                doc["model"] = "AE Tracker - " + suffix;
                 if (usat < 0) usat = 0; // Sanitize Satellites
                 
                 doc["lat"] = lat;

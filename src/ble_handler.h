@@ -6,6 +6,7 @@
 #include <vector>
 
 struct TrackerSettings {
+    String name = ""; // Added
     String apn = "hologram";
     String mqtt_broker = "mqtt.aceselectronics.com.au";
     String mqtt_user = "";
@@ -37,8 +38,11 @@ public:
     void loop();
 
     void setSettingsCallback(std::function<void(const TrackerSettings&)> callback);
+    std::function<void(const TrackerSettings&)> getSettingsCallback() { return _settingsCallback; }
 
     static const char* SERVICE_UUID;
+    
+    static const char* NAME_CHAR_UUID;         // Added: beb5483e-36e1-4688-b7f5-ea07361b2040
     
     // UUIDs matching ae-ble-app/lib/models/tracker.dart
     static const char* GPS_DATA_CHAR_UUID;     // beb5483e-36e1-4688-b7f5-ea07361b2030
@@ -59,6 +63,7 @@ private:
     
     BLECharacteristic* pGpsChar;
     BLECharacteristic* pStatusChar;
+    BLECharacteristic* pNameChar;
     BLECharacteristic* pWifiSsidChar;
     
     BLECharacteristic* pApnChar;
