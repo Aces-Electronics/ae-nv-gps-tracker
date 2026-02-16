@@ -142,10 +142,211 @@ void goToSleep(bool got_fix) {
     esp_deep_sleep_start();
 }
 
+// --- Lifecycle Functions ---
+
+void checkPowerConfig() {
+    float batt_volts = PMU.getBattVoltage() / 1000.0F;
+    Serial.printf("[Lifecycle] Battery: %.2fV\n", batt_volts);
+    
+    // Survival Mode: < 3.4V (approx 10-15%)
+    if (batt_volts < 3.40) {
+        Serial.println("[Lifecycle] LOW BATTERY! Forcing 24h Interval.");
+        settings.report_interval_mins = 1440; // 24 Hours
+    } else {
+        Serial.printf("[Lifecycle] Power OK. Interval: %d mins\n", settings.report_interval_mins);
+    }
+}
+
+void runBLEWindow(unsigned long duration_ms) {
+    Serial.printf("\n=== BLE Window (%lu ms) ===\n", duration_ms);
+    
+    // Standardize Name
+    String suffix = settings.name;
+    if (suffix.length() == 0) {
+        String mac = String((uint32_t)ESP.getEfuseMac(), HEX);
+        mac.toUpperCase();
+        if (mac.length() > 6) mac = mac.substring(mac.length() - 6);
+        suffix = mac;
+    }
+    String bleName = "AE Tracker - " + suffix;
+    
+    // Init BLE
+    BLEDevice::init(bleName.c_str());
+    BLEDevice::setMTU(517);
+    
+    // Callback
+    ble.setSettingsCallback([](const TrackerSettings& s) {
+        settings = s;
+        saveSettings();
+        Serial.println("[BLE] Settings Updated!");
+    });
+    
+    ble.begin(bleName, settings, PMU.getBattVoltage() / 1000.0, PMU.getBatteryPercent());
+    Serial.println("[BLE] Advertising...");
+
+    unsigned long start = millis();
+    strip.setPixelColor(0, 0, 0, 255); // Blue
+    strip.show();
+
+    while (millis() - start < duration_ms) {
+        ble.loop();
+        if (digitalRead(0) == LOW) {
+            Serial.println("[BLE] Boot Button Pressed - Extending Window!");
+            start = millis(); // Reset timer if interact
+        }
+        
+        if (ble.isConnected()) {
+             strip.setPixelColor(0, 0, 255, 255); // Cyan
+        } else {
+             // Blink Blue
+             if ((millis() / 500) % 2 == 0) strip.setPixelColor(0, 0, 0, 255);
+             else strip.setPixelColor(0, 0, 0, 0);
+        }
+        strip.show();
+        delay(10);
+    }
+    
+    BLEDevice::deinit(); // Save RAM/Power? Or just let it die with deep sleep
+    Serial.println("[BLE] Window Closed.\n");
+    strip.setPixelColor(0, 0, 0, 0);
+    strip.show();
+}
+
+bool getPreciseLocation(float* lat, float* lon, float* speed, float* alt, int* sats, float* hdop) {
+    Serial.println("[Lifecycle] Acquiring GPS Fix...");
+    strip.setPixelColor(0, 255, 165, 0); // Orange
+    strip.show();
+
+    // Power ON GNSS
+    modem.sendAT("+CGNSPWR=1");
+    modem.waitResponse();
+    modem.sendAT("+CGNSSEQ=\"gps;glonass;beidou;galileo\"");
+    modem.waitResponse();
+    modem.sendAT("+CGNSAN=1"); // Active Antenna
+    modem.waitResponse();
+
+    unsigned long start = millis();
+    // Timeout: 120s max for fix
+    unsigned long timeout = 120000; 
+    
+    bool locked = false;
+    float last_pdop = 99.9;
+    unsigned long stable_start = 0;
+
+    while (millis() - start < timeout) {
+        // DEBUG: Print Raw Status to see why Sats is -9999
+        modem.sendAT("+CGNSINF");
+        if (modem.waitResponse(100L, "+CGNSINF: ") == 1) {
+            String res = modem.stream.readStringUntil('\n');
+            res.trim();
+            Serial.printf("[GPS-RAW] %s\n", res.c_str());
+        }
+
+        float f_lat=0, f_lon=0, f_speed=0, f_alt=0, f_acc=0;
+        int f_vsat=0, f_usat=0;
+        
+        // Use raw poll for PDOP check if library doesn't support it directly, 
+        // but library getGPS gets 'accuracy' which is effectively HDOP/PDOP proxy.
+        if (modem.getGPS(&f_lat, &f_lon, &f_speed, &f_alt, &f_vsat, &f_usat, &f_acc)) {
+            Serial.printf("[GPS] Fix! Sats=%d HDOP=%.2f\n", f_usat, f_acc);
+            
+            // Always update coordinates if we have a somewhat valid fix (HDOP < 10)
+            // This ensures we send *something* even if we timeout waiting for "strict lock".
+            if (f_acc < 10.0 && f_lat != 0.0) {
+                *lat = f_lat; *lon = f_lon; *speed = f_speed; *alt = f_alt; *sats = f_usat; *hdop = f_acc;
+            }
+
+            // Strict Lock Criteria
+            // Relaxed: Allow lock if HDOP is excellent (< 2.0) even if Sats is weird (-9999)
+            // OR if HDOP < 2.5 and Sats >= 4.
+            if (f_acc < 2.0 || (f_acc < 2.5 && f_usat >= 4)) {
+                locked = true;
+                break; 
+            }
+        } else {
+            Serial.print(".");
+        }
+        delay(1000);
+    }
+    
+    if (locked) {
+        Serial.println("\n[Lifecycle] GPS Locked & Stable.");
+        return true;
+    } else {
+        Serial.println("\n[Lifecycle] GPS Timeout!");
+        return false;
+    }
+}
+
+void transmitData(float lat, float lon, float speed, float alt, int sats, float hdop) {
+    Serial.println("[Lifecycle] Connecting to Network...");
+    
+    // Ensure Modem RF is ON (if we turned it off previously)
+    modem.sendAT("+CFUN=1");
+    modem.waitResponse(2000L);
+
+    Serial.print("[Lifecycle] Waiting for Network...");
+    if (!modem.waitForNetwork(180000L)) {
+        Serial.println("Fail: Network Timeout");
+        return;
+    }
+    Serial.println(" OK");
+    
+    if (modem.gprsConnect(settings.apn.c_str())) {
+        Serial.println("[Lifecycle] GPRS Connected");
+        
+        if (imei == "") imei = modem.getIMEI();
+        mqtt_topic_up = "ae-nv/tracker/" + imei + "/up";
+        
+        mqtt.setServer(settings.mqtt_broker.c_str(), 1883);
+        if (mqtt.connect(imei.c_str(), settings.mqtt_user.c_str(), settings.mqtt_pass.c_str())) {
+            
+            StaticJsonDocument<512> doc;
+            doc["mac"] = imei;
+            
+            String suffix = settings.name;
+            if (suffix.length() == 0) {
+                String mac = String((uint32_t)ESP.getEfuseMac(), HEX);
+                mac.toUpperCase();
+                if (mac.length() > 6) mac = mac.substring(mac.length() - 6);
+                suffix = mac;
+            }
+            doc["model"] = "AE Tracker - " + suffix;
+            
+            doc["lat"] = lat;
+            doc["lon"] = lon;
+            doc["alt"] = alt;
+            doc["speed"] = speed;
+            doc["sats"] = sats;
+            doc["hdop"] = hdop;
+            
+            doc["voltage"] = PMU.getVbusVoltage() / 1000.0F; 
+            doc["device_voltage"] = PMU.getBattVoltage() / 1000.0F; // Legacy field
+            doc["battery_voltage"] = PMU.getBattVoltage() / 1000.0F; 
+            doc["soc"] = PMU.getBatteryPercent();
+            doc["rssi"] = modem.getSignalQuality();
+            doc["interval"] = settings.report_interval_mins;
+            
+            String payload;
+            serializeJson(doc, payload);
+            Serial.println("[MQTT] Publishing: " + payload);
+            mqtt.publish(mqtt_topic_up.c_str(), payload.c_str());
+            
+            delay(500);
+            mqtt.disconnect();
+        } else {
+             Serial.println("[Lifecycle] MQTT Connect Fail");
+        }
+        modem.gprsDisconnect();
+    } else {
+        Serial.println("[Lifecycle] GPRS Fail");
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     delay(2000);
-    Serial.println("\n--- AE Tracker Boot ---");
+    Serial.println("\n--- AE Tracker Boot (Low Power Mode) ---");
 
     Wire.begin(I2C_SDA, I2C_SCL);
     if (!PMU.begin(Wire, AXP2101_SLAVE_ADDRESS, I2C_SDA, I2C_SCL)) {
@@ -156,322 +357,53 @@ void setup() {
     PMU.enableBattDetection();
     PMU.enableCellbatteryCharge();
     
-    loadSettings();
-    settings.report_interval_mins = 1; // FORCE 1m for testing
-    Serial.println("Forcing 1-minute test interval (ADMIN MODE).");
-
-    pinMode(0, INPUT_PULLUP); // Boot Button
-    
+    // Hardware Init
+    pinMode(0, INPUT_PULLUP);
     strip.begin();
-    strip.setPixelColor(0, 0, 0, 255); // Blue (BLE Mode)
     strip.show();
-
-    // One-Shot Sequence
-    strip.setPixelColor(0, 255, 165, 0); // Orange (Modem/GPS)
-    strip.show();
-
+    
     Serial1.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
     
-    // Power Up Modem & GPS *BEFORE* BLE Window for Live Status
-    modemPowerOn();
-    Serial.println("Starting GPS/GNSS...");
+    // Load Config
+    loadSettings();
     
-    modem.sendAT("+CMEE=2"); // Verbose errors
+    // 1. Power Config Check
+    checkPowerConfig();
+    
+    // 2. BLE Window (30s)
+    modemPowerOn(); // Need modem on for some reason? No, independent.
+    // Actually, keep modem OFF during BLE to save power? 
+    // User flow said: "1. Power on... 2. Get GPS".
+    // Let's power modem ON here anyway to warm it up OR just for BLE manuf data?
+    // Manuf data needs Voltage.
+    runBLEWindow(30000); 
+
+    // 3. Acquire GPS
+    // Ensure Modem/GPS is powered
+    modemPowerOn(); 
+    
+    float lat=0, lon=0, speed=0, alt=0, hdop=99; 
+    int sats=0;
+    bool has_fix = getPreciseLocation(&lat, &lon, &speed, &alt, &sats, &hdop);
+    
+    // 4. Transmit (if we have fix OR if we want to report heartbeat?)
+    // User said: "Once GPS attained... power down GPS... send payloads"
+    // If NO FIX, do we send? 
+    // Backoff logic handles the "No Fix" case usually.
+    // For now, let's try to send even if no fix (heartbeat) or maybe just fail?
+    // We'll send what we have (0,0 if fail) but the Backoff Logic is key here.
+    
+    // Stop GPS to save power before TX
+    modem.sendAT("+CGNSPWR=0");
     modem.waitResponse();
-
-    modem.sendAT("+CGNSPWR=1"); 
-    String rawRes = "";
-    unsigned long start = millis();
-    while (millis() - start < 3000) {
-        if (modem.stream.available()) {
-            rawRes += (char)modem.stream.read();
-        }
-    }
-    Serial.print("Raw Power ON Response: ");
-    Serial.println(rawRes);
     
-    // Enable multi-GNSS
-    modem.sendAT("+CGNSSEQ=\"gps;glonass;beidou;galileo\"");
-    modem.waitResponse();
-
-    // Set Active Antenna
-    modem.sendAT("+CGNSAN=1");
-    modem.waitResponse();
-
-    modem.sendAT("+CGNSAD"); // Get antenna info
-    String antRes = "";
-    unsigned long aStart = millis();
-    while (millis() - aStart < 3000) {
-        if (modem.stream.available()) {
-            antRes += (char)modem.stream.read();
-        }
-    }
-    Serial.print("Antenna Status: ");
-    Serial.println(antRes);
-
-    modem.sendAT("+CGNSPWR?");
-    modem.waitResponse(1000L);
+    transmitData(lat, lon, speed, alt, sats, hdop);
     
-    // Debug: Check initial Battery
-    Serial.printf("[DEBUG] Initial Battery: %.2fV, %d%%, Inserted: %s\n", 
-        PMU.getBattVoltage() / 1000.0, 
-        PMU.getBatteryPercent(),
-        PMU.isBatteryConnect() ? "YES" : "NO");
-
-    // Centralized BLE initialization
-    // Standardize Name: "AE Tracker - [Name/MAC]"
-    String suffix = settings.name;
-    if (suffix.length() == 0) {
-        String mac = String((uint32_t)ESP.getEfuseMac(), HEX);
-        mac.toUpperCase();
-        if (mac.length() > 6) mac = mac.substring(mac.length() - 6);
-        suffix = mac;
-    }
-    String bleName = "AE Tracker - " + suffix;
-    
-    Serial.println("\n=== BLE Configuration Window (90 seconds + Connect) ===");
-    BLEDevice::init(bleName.c_str());
-    BLEDevice::setMTU(517);
-    Serial.println("[BLE] NimBLE initialized with MTU=517");
-    
-    // Get initial voltage for Manufacturer Data
-    float initialVolts = PMU.getBattVoltage() / 1000.0;
-    
-    // BLE Window
-    ble.setSettingsCallback([](const TrackerSettings& s) {
-        settings = s;
-        saveSettings();
-    });
-    
-    ble.begin(bleName, settings, initialVolts, PMU.getBatteryPercent());
-    Serial.println("BLE Advertising (" + bleName + ")...");
-    Serial.println("===========================================\n");
-    
-    unsigned long ble_start = millis();
-    unsigned long last_poll = 0;
-    unsigned long last_gnss_debug = 0;
-    
-    // TRACKER STATUS VARIABLES
-    float lat=0, lon=0, speed=0, alt=0, acc=0;
-    int usat=0;
-    bool session_has_fix = false;
-
-    while (millis() - ble_start < 90000 || ble.isConnected()) {
-        // Poll BLE for connection parameter updates
-        ble.loop();
-        
-        if (digitalRead(0) == LOW) {
-            stay_awake = true; 
-            Serial.println("\n[DEBUG] Stay Awake Triggered by Button Press!");
-        }
-        
-        // Raw GNSS Diagnostic every 5 seconds
-        if (millis() - last_gnss_debug > 5000) {
-            last_gnss_debug = millis();
-            Serial.print("[GNSS-DEBUG] Raw status: ");
-            modem.sendAT("+CGNSINF");
-            if (modem.waitResponse(1000L, "+CGNSINF: ") == 1) {
-                String res = modem.stream.readStringUntil('\n');
-                res.trim();
-                Serial.println(res);
-                
-                // Parse for quick serial readout
-                // Format: <run_status>,<fix_status>,<timestamp>,<lat>,<lon>,<alt>,<speed>,<course>,<fix_mode>,<reserved>,<HDOP>,<PDOP>,<VDOP>,<reserved>,<gnss_sat_in_view>,<gnss_sat_used>,<glonass_sat_used>,<reserved>,<cn0_max>,<hpa>,<vpa>
-            } else {
-                Serial.println("FAIL");
-            }
-        }
-
-        if (ble.isConnected()) {
-            strip.setPixelColor(0, 0, 255, 255); // Cyan (Connected)
-            strip.show();
-            
-            // Poll Sensors every 2 seconds
-            if (millis() - last_poll > 2000) {
-                last_poll = millis();
-                
-                // 1. Get Battery
-                status.battery_voltage = PMU.getBattVoltage() / 1000.0;
-                status.battery_soc = PMU.getBatteryPercent();
-                
-                // 2. Get GPS
-                if (modem.getGPS(&lat, &lon, &speed, &alt, nullptr, &usat, &acc)) {
-                    if (usat < 0) usat = 0; // Sanitize Satellites
-                    status.lat = lat;
-                    status.lon = lon;
-                    status.speed = speed;
-                    status.sats = usat;
-                    status.hdop = acc; // Store Accuracy as HDOP
-                    status.gps_fix = true;
-                    session_has_fix = true;
-                } else {
-                    status.gps_fix = false;
-                }
-                
-                // 3. Get Signal/Network
-                status.rssi = modem.getSignalQuality();
-                int regStatus = modem.getRegistrationStatus();
-                
-                if (status.gps_fix) status.gsm_status = "GPS Fix! Net: " + String(regStatus);
-                else status.gsm_status = "Searching GPS... Net: " + String(regStatus);
-
-                Serial.printf("[DEBUG] Loop Poll: Bat=%.2fV SOC=%d%% RSSI=%d GPS=%s SATS=%d\n",
-                    status.battery_voltage, status.battery_soc, status.rssi, 
-                    status.gps_fix ? "FIX" : "NO_FIX", status.sats);
-
-                // Push Updates
-                ble.updateStatus(status);
-                ble.updateGps(status);
-            }
-        } else {
-            // Blink Blue if not connected
-             if ((millis() / 500) % 2 == 0) strip.setPixelColor(0, 0, 0, 255);
-             else strip.setPixelColor(0, 0, 0, 0);
-             strip.show();
-        }
-        delay(10); // Small delay for stability
-    }
-    
-    saveSettings(); 
-    
-    // Defer imei fetch until after registration to ensure modem is ready
-    // GPS Acquisition Loop (Existing logic continues here if not satisfied)
-    Serial.println("Proceeding to Network/MQTT...");
-
-    // Already Powered On, just ensure settings check out
-    Serial.println("[DEBUG] Waiting for network registration (3 min timeout)...");
-    if (modem.waitForNetwork(180000L)) {
-        Serial.println("Network Registered OK");
-        
-        // Re-check signal quality after registration
-        int csq = modem.getSignalQuality();
-        Serial.printf("[DEBUG] Signal Quality after registration: %d\n", csq);
-        
-        bool connected = false;
-        Serial.print("Connecting to GPRS (APN: " + settings.apn + ")...");
-        if (modem.gprsConnect(settings.apn.c_str())) {
-            connected = true;
-            Serial.println(" OK");
-        } else {
-            Serial.println(" fail");
-            Serial.println("Attempting Auto-APN Discovery (+CGNAPN)...");
-            modem.sendAT("+CGNAPN");
-            if (modem.waitResponse(10000L, "+CGNAPN:") == 1) {
-                String res = modem.stream.readStringUntil('\n');
-                res.trim();
-                int firstQuote = res.indexOf('"');
-                int lastQuote = res.lastIndexOf('"');
-                if (firstQuote != -1 && lastQuote != -1 && lastQuote > firstQuote) {
-                    String discoveredAPN = res.substring(firstQuote + 1, lastQuote);
-                    Serial.println("Discovered APN: " + discoveredAPN);
-                    if (discoveredAPN.length() > 0 && modem.gprsConnect(discoveredAPN.c_str())) {
-                        connected = true;
-                        settings.apn = discoveredAPN;
-                        Serial.println("Connected via Discovered APN!");
-                    }
-                }
-            }
-            if (!connected) {
-                Serial.println("Trying Empty APN...");
-                if (modem.gprsConnect("")) {
-                    connected = true;
-                    Serial.println("Connected with Empty APN!");
-                }
-            }
-        }
-
-        if (connected) {
-            if (imei == "") {
-                imei = modem.getIMEI();
-                mqtt_topic_up = "ae-nv/tracker/" + imei + "/up";
-            }
-            Serial.printf("[DEBUG] Using Topic: %s\n", mqtt_topic_up.c_str());
-            
-            // --- CRITICAL FIX: Read GPS before publishing (even if BLE wasn't connected) ---
-            Serial.println("[DEBUG] Reading fresh GPS data for MQTT...");
-            float f_lat=0, f_lon=0, f_speed=0, f_alt=0, f_acc=0;
-            int f_vsat=0, f_usat=0;
-            if (modem.getGPS(&f_lat, &f_lon, &f_speed, &f_alt, &f_vsat, &f_usat, &f_acc)) {
-                Serial.printf("[DEBUG] Fresh GPS: Lat=%.6f Lon=%.6f Sats=%d\n", f_lat, f_lon, f_usat);
-                lat = f_lat;
-                lon = f_lon;
-                speed = f_speed;
-                alt = f_alt;
-                usat = f_usat;
-                acc = f_acc;
-                session_has_fix = true; // Ensure we mark as fixed for backoff logic
-            } else {
-                Serial.println("[DEBUG] GPS Read Failed (using last known or 0).");
-            }
-            // -------------------------------------------------------------------------------
-
-            mqtt.setServer(settings.mqtt_broker.c_str(), 1883);
-            if (mqtt.connect(imei.c_str(), settings.mqtt_user.c_str(), settings.mqtt_pass.c_str())) {
-                StaticJsonDocument<512> doc;
-                doc["mac"] = imei;
-                
-                // Use standardized name for MQTT model/name
-                String suffix = settings.name;
-                if (suffix.length() == 0) {
-                    String mac = String((uint32_t)ESP.getEfuseMac(), HEX);
-                    mac.toUpperCase();
-                    if (mac.length() > 6) mac = mac.substring(mac.length() - 6);
-                    suffix = mac;
-                }
-                doc["model"] = "AE Tracker - " + suffix;
-                if (usat < 0) usat = 0; // Sanitize Satellites
-                
-                doc["lat"] = lat;
-                doc["lon"] = lon;
-                doc["alt"] = alt;
-                doc["speed"] = speed;
-                doc["sats"] = usat;
-                doc["hdop"] = acc; // Using Accuracy (acc) as valid proxy for HDOP
-                
-                float batt_volts = PMU.getBattVoltage() / 1000.0F;
-                int batt_soc = PMU.getBatteryPercent();
-                float vbus_volts = PMU.getVbusVoltage() / 1000.0F;
-                
-                doc["voltage"] = vbus_volts; 
-                doc["device_voltage"] = batt_volts; 
-                doc["battery_voltage"] = batt_volts; 
-                doc["soc"] = batt_soc;
-                
-                doc["rssi"] = modem.getSignalQuality();
-                doc["interval"] = settings.report_interval_mins;
-                
-                String payload;
-                serializeJson(doc, payload);
-                Serial.println("[MQTT] Publishing Payload: " + payload);
-                if (mqtt.publish(mqtt_topic_up.c_str(), payload.c_str())) {
-                    Serial.println("[MQTT] Publish OK");
-                } else {
-                    Serial.printf("[MQTT] Publish FAIL (MQTT State: %d)\n", mqtt.state());
-                }
-                delay(1000);
-                mqtt.disconnect();
-            } else {
-                Serial.printf("MQTT FAIL (MQTT State: %d)\n", mqtt.state());
-                Serial.println("Hint: -1=TCP/IP Connect Fail, -2=Timeout, -3=ConnLost, -4=Connect Bad Protocol, -5=Bad ID, -6=Bad User/Pass, -7=Unauthorized, -8=Bad Params");
-            }
-            modem.gprsDisconnect();
-        } else {
-            Serial.println("GPRS FAIL");
-        }
-    } else {
-        Serial.println("NET FAIL");
-    }
-
-    if (stay_awake) {
-        Serial.println("STAY AWAKE: Skipping Deep Sleep. Re-running setup in 10s...");
-        delay(10000);
-        ESP.restart();
-    } else {
-        goToSleep(session_has_fix);
-    }
+    // 5. Sleep
+    goToSleep(has_fix);
 }
 
 void loop() {
-    // Empty (Deep Sleep handles re-boot)
+    // Empty
 }
 
