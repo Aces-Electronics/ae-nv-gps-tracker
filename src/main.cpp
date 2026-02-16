@@ -141,6 +141,52 @@ void goToSleep(bool got_fix) {
     esp_sleep_enable_timer_wakeup(sleep_time);
     esp_deep_sleep_start();
 }
+// --- Custom CGNSINF Parser for SIM7080G ---
+bool parseCGNSINF(String raw, float* lat, float* lon, float* speed, float* alt, int* sats, float* hdop) {
+    // Expected: <run>,<fix>,<time>,<lat>,<lon>,<alt>,<speed>,<course>,<mode>,<reserved1>,<hdop>,<pdop>,<vdop>,<reserved2>,<sats_view>,<sats_used>,...
+    // Raw Example: 1,,20260216002433.000,-28.025790,153.387616,-12.593,0.00,,1,,5.3,9.7,8.2,,5,,64.8,158.2
+    
+    // Check Run Status
+    if (!raw.startsWith("1,")) return false;
+    
+    // Split by comma
+    int idx = 0;
+    int from = 0;
+    String parts[25];
+    int max_parts = 25;
+    
+    for (int i=0; i<max_parts; i++) {
+        int comma = raw.indexOf(',', from);
+        if (comma == -1) {
+            parts[i] = raw.substring(from);
+            from = raw.length();
+            break;
+        } else {
+            parts[i] = raw.substring(from, comma);
+            from = comma + 1;
+        }
+    }
+
+    // Index 3: Lat, 4: Lon (Verify they are not empty)
+    if (parts[3].length() == 0 || parts[4].length() == 0) return false;
+    
+    *lat = parts[3].toFloat();
+    *lon = parts[4].toFloat();
+    *alt = parts[5].toFloat();
+    *speed = parts[6].toFloat();
+    *hdop = parts[10].toFloat();
+    
+    // Sats Logic: Use 'Used' (15) if present, else 'In View' (14)
+    if (parts[15].length() > 0) {
+        *sats = parts[15].toInt();
+    } else if (parts[14].length() > 0) {
+        *sats = parts[14].toInt();
+    } else {
+        *sats = 0;
+    }
+    
+    return true; // Consider valid if we parsed Lat/Lon
+}
 
 // --- Lifecycle Functions ---
 
@@ -234,32 +280,27 @@ bool getPreciseLocation(float* lat, float* lon, float* speed, float* alt, int* s
     unsigned long stable_start = 0;
 
     while (millis() - start < timeout) {
-        // DEBUG: Print Raw Status to see why Sats is -9999
         modem.sendAT("+CGNSINF");
-        if (modem.waitResponse(100L, "+CGNSINF: ") == 1) {
-            String res = modem.stream.readStringUntil('\n');
+        String res = "";
+        if (modem.waitResponse(1000L, "+CGNSINF: ") == 1) {
+            res = modem.stream.readStringUntil('\n');
             res.trim();
             Serial.printf("[GPS-RAW] %s\n", res.c_str());
         }
 
         float f_lat=0, f_lon=0, f_speed=0, f_alt=0, f_acc=0;
-        int f_vsat=0, f_usat=0;
+        int f_sats=0;
         
-        // Use raw poll for PDOP check if library doesn't support it directly, 
-        // but library getGPS gets 'accuracy' which is effectively HDOP/PDOP proxy.
-        if (modem.getGPS(&f_lat, &f_lon, &f_speed, &f_alt, &f_vsat, &f_usat, &f_acc)) {
-            Serial.printf("[GPS] Fix! Sats=%d HDOP=%.2f\n", f_usat, f_acc);
+        if (parseCGNSINF(res, &f_lat, &f_lon, &f_speed, &f_alt, &f_sats, &f_acc)) {
+            Serial.printf("[GPS] Fix! Sats=%d HDOP=%.2f\n", f_sats, f_acc);
             
             // Always update coordinates if we have a somewhat valid fix (HDOP < 10)
-            // This ensures we send *something* even if we timeout waiting for "strict lock".
             if (f_acc < 10.0 && f_lat != 0.0) {
-                *lat = f_lat; *lon = f_lon; *speed = f_speed; *alt = f_alt; *sats = f_usat; *hdop = f_acc;
+                *lat = f_lat; *lon = f_lon; *speed = f_speed; *alt = f_alt; *sats = f_sats; *hdop = f_acc;
             }
 
-            // Strict Lock Criteria
-            // Relaxed: Allow lock if HDOP is excellent (< 2.0) even if Sats is weird (-9999)
-            // OR if HDOP < 2.5 and Sats >= 4.
-            if (f_acc < 2.0 || (f_acc < 2.5 && f_usat >= 4)) {
+            // Lock Criteria: HDOP < 2.5 and Sats >= 4 OR HDOP < 2.0 (Strong Fix)
+            if (f_acc < 2.0 || (f_acc < 2.5 && f_sats >= 4)) {
                 locked = true;
                 break; 
             }
