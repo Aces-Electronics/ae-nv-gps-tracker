@@ -67,6 +67,10 @@ void modemPowerOn() {
     PMU.setALDO4Voltage(3300);
     PMU.enableALDO4();
     
+    // GPS Antenna Power
+    PMU.setBLDO2Voltage(3300);
+    PMU.enableBLDO2();
+    
     // Drain any old data
     while(Serial1.available()) Serial1.read();
 
@@ -212,6 +216,51 @@ void checkPowerConfig() {
     }
 }
 
+void initGNSS() {
+    Serial.println("[Modem] Starting GNSS Engine...");
+    modem.sendAT("+CGNSPWR=1");
+    modem.waitResponse();
+    modem.sendAT("+CGNSSEQ=\"gps;glonass;beidou;galileo\"");
+    modem.waitResponse();
+    modem.sendAT("+CGNSAN=1"); // Active Antenna
+    modem.waitResponse();
+}
+
+void pollGPSDiagnostic() {
+    modem.sendAT("+CGNSINF");
+    if (modem.waitResponse(1000L, "+CGNSINF: ") == 1) {
+        String res = modem.stream.readStringUntil('\n');
+        res.trim();
+        Serial.printf("[GPS-RAW] [%s]\n", res.c_str());
+        
+        // Quick parse for logs: <run>,<fix>,...
+        int firstComma = res.indexOf(',');
+        int secondComma = res.indexOf(',', firstComma + 1);
+        if (firstComma != -1 && secondComma != -1) {
+            String fixStr = res.substring(firstComma + 1, secondComma);
+            if (fixStr.length() == 0) fixStr = "0";
+            
+            // Extract SatsView (index 14)
+            int commaCount = 0;
+            String satsView = "0";
+            int from = 0;
+            for (int i=0; i<15; i++) {
+                int next = res.indexOf(',', from);
+                if (next == -1) {
+                    if (i == 14) satsView = res.substring(from);
+                    break;
+                }
+                if (i == 14) {
+                    satsView = res.substring(from, next);
+                }
+                from = next + 1;
+            }
+            if (satsView.length() == 0) satsView = "0";
+            Serial.printf("[GPS] Background... Fix=%s SatsView=%s\n", fixStr.c_str(), satsView.c_str());
+        }
+    }
+}
+
 void runBLEWindow(unsigned long duration_ms) {
     Serial.printf("\n=== BLE Window (%lu ms) ===\n", duration_ms);
     
@@ -240,6 +289,7 @@ void runBLEWindow(unsigned long duration_ms) {
     Serial.println("[BLE] Advertising...");
 
     unsigned long start = millis();
+    unsigned long last_gps_poll = 0;
     strip.setPixelColor(0, 0, 0, 255); // Blue
     strip.show();
 
@@ -250,6 +300,11 @@ void runBLEWindow(unsigned long duration_ms) {
             start = millis(); // Reset timer if interact
         }
         
+        if (millis() - last_gps_poll > 5000) {
+            pollGPSDiagnostic();
+            last_gps_poll = millis();
+        }
+
         if (ble.isConnected()) {
              strip.setPixelColor(0, 0, 255, 255); // Cyan
         } else {
@@ -261,33 +316,43 @@ void runBLEWindow(unsigned long duration_ms) {
         delay(10);
     }
     
-    BLEDevice::deinit(); // Save RAM/Power? Or just let it die with deep sleep
+    BLEDevice::deinit(); 
     Serial.println("[BLE] Window Closed.\n");
     strip.setPixelColor(0, 0, 0, 0);
     strip.show();
 }
 
 String getIMEIWithRetry() {
-    for (int i = 0; i < 3; i++) {
-        // Clear buffer
+    Serial.println("[Modem] Getting IMEI...");
+    for (int i = 0; i < 5; i++) {
+        // Drain any pending data
         while (Serial1.available()) Serial1.read();
         
         String res = modem.getIMEI();
+        res.trim();
+        
+        // Sometimes returns "OK" or empty if busy
         if (res.length() >= 14 && res != "OK") {
             // Validate numeric
             bool numeric = true;
             for (char c : res) {
                 if (!isDigit(c)) { numeric = false; break; }
             }
-            if (numeric) return res;
+            if (numeric) {
+                Serial.printf("[Modem] IMEI Found: %s\n", res.c_str());
+                return res;
+            }
         }
-        Serial.printf("[Modem] IMEI Retry %d (Got: %s)\n", i+1, res.c_str());
-        delay(500);
+        Serial.printf("[Modem] IMEI Retry %d (Got: '%s')\n", i+1, res.c_str());
+        delay(1000);
     }
+    
     // Fallback to MAC suffix if IMEI fails repeatedly
     String mac = String((uint32_t)ESP.getEfuseMac(), HEX);
     mac.toUpperCase();
-    return "ESP32-" + mac;
+    String fallback = "ESP32-" + mac;
+    Serial.printf("[Modem] IMEI Failed. Using Fallback: %s\n", fallback.c_str());
+    return fallback;
 }
 
 bool getPreciseLocation(float* lat, float* lon, float* speed, float* alt, int* sats, float* hdop) {
@@ -295,69 +360,54 @@ bool getPreciseLocation(float* lat, float* lon, float* speed, float* alt, int* s
     strip.setPixelColor(0, 255, 165, 0); // Orange
     strip.show();
 
-    // Power ON GNSS
-    modem.sendAT("+CGNSPWR=1");
-    modem.waitResponse();
-    modem.sendAT("+CGNSSEQ=\"gps;glonass;beidou;galileo\"");
-    modem.waitResponse();
-    modem.sendAT("+CGNSAN=1"); // Active Antenna
-    modem.waitResponse();
-
+    // Note: GNSS assumed to be POWERED ON by initGNSS() caller
+    
     unsigned long start = millis();
     bool locked = false;
 
     while (millis() - start < 300000L) {
         modem.sendAT("+CGNSINF");
-        String res = "";
-        if (modem.waitResponse(2000L, res) != 1) {
-            delay(1000);
-            continue;
-        }
-        
-        if (res.startsWith("+CGNSINF: ")) res = res.substring(10);
-        
-        float f_lat=0, f_lon=0, f_speed=0, f_alt=0, f_acc=0;
-        int f_sats=0;
-        
-        if (parseCGNSINF(res, &f_lat, &f_lon, &f_speed, &f_alt, &f_sats, &f_acc)) {
-            Serial.printf("[GPS] Valid! Lat=%.4f Lon=%.4f Sats=%d HDOP=%.2f\n", f_lat, f_lon, f_sats, f_acc);
+        if (modem.waitResponse(2000L, "+CGNSINF: ") == 1) {
+            String res = modem.stream.readStringUntil('\n');
+            res.trim();
+            Serial.printf("[GPS-RAW] [%s]\n", res.c_str());
             
-            // Always update coordinates if we have a valid fix
-            *lat = f_lat; *lon = f_lon; *speed = f_speed; *alt = f_alt; *sats = f_sats; *hdop = f_acc;
+            float f_lat=0, f_lon=0, f_speed=0, f_alt=0, f_acc=0;
+            int f_sats=0;
+            
+            if (parseCGNSINF(res, &f_lat, &f_lon, &f_speed, &f_alt, &f_sats, &f_acc)) {
+                Serial.printf("[GPS] Valid! Lat=%.4f Lon=%.4f Sats=%d HDOP=%.2f\n", f_lat, f_lon, f_sats, f_acc);
+                *lat = f_lat; *lon = f_lon; *speed = f_speed; *alt = f_alt; *sats = f_sats; *hdop = f_acc;
 
-            // Lock Criteria: HDOP < 2.5 and Sats >= 4 OR HDOP < 1.5 (Strong Fix)
-            if (f_acc < 1.5 || (f_acc < 2.5 && f_sats >= 4)) {
-                locked = true;
-                break; 
-            }
-        } else {
-            // Improved Diagnostic Logging
-            if (res.length() > 0) {
+                if (f_acc < 1.5 || (f_acc < 2.5 && f_sats >= 4)) {
+                    locked = true;
+                    break; 
+                }
+            } else {
+                // Diagnostic Logging
                 int firstComma = res.indexOf(',');
                 int secondComma = res.indexOf(',', firstComma + 1);
-                int thirdComma = res.indexOf(',', secondComma + 1);
-                
-                String fixStatus = res.substring(firstComma + 1, secondComma);
-                
-                // Sats View is at index 14
-                int commaCount = 0;
-                int satsViewIdx = -1;
-                for (int i = 0; i < res.length(); i++) {
-                    if (res[i] == ',') {
-                        commaCount++;
-                        if (commaCount == 14) {
-                            int nextComma = res.indexOf(',', i + 1);
-                            if (nextComma != -1) {
-                                String sv = res.substring(i + 1, nextComma);
-                                Serial.printf("[GPS] Wait... FixStatus=%s SatsView=%s\n", fixStatus.c_str(), sv.c_str());
-                                satsViewIdx = i;
-                                break;
-                            }
+                if (firstComma != -1 && secondComma != -1) {
+                    String fixStatus = res.substring(firstComma + 1, secondComma);
+                    if (fixStatus.length() == 0) fixStatus = "0";
+                    
+                    // Sats View is at index 14
+                    int commaCount = 0;
+                    String sv = "0";
+                    int from = 0;
+                    for (int i=0; i<15; i++) {
+                        int next = res.indexOf(',', from);
+                        if (next == -1) {
+                            if (i == 14) sv = res.substring(from);
+                            break;
                         }
+                        if (i == 14) {
+                            sv = res.substring(from, next);
+                        }
+                        from = next + 1;
                     }
-                }
-                if (satsViewIdx == -1) {
-                    Serial.printf("[GPS] Wait... FixStatus=%s\n", fixStatus.c_str());
+                    if (sv.length() == 0) sv = "0";
+                    Serial.printf("[GPS] Wait... FixStatus=%s SatsView=%s\n", fixStatus.c_str(), sv.c_str());
                 }
             }
         }
@@ -383,7 +433,6 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
 
     Serial.println("[Lifecycle] Connecting to Network...");
     
-    // Ensure Modem RF is ON
     modem.sendAT("+CFUN=1");
     modem.waitResponse(2000L);
 
@@ -400,6 +449,7 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
         
         Serial.printf("[MQTT] Connecting to %s...", settings.mqtt_broker.c_str());
         mqtt.setServer(settings.mqtt_broker.c_str(), 1883);
+        mqtt.setBufferSize(512); // Ensure we can send full JSON
         if (mqtt.connect(imei.c_str(), settings.mqtt_user.c_str(), settings.mqtt_pass.c_str())) {
             Serial.println(" Connected");
             
@@ -425,7 +475,6 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
             doc["battery_voltage"] = PMU.getBattVoltage() / 1000.0F; 
             doc["soc"] = PMU.getBatteryPercent();
             
-            // Convert CSQ to dBm
             int csq = modem.getSignalQuality();
             int dbm = (csq == 99) ? -113 : (csq * 2) - 113;
             doc["rssi"] = dbm;
@@ -438,7 +487,7 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
             if (mqtt.publish(mqtt_topic_up.c_str(), payload.c_str())) {
                 Serial.println("[MQTT] Publish Successful");
             } else {
-                Serial.println("[MQTT] Publish FAILED");
+                Serial.printf("[MQTT] Publish FAILED (State: %d)\n", mqtt.state());
             }
             
             delay(1000);
@@ -455,7 +504,9 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
 void setup() {
     Serial.begin(115200);
     delay(2000);
-    Serial.println("\n--- AE Tracker Boot (Low Power Mode) ---");
+    
+    esp_reset_reason_t reason = esp_reset_reason();
+    Serial.printf("\n--- AE Tracker Boot (Reason: %d) ---\n", reason);
 
     Wire.begin(I2C_SDA, I2C_SCL);
     if (!PMU.begin(Wire, AXP2101_SLAVE_ADDRESS, I2C_SDA, I2C_SCL)) {
@@ -466,49 +517,28 @@ void setup() {
     PMU.enableBattDetection();
     PMU.enableCellbatteryCharge();
     
-    // Hardware Init
     pinMode(0, INPUT_PULLUP);
     strip.begin();
     strip.show();
     
     Serial1.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
     
-    // Load Config
     loadSettings();
-    
-    // 1. Power Config Check
     checkPowerConfig();
     
-    // 2. BLE Window (30s)
-    modemPowerOn(); // Need modem on for some reason? No, independent.
-    // Actually, keep modem OFF during BLE to save power? 
-    // User flow said: "1. Power on... 2. Get GPS".
-    // Let's power modem ON here anyway to warm it up OR just for BLE manuf data?
-    // Manuf data needs Voltage.
-    runBLEWindow(30000); 
-
-    // 3. Acquire GPS
-    // Ensure Modem/GPS is powered
     modemPowerOn(); 
+    initGNSS(); // Start GPS early
+    
+    runBLEWindow(30000); 
     
     float lat=0, lon=0, speed=0, alt=0, hdop=99; 
     int sats=0;
     bool has_fix = getPreciseLocation(&lat, &lon, &speed, &alt, &sats, &hdop);
     
-    // 4. Transmit (if we have fix OR if we want to report heartbeat?)
-    // User said: "Once GPS attained... power down GPS... send payloads"
-    // If NO FIX, do we send? 
-    // Backoff logic handles the "No Fix" case usually.
-    // For now, let's try to send even if no fix (heartbeat) or maybe just fail?
-    // We'll send what we have (0,0 if fail) but the Backoff Logic is key here.
-    
-    // Stop GPS to save power before TX
     modem.sendAT("+CGNSPWR=0");
     modem.waitResponse();
     
     transmitData(lat, lon, speed, alt, sats, hdop);
-    
-    // 5. Sleep
     goToSleep(has_fix);
 }
 
