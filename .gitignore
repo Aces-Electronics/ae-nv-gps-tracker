@@ -1,1 +1,3 @@
 .pio/
+.DS_Store**
+hardware/ae-tracker-db/ae-tracker-db-backups
