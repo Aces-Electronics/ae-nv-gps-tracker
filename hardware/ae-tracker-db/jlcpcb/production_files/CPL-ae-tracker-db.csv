@@ -8,7 +8,7 @@ C6,100nF,C_0603_1608Metric,149.081008,-89.70426,0.0,top
 D1,SMBJ18A,D_SMB,152.5,-107.0375,0.0,top
 F1,Fuse_Small,R_1206_3216Metric,158.1,-106.9375,90.0,top
 J3,Conn_01x04_Socket,"PhoenixContact_MC_1,5_4-GF-3.5_1x04_P3.50mm_Horizontal_ThreadedFlange",150.65,-111.8675,0.0,top
-J4,Conn_01x16_Pin,PinHeader_1x16_P2.54mm_Vertical,136.0,-99.95,180.0,top
+J4,Conn_01x16_Pin,PinHeader_1x16_P2.54mm_Horizontal,136.0,-99.95,180.0,top
 R10,10k,R_0603_1608Metric,138.751661,-101.528972,-90.0,top
 R11,10k,R_0603_1608Metric,139.921454,-97.869562,180.0,top
 R12,10k,R_0603_1608Metric,148.220131,-95.887813,90.0,top

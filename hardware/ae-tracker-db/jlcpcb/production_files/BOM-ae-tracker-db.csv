@@ -12,11 +12,10 @@ Comment,Designator,Footprint,LCSC,Quantity
 590R,R14,R_0603_1608Metric,C2933241,1
 BQ25176J,U3,WSON-8-1EP_2x2mm_P0.5mm_EP0.9x1.6mm,C22407142,1
 Conn_01x04_Socket,J3,"PhoenixContact_MC_1,5_4-GF-3.5_1x04_P3.50mm_Horizontal_ThreadedFlange",C441259,1
-Conn_01x16_Pin,J4,PinHeader_1x16_P2.54mm_Vertical,C5370355,1
+Conn_01x16_Pin,J4,PinHeader_1x16_P2.54mm_Horizontal,C5370355,1
 Fuse_Small,F1,R_1206_3216Metric,C41367222,1
 LIS3DH,U2,LGA-16_3x3mm_P0.5mm_LayoutBorder3x5y,C15134,1
 SMBJ18A,D1,D_SMB,C78412,1
 SN65HVD231,U1,SOIC-8_3.9x4.9mm_P1.27mm,C129257,1
 TPS1H000-Q1,U4,MSOP-8-1EP_3x3mm_P0.65mm_EP1.68x1.88mm,C2653764,1
-Conn_01x01_Pin,,PinHeader_1x01_P2.54mm_Vertical,,0
-Jumper_2_Bridged,JP1,SolderJumper-2_P1.3mm_Bridged_RoundedPad1.0x1.5mm,,1
+KF2EDGKNM-3.5-4P,J1,DNP,C2923037,1
