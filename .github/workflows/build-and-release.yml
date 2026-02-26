@@ -1,0 +1,81 @@
+name: Build & Release Firmware
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version_override:
+        description: 'Version override (e.g. 1.2.3). Leave empty to auto-increment.'
+        required: false
+        type: string
+
+jobs:
+  build:
+    name: Build GPS Tracker Firmware
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-gps-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-${{ runner.os }}-gps-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Set Version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version_override }}" ]; then
+            echo "version=${{ github.event.inputs.version_override }}" >> $GITHUB_OUTPUT
+          else
+            echo "version=0.0.${{ github.run_number }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build Firmware
+        env:
+          OTA_VERSION: ${{ steps.version.outputs.version }}
+          HW_VERSION: "1"
+        run: pio run -e esp32-s3-devkitm-1
+
+      - name: Stage Binary
+        run: |
+          mkdir -p artifacts
+          cp .pio/build/esp32-s3-devkitm-1/firmware.bin artifacts/ae-gps-tracker_v${{ steps.version.outputs.version }}.bin
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-bin
+          path: artifacts/ae-gps-tracker_v${{ steps.version.outputs.version }}.bin
+          retention-days: 30
+
+      - name: Notify AE-NV Server (on main branch only)
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        env:
+          AE_NV_WEBHOOK_URL: ${{ secrets.AE_NV_WEBHOOK_URL }}
+          AE_NV_WEBHOOK_SECRET: ${{ secrets.AE_NV_WEBHOOK_SECRET }}
+        run: |
+          PAYLOAD=$(printf '{"event":"workflow_run","repo":"ae-nv-gps-tracker","run_id":%s,"conclusion":"success","version":"%s"}' \
+            "${{ github.run_id }}" "${{ steps.version.outputs.version }}")
+          SIG="sha256=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$AE_NV_WEBHOOK_SECRET" | sed 's/SHA2-256(stdin)= //' | tr -d '\n')"
+          curl -f -X POST "${AE_NV_WEBHOOK_URL}/api/admin/github/webhook" \
+            -H "Content-Type: application/json" \
+            -H "X-Hub-Signature-256: ${SIG}" \
+            -H "X-GitHub-Event: workflow_run" \
+            -d "$PAYLOAD"
