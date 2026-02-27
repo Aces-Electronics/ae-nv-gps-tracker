@@ -64,6 +64,7 @@ jobs:
           name: firmware-bin
           path: artifacts/ae-gps-tracker_v${{ steps.version.outputs.version }}.bin
           retention-days: 30
+          compression-level: 0
 
       - name: Notify AE-NV Server (on main branch only)
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
