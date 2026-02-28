@@ -53,16 +53,17 @@ jobs:
           HW_VERSION: "1"
         run: pio run -e esp32-s3-devkitm-1
 
-      - name: Stage Binary
+      - name: Stage Artifacts
         run: |
           mkdir -p artifacts
           cp .pio/build/esp32-s3-devkitm-1/firmware.bin artifacts/ae-gps-tracker_v${{ steps.version.outputs.version }}.bin
+          cp .pio/build/esp32-s3-devkitm-1/firmware.elf artifacts/ae-gps-tracker_v${{ steps.version.outputs.version }}.elf
 
-      - name: Upload Build Artifact
+      - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-bin
-          path: artifacts/ae-gps-tracker_v${{ steps.version.outputs.version }}.bin
+          name: firmware-artifacts
+          path: artifacts/ae-gps-tracker_v${{ steps.version.outputs.version }}*
           retention-days: 30
           compression-level: 0
 

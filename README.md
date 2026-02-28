@@ -177,6 +177,13 @@ The tracker integrates with the AE-NV web dashboard:
 - **Satellite Count**: Live satellite visibility
 - **Recent Locations**: Historical table with GPS, battery, and supply data
 
+## Forensic Crash Reporting
+The tracker includes a high-fidelity crash handling system for remote diagnostics:
+- **Panic Interception**: Intercepts ESP32-S3 hardware panics to capture the exact state of failure.
+- **Persistent Logs**: Saves register dumps and backtraces to NVS/RTC memory to survive reboots.
+- **Cloud Delivery**: Automatically uploads the crash log to the cloud via MQTT on next boot.
+- **Symbol Matching**: The CI pipeline preserves `.elf` files for every build, allowing the backend to translate raw addresses into source code lines (e.g., `main.cpp:142`).
+
 ## Next Steps
 
 See the agent prompts in `/docs/agent-prompts/` for:

@@ -9,11 +9,15 @@
 #include <XPowersLib.h>
 #include <Preferences.h>
 #include "ble_handler.h"
+#include "crash_handler.h"
 
 // --- Configuration ---
 TrackerSettings settings;
 TrackerStatus status;
 Preferences prefs;
+
+bool g_hasCrashLog = false;
+
 
 // --- Globals ---
 TinyGsm modem(Serial1);
@@ -455,6 +459,20 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
         if (mqtt.connect(imei.c_str(), settings.mqtt_user.c_str(), settings.mqtt_pass.c_str())) {
             Serial.println(" Connected");
             
+            // Check for previous crash logs
+            if (g_hasCrashLog) {
+                String log = crash_handler_get_log();
+                String crash_topic = "ae/crash/" + imei;
+                Serial.println("[MQTT] Publishing Crash Log...");
+                if (mqtt.publish(crash_topic.c_str(), log.c_str())) {
+                    Serial.println("[MQTT] Crash Log Sent Successfully");
+                    g_hasCrashLog = false;
+                } else {
+                    Serial.println("[MQTT] Crash Log Publish FAILED");
+                }
+            }
+
+            
             StaticJsonDocument<512> doc;
             doc["mac"] = imei;
             
@@ -505,7 +523,9 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
 
 void setup() {
     Serial.begin(115200);
+    g_hasCrashLog = crash_handler_process_on_boot();
     delay(2000);
+
     
     esp_reset_reason_t reason = esp_reset_reason();
     Serial.printf("\n--- AE Tracker Boot (Reason: %d) ---\n", reason);
