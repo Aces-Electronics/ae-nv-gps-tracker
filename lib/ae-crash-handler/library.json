@@ -1,0 +1,12 @@
+{
+    "name": "ae-crash-handler",
+    "version": "1.0.0",
+    "description": "Unified crash handler for AE-NV devices (supports RISC-V and Xtensa)",
+    "keywords": "crash, debug, backtrace, esp32",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/Aces-Electronics/ae-nv.git"
+    },
+    "frameworks": "arduino",
+    "platforms": "espressif32"
+}
