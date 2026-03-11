@@ -1408,7 +1408,7 @@
 		(path "/047b0557-ac24-4400-907a-698580e4308b")
 		(sheetname "/")
 		(sheetfile "ae-tracker-db.kicad_sch")
-		(attr through_hole exclude_from_pos_files exclude_from_bom dnp)
+		(attr through_hole exclude_from_pos_files dnp)
 		(fp_line
 			(start -1.38 -1.38)
 			(end 0 -1.38)
@@ -2177,7 +2177,7 @@
 				)
 			)
 		)
-		(property "LCSC" "C5370355"
+		(property "LCSC" "C2894958"
 			(at 0 0 180)
 			(unlocked yes)
 			(layer "F.Fab")
@@ -6416,7 +6416,7 @@
 		(sheetname "/")
 		(sheetfile "ae-tracker-db.kicad_sch")
 		(zone_connect 1)
-		(attr exclude_from_pos_files exclude_from_bom allow_soldermask_bridges)
+		(attr exclude_from_pos_files allow_soldermask_bridges)
 		(net_tie_pad_groups "1, 2")
 		(fp_poly
 			(pts
@@ -9640,7 +9640,7 @@
 			(justify bottom)
 		)
 	)
-	(gr_text "JLCJLCJLC"
+	(gr_text "JLCJLCJLCJLC"
 		(at 156.4 85.8 0)
 		(layer "B.SilkS")
 		(uuid "2d861efe-3875-4a6a-b008-f798f8a83259")
