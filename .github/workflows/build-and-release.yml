@@ -67,6 +67,12 @@ jobs:
           retention-days: 30
           compression-level: 0
 
+      - name: Delete older artifacts
+        uses: geekyeggo/delete-artifact@v5
+        with:
+          name: firmware-artifacts
+          keep_latest: 2
+
       - name: Notify AE-NV Server (on main branch only)
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         env:
