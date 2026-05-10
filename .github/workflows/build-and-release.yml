@@ -71,7 +71,7 @@ jobs:
           AE_NV_WEBHOOK_URL: ${{ secrets.AE_NV_WEBHOOK_URL }}
           AE_NV_WEBHOOK_SECRET: ${{ secrets.AE_NV_WEBHOOK_SECRET }}
         run: |
-          PAYLOAD=$(printf '{"event":"workflow_run","repo":"ae-nv-gps-tracker","run_id":%s,"conclusion":"success","version":"%s"}' \
+          PAYLOAD=$(printf '{"event":"workflow_run","repo":"ae-nv-gps-tracker","run_id":%s,"conclusion":"success","version":"%s","hw_version":"1"}' \
             "${{ github.run_id }}" "${{ steps.version.outputs.version }}")
           SIG="sha256=$(python3 -c '
           import hmac, hashlib, os, sys
