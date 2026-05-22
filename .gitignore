@@ -1,3 +1,5 @@
 .pio/
 .DS_Store**
 hardware/ae-tracker-db/ae-tracker-db-backups.DS_Store
+hardware/ae-tracker-db/ae-tracker-db-backups/**
+.vscode/
