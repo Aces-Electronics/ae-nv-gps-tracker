@@ -34,7 +34,18 @@ public:
             Serial.printf("[BLE] Device Name set: %s\n", _settings->name.c_str());
         }
         else if (uuid == BLEHandler::APN_CHAR_UUID) _settings->apn = val.c_str();
-        else if (uuid == BLEHandler::BROKER_CHAR_UUID) _settings->mqtt_broker = val.c_str();
+        else if (uuid == BLEHandler::BROKER_CHAR_UUID) {
+            // Ignore an empty write rather than saving it: an empty host bricks the
+            // uplink until the tracker is re-provisioned, and the write is almost
+            // always a settings form saved with the broker field never populated.
+            String broker = String(val.c_str());
+            broker.trim();
+            if (broker.length() == 0) {
+                Serial.println("[BLE] Rejected empty broker write; keeping stored value");
+            } else {
+                _settings->mqtt_broker = broker;
+            }
+        }
         else if (uuid == BLEHandler::USER_CHAR_UUID) _settings->mqtt_user = val.c_str();
         else if (uuid == BLEHandler::PASS_CHAR_UUID) _settings->mqtt_pass = val.c_str();
         else if (uuid == BLEHandler::INTERVAL_CHAR_UUID) {

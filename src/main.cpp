@@ -38,8 +38,18 @@ void loadSettings() {
     settings.mqtt_broker = prefs.getString("broker", "mqtt.aceselectronics.com.au");
     settings.mqtt_user = prefs.getString("user", "aesmartshunt");
     settings.mqtt_pass = prefs.getString("pass", "AERemoteAccess2024!");
-    settings.report_interval_mins = prefs.getUInt("interval", 5); 
+    settings.report_interval_mins = prefs.getUInt("interval", 5);
     if (settings.report_interval_mins < 5) settings.report_interval_mins = 5;
+
+    // getString()'s default only covers a *missing* key. A stored zero-length
+    // value comes back as "", and an empty host fails DNS resolution instantly --
+    // the uplink then dies with no obvious cause until the unit is re-provisioned.
+    // Treat empty as absent so the device self-heals on the next boot.
+    settings.mqtt_broker.trim();
+    if (settings.mqtt_broker.length() == 0) {
+        Serial.println("[Settings] WARN: Stored broker is empty. Falling back to default.");
+        settings.mqtt_broker = "mqtt.aceselectronics.com.au";
+    }
 
     // Override for Telstra SIM if default is hologram
     if (settings.apn == "hologram") {
