@@ -22,3 +22,21 @@ bool crash_handler_process_on_boot();
  * @return String containing the crash log and backtrace.
  */
 String crash_handler_get_log();
+
+/**
+ * @brief Whether NVS still holds a crash log.
+ *
+ * Distinct from crash_handler_process_on_boot(), which answers "did the previous
+ * boot panic" and can only be true once -- it consumes the RTC magic. This asks
+ * the durable copy instead, so a log captured on an earlier boot and never
+ * delivered can still be found, dumped and uploaded.
+ *
+ * @return true if a stored crash log is present.
+ */
+bool crash_handler_has_log();
+
+/**
+ * @brief Clears the crash log from NVS.
+ */
+void crash_handler_clear_log();
+

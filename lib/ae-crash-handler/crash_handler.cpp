@@ -50,20 +50,43 @@ String crash_handler_get_log() {
     return log;
 }
 
+bool crash_handler_has_log() {
+    crashPrefs.begin("crash", true);
+    const bool has = crashPrefs.isKey("log");
+    crashPrefs.end();
+    return has;
+}
+
+void crash_handler_clear_log() {
+    crashPrefs.begin("crash", false);
+    crashPrefs.remove("log");
+    crashPrefs.end();
+}
+
+
 // Internal helper for architecture-specific backtrace files
 extern "C" void append_to_rtc_buffer(const char* format, ...) {
     if (rtc_crash_info.magic != CRASH_MAGIC) return;
-    
-    char buf[128];
+
+    // Formats straight into the RTC buffer, against the space actually left in
+    // it. It used to stage through a char buf[128] first, which silently cut
+    // every caller off at 127 characters -- and the register dump is ONE printf
+    // of about 700 bytes. So the log that reached the cloud held MEPC, RA, SP,
+    // GP, TP and half of T0, then stopped mid-value with "Backtrace:" run
+    // straight onto the end of it. Thirty of the thirty-six registers the dump
+    // exists to capture were being thrown away, in a 2 KB buffer that had ample
+    // room for all of them.
+    //
+    // The old length check also dropped an over-long append entirely rather than
+    // taking what fitted, so the tail of a crash log was all-or-nothing.
+    size_t current_len = strnlen(rtc_crash_info.buffer, CRASH_BUFFER_SIZE);
+    if (current_len >= CRASH_BUFFER_SIZE - 1) return;
+
     va_list args;
     va_start(args, format);
-    vsnprintf(buf, sizeof(buf), format, args);
+    vsnprintf(rtc_crash_info.buffer + current_len,
+              CRASH_BUFFER_SIZE - current_len, format, args);
     va_end(args);
-
-    size_t current_len = strlen(rtc_crash_info.buffer);
-    if (current_len + strlen(buf) < CRASH_BUFFER_SIZE - 1) {
-        strcat(rtc_crash_info.buffer, buf);
-    }
 }
 
 // Architecture-specific implementations are included via #ifdef
