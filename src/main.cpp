@@ -533,7 +533,12 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
 
 void setup() {
     Serial.begin(115200);
-    g_hasCrashLog = crash_handler_process_on_boot();
+    // process_on_boot() consumes the RTC magic, so it answers true exactly once --
+    // on the boot straight after the panic. If the log is not delivered during
+    // that one boot it is never looked at again, even though it is sitting in
+    // NVS. A board that reboots before it can report is precisely the board whose
+    // log is worth having, so ask the durable copy as well.
+    g_hasCrashLog = crash_handler_process_on_boot() || crash_handler_has_log();
     delay(2000);
 
     
