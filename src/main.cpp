@@ -10,6 +10,7 @@
 #include <Preferences.h>
 #include "ble_handler.h"
 #include "crash_handler.h"
+#include "ota_handler.h"
 
 // --- Configuration ---
 TrackerSettings settings;
@@ -29,7 +30,27 @@ BLEHandler ble;
 
 String imei = "";
 String mqtt_topic_up = "";
+String mqtt_topic_dn = "";
 bool stay_awake = false; // Enable Sleep for Backoff Strategy
+
+// How long the MQTT session is held open after publishing, waiting for the
+// retained downlink. The broker sends a retained message immediately on SUBACK,
+// so this is one round trip's worth of slack, not a poll. It replaces the
+// delay(1000) that used to sit here, so the worst case costs ~2s more modem-on
+// time per wake -- on a five-minute cycle that is roughly 5 mAh/day at a
+// registered-idle 25 mA, and the loop exits the moment something arrives.
+static const unsigned long DOWNLINK_WAIT_MS = 3000;
+
+OtaCommand g_otaCmd;
+bool g_otaPending = false;
+
+// CI passes the release number in as OTA_VERSION; a bench build has none. An
+// empty string is reported as-is rather than as a made-up number, because the
+// backend matches an OTA command against exactly this value and a placeholder
+// would close commands the device never applied.
+const char* firmwareVersion() {
+    return FIRMWARE_VERSION;
+}
 
 void loadSettings() {
     prefs.begin("tracker", false);
@@ -439,13 +460,37 @@ bool getPreciseLocation(float* lat, float* lon, float* speed, float* alt, int* s
     }
 }
 
+void onDownlink(char* topic, uint8_t* payload, unsigned int length) {
+    Serial.printf("[MQTT] Downlink on %s (%u bytes)\n", topic, length);
+
+    // Only OTA is subscribed, so the topic is not re-checked here. A zero-length
+    // payload is the backend withdrawing the retained command; otaParseCommand()
+    // rejects it and g_otaPending stays false.
+    if (otaParseCommand(payload, length, g_otaCmd)) {
+        g_otaPending = true;
+        Serial.printf("[OTA] Command: v%s %s\n", g_otaCmd.version.c_str(), g_otaCmd.url.c_str());
+    }
+}
+
 void transmitData(float lat, float lon, float speed, float alt, int sats, float hdop) {
     Serial.println("[Lifecycle] Preparing Transmission...");
-    
+
     imei = getIMEIWithRetry();
     mqtt_topic_up = "ae-nv/tracker/" + imei + "/up";
+    // The backend keys this device's devices row on the IMEI -- processTrackerData()
+    // upserts with mac = imei -- and the command queue builds its topic from that
+    // same column (ae/downlink/<device_mac>/OTA), so the IMEI is what a downlink is
+    // addressed to. It has no parent, so it is never routed via a gateway.
+    //
+    // The catch is what happens when getIMEIWithRetry() does not get an IMEI: the
+    // fallback identity is ESP32-<mac suffix>, and one enrolled row is already
+    // stored as the literal 'OK' from an earlier version of that retry. Whatever
+    // it publishes under is what it must subscribe under, so this is derived from
+    // the same string rather than from the IMEI directly.
+    mqtt_topic_dn = "ae/downlink/" + imei + "/OTA";
     Serial.printf("[MQTT] MAC/IMEI: %s\n", imei.c_str());
     Serial.printf("[MQTT] Topic: %s\n", mqtt_topic_up.c_str());
+    Serial.printf("[MQTT] Downlink: %s\n", mqtt_topic_dn.c_str());
 
     Serial.println("[Lifecycle] Connecting to Network...");
     
@@ -465,10 +510,22 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
         
         Serial.printf("[MQTT] Connecting to %s...", settings.mqtt_broker.c_str());
         mqtt.setServer(settings.mqtt_broker.c_str(), 1883);
-        mqtt.setBufferSize(512); // Ensure we can send full JSON
+        mqtt.setBufferSize(768); // Send the full JSON, and receive an OTA command in one frame
+        mqtt.setCallback(onDownlink);
         if (mqtt.connect(imei.c_str(), settings.mqtt_user.c_str(), settings.mqtt_pass.c_str())) {
             Serial.println(" Connected");
-            
+
+            // Subscribed before anything is published. The retained OTA arrives on
+            // SUBACK, so subscribing first is what lets one session both report and
+            // collect; doing it after the publish would still work, but it puts the
+            // slowest step of the wake behind the one that must not be lost.
+            //
+            // qos 1: the broker only replays a retained message once, and a qos 0
+            // copy dropped on a marginal LTE-M link is not repeated.
+            if (!mqtt.subscribe(mqtt_topic_dn.c_str(), 1)) {
+                Serial.println("[MQTT] Subscribe FAILED (no downlink this wake)");
+            }
+
             // Check for previous crash logs
             if (g_hasCrashLog) {
                 String log = crash_handler_get_log();
@@ -483,8 +540,13 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
             }
 
             
-            StaticJsonDocument<512> doc;
+            StaticJsonDocument<768> doc;
             doc["mac"] = imei;
+            // The key the worker reads for every other product
+            // (backend-worker/src/index.ts:2154). Nothing has ever set it here, which
+            // is why both enrolled trackers have an empty firmware_version column and
+            // why an OTA command aimed at one could never be resolved.
+            doc["fw_version"] = firmwareVersion();
             
             String suffix = settings.name;
             if (suffix.length() == 0) {
@@ -520,11 +582,39 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
                 Serial.printf("[MQTT] Publish FAILED (State: %d)\n", mqtt.state());
             }
             
-            delay(1000);
+            // Hold the session just long enough for the retained downlink. This is
+            // the only window this device has: setup() runs once per wake and loop()
+            // is empty, so anything not collected here waits for the next wake.
+            unsigned long wait_start = millis();
+            while (!g_otaPending && millis() - wait_start < DOWNLINK_WAIT_MS) {
+                mqtt.loop();
+                delay(10);
+            }
+
             mqtt.disconnect();
         } else {
              Serial.printf(" FAILED (State: %d)\n", mqtt.state());
         }
+
+        // OTA runs on the same GPRS session, after MQTT is closed and before it is
+        // torn down. On success this call does not return -- the device reboots into
+        // the new slot -- so the telemetry publish above has to have happened first.
+        if (g_otaPending) {
+            String act;
+            if (!otaShouldApply(g_otaCmd, firmwareVersion())) {
+                // otaShouldApply logs the specific reason.
+            } else if (!otaLinkIsCatM(modem, act)) {
+                // otaLinkIsCatM logs the technology it actually saw. Deliberately not
+                // a failure the device retries hard: it will be offered the same
+                // retained command on the next wake, and may be on a better cell.
+            } else if (otaDownloadAndApply(modem, g_otaCmd)) {
+                modem.gprsDisconnect();
+                modemPowerOff();
+                Serial.flush();
+                ESP.restart();
+            }
+        }
+
         modem.gprsDisconnect();
     } else {
         Serial.println(" GPRS FAILED");
@@ -543,7 +633,7 @@ void setup() {
 
     
     esp_reset_reason_t reason = esp_reset_reason();
-    Serial.printf("\n--- AE Tracker Boot (Reason: %d) ---\n", reason);
+    Serial.printf("\n--- AE Tracker Boot (Reason: %d, FW: '%s') ---\n", reason, firmwareVersion());
 
     Wire.begin(I2C_SDA, I2C_SCL);
     if (!PMU.begin(Wire, AXP2101_SLAVE_ADDRESS, I2C_SDA, I2C_SCL)) {

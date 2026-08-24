@@ -60,7 +60,14 @@ jobs:
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: firmware-artifacts
+          # firmware-bin-<device_type>-hw<n>, the name the webhook looks for
+          # (artifactNameFor() in ae-nv-web-app/src/app/api/admin/github/webhook/route.ts).
+          # This used to be `firmware-artifacts` and was only ever found by the
+          # single-artifact fallback -- which holds only while this repo builds one
+          # image per run. The moment it grows a matrix, the fallback stops applying
+          # and every build publishes nothing, which is what happened to
+          # ae-nv-temp-monitor's hw1.
+          name: firmware-bin-ae-gps-tracker-hw1
           path: artifacts/ae-gps-tracker_v${{ steps.version.outputs.version }}*
           retention-days: 1
           compression-level: 0
