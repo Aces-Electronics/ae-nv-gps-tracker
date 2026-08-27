@@ -8,7 +8,10 @@ LilyGo T-SIM7080G-S3 based GPS tracker with NB-IoT connectivity for the AE-NV ec
 - **GPS**: Integrated GNSS (GPS/GLONASS/Beidou/Galileo)
 - **Connectivity**: NB-IoT / LTE Cat-M1
 - **Battery**: LiPo with AXP2101 PMU
-- **Sensors**: MMA8452Q accelerometer for orientation detection
+- **Daughter board**: `ae-tracker-db` — LIS3DH accelerometer, SN65HVD231 CAN
+  transceiver, and a BQ25176J charger that tops the LiPo up from the jetski's
+  supply through an MCU-switchable cutoff. Plugs onto the LilyGo's 16-pin
+  expansion header; the J4 pin map is in [`src/utilities.h`](src/utilities.h).
 
 ## Features
 
@@ -16,7 +19,8 @@ LilyGo T-SIM7080G-S3 based GPS tracker with NB-IoT connectivity for the AE-NV ec
 - ✅ NB-IoT connectivity via Telstra network
 - ✅ MQTT telemetry publishing to AE-NV backend
 - ✅ BLE configuration interface (90s window on boot)
-- ✅ Orientation detection (Flat/Vertical/Upside Down)
+- ✅ Orientation detection (Flat/Vertical/Upside Down) — needs the daughter
+  board; reports `Unknown` without it
 - ✅ Configurable reporting intervals (1-60 minutes)
 - ✅ Battery voltage monitoring
 - ✅ Deep sleep support (planned)

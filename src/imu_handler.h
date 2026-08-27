@@ -1,0 +1,39 @@
+#pragma once
+
+#include <Arduino.h>
+
+// The vocabulary is fixed by the telemetry contract: the README documents an
+// "orientation" field carrying exactly these strings, and the web UI shows it
+// as a label rather than parsing it. Unknown is what goes out when the IMU did
+// not answer, so the field stays present and typed either way.
+enum class Orientation {
+    Unknown,
+    Flat,
+    Vertical,
+    UpsideDown,
+};
+
+struct ImuReading {
+    bool        valid = false;
+    float       x = 0, y = 0, z = 0; // g, gravity included
+    Orientation orientation = Orientation::Unknown;
+};
+
+// Brings up the LIS3DH on the daughter board's I2C bus. Returns false when
+// nothing answers, which is deliberately not fatal: this product's job is to
+// report a position, and a missing or faulty daughter board must not be able to
+// stop that happening.
+bool imuBegin();
+
+// True once imuBegin() has found a device.
+bool imuPresent();
+
+// The address imuBegin() settled on, or 0 if none. Worth logging: the board
+// leaves SDO/SA0 floating, so which of the two it answers on is not fixed.
+uint8_t imuAddress();
+
+// Averages a short burst of samples and classifies the result. Safe to call
+// with no IMU present -- returns a reading with valid == false.
+ImuReading imuRead();
+
+const char* orientationName(Orientation o);

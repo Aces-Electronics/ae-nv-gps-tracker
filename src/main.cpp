@@ -11,6 +11,7 @@
 #include "ble_handler.h"
 #include "crash_handler.h"
 #include "ota_handler.h"
+#include "imu_handler.h"
 
 // --- Configuration ---
 TrackerSettings settings;
@@ -475,6 +476,11 @@ void onDownlink(char* topic, uint8_t* payload, unsigned int length) {
 void transmitData(float lat, float lon, float speed, float alt, int sats, float hdop) {
     Serial.println("[Lifecycle] Preparing Transmission...");
 
+    // Sampled here rather than in setup() so the reported orientation is the one
+    // at report time: GPS acquisition ahead of this can run for five minutes,
+    // and a value from before that is not describing the same situation.
+    ImuReading imu = imuRead();
+
     imei = getIMEIWithRetry();
     mqtt_topic_up = "ae-nv/tracker/" + imei + "/up";
     // The backend keys this device's devices row on the IMEI -- processTrackerData()
@@ -566,7 +572,13 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
             doc["device_voltage"] = PMU.getBattVoltage() / 1000.0F; 
             doc["battery_voltage"] = PMU.getBattVoltage() / 1000.0F; 
             doc["soc"] = PMU.getBatteryPercent();
-            
+
+            // Always emitted, "Unknown" included: the field has been in the
+            // documented payload all along, and a key that appears only on
+            // boards with a working IMU is harder for the backend to reason
+            // about than one that is always there.
+            doc["orientation"] = orientationName(imu.orientation);
+
             int csq = modem.getSignalQuality();
             int dbm = (csq == 99) ? -113 : (csq * 2) - 113;
             doc["rssi"] = dbm;
@@ -643,7 +655,10 @@ void setup() {
     PMU.enableBattVoltageMeasure();
     PMU.enableBattDetection();
     PMU.enableCellbatteryCharge();
-    
+
+    // Daughter board. Absence is reported and then ignored -- see imuBegin().
+    imuBegin();
+
     pinMode(0, INPUT_PULLUP);
     strip.begin();
     strip.show();
