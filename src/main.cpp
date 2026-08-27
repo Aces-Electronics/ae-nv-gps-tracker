@@ -301,6 +301,26 @@ void pollGPSDiagnostic() {
     }
 }
 
+// The BLE window is the only way in to change settings, but on a scheduled wake
+// there is nobody standing there to use it -- and 15s of advertising is a large
+// share of a cycle whose useful work is a GPS fix and one publish. So it opens
+// on a cold boot, and on demand when the boot button is held down through reset.
+// A timer wake goes straight to work.
+//
+// Requires pinMode(0, INPUT_PULLUP) to have run already.
+static bool shouldRunBLEWindow() {
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_UNDEFINED) {
+        Serial.println("[BLE] Cold boot - opening config window.");
+        return true;
+    }
+    if (digitalRead(0) == LOW) {
+        Serial.println("[BLE] Boot button held - opening config window.");
+        return true;
+    }
+    Serial.println("[BLE] Timer wake - skipping config window.");
+    return false;
+}
+
 void runBLEWindow(unsigned long duration_ms) {
     Serial.printf("\n=== BLE Window (%lu ms) ===\n", duration_ms);
     
@@ -660,7 +680,9 @@ void setup() {
     modemPowerOn(); 
     initGNSS(); // Start GPS early
     
-    runBLEWindow(15000); 
+    if (shouldRunBLEWindow()) {
+        runBLEWindow(15000);
+    }
     
     float lat=0, lon=0, speed=0, alt=0, hdop=99; 
     int sats=0;
