@@ -3,6 +3,7 @@
 #include <Wire.h>
 #include <Adafruit_LIS3DH.h>
 #include <Adafruit_Sensor.h>
+#include "driver/gpio.h"
 
 // The AXP2101 owns Wire (I2C_SDA/I2C_SCL). The daughter board lands the LIS3DH
 // on a different pin pair entirely -- see the J4 map in utilities.h -- so this
@@ -30,6 +31,23 @@ static const int SAMPLE_DELAY_MS = 20;
 static bool i2cAck(uint8_t addr) {
     Wire1.beginTransmission(addr);
     return Wire1.endTransmission() == 0;
+}
+
+// Voltage on a bus line with the internal pull-up engaged. digitalRead() only
+// says "under VIH", which cannot separate a resistive divider from a diode
+// clamp from something actively driving. analogRead() attaches the pad to the
+// ADC and clears the pull doing so, so the pull is re-asserted afterwards.
+//
+// Self-checking by design: on an idle healthy line this has to come back near
+// the 3.3V rail. If a line digitalRead() calls high reads near zero here, the
+// pull is not surviving the ADC attach and every number from this is worthless.
+static int lineMilliVolts(uint8_t pin) {
+    analogRead(pin);
+    gpio_set_pull_mode((gpio_num_t)pin, GPIO_PULLUP_ONLY);
+    delayMicroseconds(500);
+    const int mv = analogReadMilliVolts(pin);
+    pinMode(pin, INPUT_PULLUP);
+    return mv;
 }
 
 // Only reached when a line is already stuck low, i.e. the bus is unusable
@@ -78,8 +96,11 @@ bool imuBegin() {
     delayMicroseconds(500);
     const bool sdaIdleHigh = digitalRead(DB_IMU_SDA) == HIGH;
     const bool sclIdleHigh = digitalRead(DB_IMU_SCL) == HIGH;
-    Serial.printf("[IMU] Bus idle: SDA=%s SCL=%s\n",
-                  sdaIdleHigh ? "high" : "LOW", sclIdleHigh ? "high" : "LOW");
+    const int sdaMv = lineMilliVolts(DB_IMU_SDA);
+    const int sclMv = lineMilliVolts(DB_IMU_SCL);
+    Serial.printf("[IMU] Bus idle: SDA=%s (%d mV)  SCL=%s (%d mV)\n",
+                  sdaIdleHigh ? "high" : "LOW", sdaMv,
+                  sclIdleHigh ? "high" : "LOW", sclMv);
     if (!sdaIdleHigh || !sclIdleHigh) {
         Serial.println("[IMU] A line is stuck low - a pull-down still fitted, a short, or a device holding the bus.");
         if (!sdaIdleHigh) characteriseStuckLine(DB_IMU_SDA, "SDA");
