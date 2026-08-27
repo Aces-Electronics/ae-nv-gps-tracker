@@ -32,8 +32,61 @@ static bool i2cAck(uint8_t addr) {
     return Wire1.endTransmission() == 0;
 }
 
+// Only reached when a line is already stuck low, i.e. the bus is unusable
+// either way. Briefly drives the line high to separate a resistor still pulling
+// it down -- the S3 wins easily against 10k -- from a hard short to ground,
+// which it cannot move. Arduino's OUTPUT is GPIO_MODE_INPUT_OUTPUT, so the
+// read-back is the real pad level and not just the output register.
+//
+// Sourcing into a dead short for 200us is well inside what the pad tolerates,
+// and this never runs on a healthy bus.
+static void characteriseStuckLine(uint8_t pin, const char* name) {
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, HIGH);
+    delayMicroseconds(200);
+    const bool rose = digitalRead(pin) == HIGH;
+    pinMode(pin, INPUT_PULLUP);
+    Serial.printf("[IMU]   %s driven high -> %s: %s\n", name,
+                  rose ? "rose" : "STILL LOW",
+                  rose ? "a resistor is pulling it down (pull-down still fitted?), not a short"
+                       : "cannot be moved - looks like a hard short to ground");
+}
+
+// Scans the whole 7-bit range. Only run when the LIS3DH did not answer, to
+// separate "nothing on this bus" from "something is here but not where or what
+// was expected".
+static void imuScanBus() {
+    Serial.println("[IMU] Scanning bus...");
+    int found = 0;
+    for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+        if (i2cAck(addr)) {
+            Serial.printf("[IMU]   device at 0x%02X\n", addr);
+            found++;
+        }
+    }
+    Serial.printf("[IMU] Scan found %d device(s).\n", found);
+}
+
 bool imuBegin() {
-    Wire1.begin(DB_IMU_SDA, DB_IMU_SCL);
+    // Checked before the pins are handed to the I2C peripheral. With the
+    // internal pull-ups engaged both lines must rest high; if either does not,
+    // nothing further can work and the cause is on the board rather than in
+    // software. Worth distinguishing, because a stuck line and an absent board
+    // look identical from the ACK alone.
+    pinMode(DB_IMU_SDA, INPUT_PULLUP);
+    pinMode(DB_IMU_SCL, INPUT_PULLUP);
+    delayMicroseconds(500);
+    const bool sdaIdleHigh = digitalRead(DB_IMU_SDA) == HIGH;
+    const bool sclIdleHigh = digitalRead(DB_IMU_SCL) == HIGH;
+    Serial.printf("[IMU] Bus idle: SDA=%s SCL=%s\n",
+                  sdaIdleHigh ? "high" : "LOW", sclIdleHigh ? "high" : "LOW");
+    if (!sdaIdleHigh || !sclIdleHigh) {
+        Serial.println("[IMU] A line is stuck low - a pull-down still fitted, a short, or a device holding the bus.");
+        if (!sdaIdleHigh) characteriseStuckLine(DB_IMU_SDA, "SDA");
+        if (!sclIdleHigh) characteriseStuckLine(DB_IMU_SCL, "SCL");
+    }
+
+    Wire1.begin(DB_IMU_SDA, DB_IMU_SCL, DB_I2C_HZ);
 
     // SDO/SA0 floats on this board and the LIS3DH pulls that pin up internally,
     // so 0x19 is the expected answer -- see the note in utilities.h. 0x18 is
@@ -49,11 +102,8 @@ bool imuBegin() {
     }
 
     if (!found) {
-        // Both plausible addresses are silent. On this board revision the most
-        // likely cause is not a missing daughter board: R8/R9 pull SDA/SCL down
-        // to GND instead of up to 3.3V, so the bus never idles high and no
-        // device can ACK. Says so here because it is not visible from the bus.
-        Serial.println("[IMU] No ACK on 0x18 or 0x19 - board absent, or SDA/SCL not idling high.");
+        Serial.println("[IMU] No ACK at 0x19 or 0x18.");
+        imuScanBus();
         return false;
     }
 
