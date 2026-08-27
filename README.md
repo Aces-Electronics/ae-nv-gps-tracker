@@ -72,6 +72,28 @@ pio run -d /path/to/ae-sim7080g-tracker -t upload --upload-port /dev/ttyACM6
 pio device monitor --port /dev/ttyACM6 -b 115200
 ```
 
+### CAN bring-up build
+
+A separate environment boots straight into a listen-only CAN sniffer and never
+reaches the tracker's normal cycle — no modem, no MQTT, no sleep:
+
+```bash
+pio run -e can-sniffer -t upload && pio device monitor -b 115200
+```
+
+It scans 250k → 500k → 125k, keeps whichever rate hears frames, then prints a
+table of distinct IDs with hit counts and the last payload for each, refreshed
+every 10 seconds.
+
+**Listen-only never drives the bus**, not even the ACK bit, so this is safe to
+plug into a running ski before anything is known about the bus or its rate. The
+shipping firmware is unaffected — `default_envs` keeps this out of a bare
+`pio run`, and the linker drops the sniffer and the TWAI driver from it.
+
+Note that the daughter board's CAN termination jumper (JP1) is bridged by
+default. A vehicle bus is already terminated at both ends, so JP1 most likely
+wants cutting before connecting to a real ski.
+
 ### Configuration
 
 The tracker can be configured via BLE during the 15-second window on cold boot:

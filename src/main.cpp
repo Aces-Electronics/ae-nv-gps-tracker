@@ -13,6 +13,7 @@
 #include "ota_handler.h"
 #include "imu_handler.h"
 #include "power_handler.h"
+#include "can_handler.h"
 
 // --- Configuration ---
 TrackerSettings settings;
@@ -724,6 +725,13 @@ void setup() {
     pinMode(0, INPUT_PULLUP);
     strip.begin();
     strip.show();
+
+#ifdef CAN_SNIFFER_MODE
+    // Bring-up build: never returns. Deliberately after powerBegin() so the
+    // transceiver starts from a defined state, and before anything touches the
+    // modem -- none of that is wanted with a laptop on the diag port.
+    canSnifferLoop();
+#endif
     
     Serial1.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
     
