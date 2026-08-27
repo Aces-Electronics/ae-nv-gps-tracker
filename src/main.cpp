@@ -43,6 +43,11 @@ String mqtt_topic_dn = "";
 // registered-idle 25 mA, and the loop exits the moment something arrives.
 static const unsigned long DOWNLINK_WAIT_MS = 3000;
 
+// PubSubClient sizes one buffer for both directions, so this has to hold the
+// outgoing telemetry frame and the incoming retained OTA command alike. Named
+// because the publish path now checks against it -- see transmitData().
+static const uint16_t MQTT_BUFFER_SIZE = 768;
+
 OtaCommand g_otaCmd;
 bool g_otaPending = false;
 
@@ -566,7 +571,7 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
         
         Serial.printf("[MQTT] Connecting to %s...", settings.mqtt_broker.c_str());
         mqtt.setServer(settings.mqtt_broker.c_str(), 1883);
-        mqtt.setBufferSize(768); // Send the full JSON, and receive an OTA command in one frame
+        mqtt.setBufferSize(MQTT_BUFFER_SIZE); // Full JSON out, OTA command in, one frame each
         mqtt.setCallback(onDownlink);
         if (mqtt.connect(imei.c_str(), settings.mqtt_user.c_str(), settings.mqtt_pass.c_str())) {
             Serial.println(" Connected");
@@ -596,7 +601,7 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
             }
 
             
-            StaticJsonDocument<768> doc;
+            JsonDocument doc;
             doc["mac"] = imei;
             // The key the worker reads for every other product
             // (backend-worker/src/index.ts:2154). Nothing has ever set it here, which
@@ -641,6 +646,23 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
             String payload;
             serializeJson(doc, payload);
             Serial.println("[MQTT] Publishing: " + payload);
+
+            // StaticJsonDocument<768> used to cap the document at the same size
+            // as the buffer, so an over-long report came out truncated but went.
+            // JsonDocument has no ceiling, so the ceiling moved here.
+            //
+            // PubSubClient refuses an oversized frame by returning false without
+            // touching the wire, and the failure path below can only report
+            // mqtt.state(), which still says "connected". A report that vanishes
+            // for a reason nothing in the log names is the outcome worth
+            // avoiding -- this is what makes the cause explicit. The formula is
+            // PubSubClient's own: 5 bytes of fixed header, 2 for topic length,
+            // then topic and payload.
+            const size_t frameLen = 5 + 2 + mqtt_topic_up.length() + payload.length();
+            if (frameLen > MQTT_BUFFER_SIZE) {
+                Serial.printf("[MQTT] Frame is %u bytes, buffer is %u -- publish will be refused. Payload needs trimming.\n",
+                              (unsigned)frameLen, (unsigned)MQTT_BUFFER_SIZE);
+            }
             if (mqtt.publish(mqtt_topic_up.c_str(), payload.c_str())) {
                 Serial.println("[MQTT] Publish Successful");
                 // Only a delivered report starts the motion rate limit. A failed
