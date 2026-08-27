@@ -18,12 +18,12 @@ LilyGo T-SIM7080G-S3 based GPS tracker with NB-IoT connectivity for the AE-NV ec
 - ✅ GPS tracking with satellite count and HDOP
 - ✅ NB-IoT connectivity via Telstra network
 - ✅ MQTT telemetry publishing to AE-NV backend
-- ✅ BLE configuration interface (90s window on boot)
+- ✅ BLE configuration interface (15s window on cold boot)
 - ✅ Orientation detection (Flat/Vertical/Upside Down) — needs the daughter
   board; reports `Unknown` without it
 - ✅ Configurable reporting intervals (1-60 minutes)
 - ✅ Battery voltage monitoring
-- ✅ Deep sleep support (planned)
+- ✅ Deep sleep between reports, with GPS-failure backoff
 
 ## Telemetry Fields
 
@@ -71,7 +71,7 @@ pio device monitor --port /dev/ttyACM6 -b 115200
 
 ### Configuration
 
-The tracker can be configured via BLE during the 90-second window on boot:
+The tracker can be configured via BLE during the 15-second window on cold boot:
 
 - **Report Interval**: 1-60 minutes
 - **Home Location**: Set via web UI
@@ -165,7 +165,8 @@ The firmware uses robust satellite count parsing with fallback logic:
 
 - **Active Mode**: GPS acquisition + MQTT publish
 - **BLE Window**: 90 seconds on boot for configuration
-- **Deep Sleep**: Planned implementation for extended battery life
+- **Deep Sleep**: Between reports. Interval comes from settings, extended by a
+  backoff when GPS fails repeatedly (5/15/30/60/180 min)
 
 ## Known Issues
 

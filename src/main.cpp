@@ -33,7 +33,6 @@ BLEHandler ble;
 String imei = "";
 String mqtt_topic_up = "";
 String mqtt_topic_dn = "";
-bool stay_awake = false; // Enable Sleep for Backoff Strategy
 
 // How long the MQTT session is held open after publishing, waiting for the
 // retained downlink. The broker sends a retained message immediately on SUBACK,
@@ -266,38 +265,39 @@ void initGNSS() {
     modem.waitResponse();
 }
 
+// One field of a comma-separated CGNSINF line, or "" if the line is too short.
+// Only the two logging paths use this; parseCGNSINF() splits the whole line
+// itself because it needs most of the fields at once.
+static String cgnsinfField(const String& raw, int index) {
+    int from = 0;
+    for (int i = 0; i <= index; i++) {
+        int next = raw.indexOf(',', from);
+        if (next == -1) {
+            return (i == index) ? raw.substring(from) : String("");
+        }
+        if (i == index) return raw.substring(from, next);
+        from = next + 1;
+    }
+    return String("");
+}
+
+// Fix status (field 1) and satellites in view (field 14) -- the two numbers
+// worth watching while a fix is still coming in.
+static void logGPSProgress(const char* tag, const String& raw) {
+    String fix = cgnsinfField(raw, 1);
+    String sv  = cgnsinfField(raw, 14);
+    if (fix.length() == 0) fix = "0";
+    if (sv.length() == 0)  sv  = "0";
+    Serial.printf("[GPS] %s Fix=%s SatsView=%s\n", tag, fix.c_str(), sv.c_str());
+}
+
 void pollGPSDiagnostic() {
     modem.sendAT("+CGNSINF");
     if (modem.waitResponse(1000L, "+CGNSINF: ") == 1) {
         String res = modem.stream.readStringUntil('\n');
         res.trim();
         Serial.printf("[GPS-RAW] [%s]\n", res.c_str());
-        
-        // Quick parse for logs: <run>,<fix>,...
-        int firstComma = res.indexOf(',');
-        int secondComma = res.indexOf(',', firstComma + 1);
-        if (firstComma != -1 && secondComma != -1) {
-            String fixStr = res.substring(firstComma + 1, secondComma);
-            if (fixStr.length() == 0) fixStr = "0";
-            
-            // Extract SatsView (index 14)
-            int commaCount = 0;
-            String satsView = "0";
-            int from = 0;
-            for (int i=0; i<15; i++) {
-                int next = res.indexOf(',', from);
-                if (next == -1) {
-                    if (i == 14) satsView = res.substring(from);
-                    break;
-                }
-                if (i == 14) {
-                    satsView = res.substring(from, next);
-                }
-                from = next + 1;
-            }
-            if (satsView.length() == 0) satsView = "0";
-            Serial.printf("[GPS] Background... Fix=%s SatsView=%s\n", fixStr.c_str(), satsView.c_str());
-        }
+        logGPSProgress("Background...", res);
     }
 }
 
@@ -424,31 +424,7 @@ bool getPreciseLocation(float* lat, float* lon, float* speed, float* alt, int* s
                     break; 
                 }
             } else {
-                // Diagnostic Logging
-                int firstComma = res.indexOf(',');
-                int secondComma = res.indexOf(',', firstComma + 1);
-                if (firstComma != -1 && secondComma != -1) {
-                    String fixStatus = res.substring(firstComma + 1, secondComma);
-                    if (fixStatus.length() == 0) fixStatus = "0";
-                    
-                    // Sats View is at index 14
-                    int commaCount = 0;
-                    String sv = "0";
-                    int from = 0;
-                    for (int i=0; i<15; i++) {
-                        int next = res.indexOf(',', from);
-                        if (next == -1) {
-                            if (i == 14) sv = res.substring(from);
-                            break;
-                        }
-                        if (i == 14) {
-                            sv = res.substring(from, next);
-                        }
-                        from = next + 1;
-                    }
-                    if (sv.length() == 0) sv = "0";
-                    Serial.printf("[GPS] Wait... FixStatus=%s SatsView=%s\n", fixStatus.c_str(), sv.c_str());
-                }
+                logGPSProgress("Wait...", res);
             }
         }
         delay(1000);
