@@ -58,8 +58,19 @@
 #define DB_IMU_INT1          12 // J4.12 -> U2.11 (INT1)
 #define DB_IMU_INT2          13 // J4.13 -> U2.9 (INT2)
 
-// U2 CS is strapped high through R12, selecting I2C. SDO/SA0 is left floating
-// on the board, so the address is not pinned to one value -- probe both.
+// U2 CS is strapped high through R12, selecting I2C.
+//
+// SDO/SA0 is left floating on the board. The LIS3DH carries an internal
+// pull-up on that pin (~20.4k typ, datasheet Table 3), NOT a pull-down, so
+// floating sits high and the expected address is 0x19. Both are probed anyway,
+// and imuBegin() logs which one answered.
+//
+// Worth knowing before anyone "fixes" the float by strapping SA0 to GND: that
+// would select 0x18, but it also puts the rail across the internal pull-up for
+// ~162uA continuously at 3.3V -- on its own more than the <100uA deep-sleep
+// budget. Tie it to VDD_IO if determinism is wanted; that keeps 0x19 and costs
+// nothing. Grounding it is only sensible alongside CTRL_REG0 (0x1E) = 0x90,
+// which disables the pull-up.
 #define DB_IMU_ADDR_LOW      0x18
 #define DB_IMU_ADDR_HIGH     0x19
 

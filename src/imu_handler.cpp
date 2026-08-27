@@ -35,9 +35,11 @@ static bool i2cAck(uint8_t addr) {
 bool imuBegin() {
     Wire1.begin(DB_IMU_SDA, DB_IMU_SCL);
 
-    // SDO/SA0 is left floating on the daughter board, so the address is
-    // whichever way that pin happens to sit. Try both rather than guessing.
-    const uint8_t candidates[] = { DB_IMU_ADDR_LOW, DB_IMU_ADDR_HIGH };
+    // SDO/SA0 floats on this board and the LIS3DH pulls that pin up internally,
+    // so 0x19 is the expected answer -- see the note in utilities.h. 0x18 is
+    // still tried, because a later board revision may strap it and this should
+    // not need editing when that happens.
+    const uint8_t candidates[] = { DB_IMU_ADDR_HIGH, DB_IMU_ADDR_LOW };
     uint8_t found = 0;
     for (uint8_t addr : candidates) {
         if (i2cAck(addr)) {
