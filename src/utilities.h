@@ -1,6 +1,10 @@
 #pragma once
 
-#define LILYGO_T_SIM7080G_S3
+// The LILYGO_T_SIM7080G_S3 board marker is set in platformio.ini's build_flags,
+// which is where it reaches libraries as well as this header. It was defined
+// here too until every file including this one warned about redefining it.
+// Nothing in the tree tests it -- the LilyGo original picked a pin block with
+// it and those conditionals are long gone -- so the second copy bought nothing.
 
 // Modem Pins (T-SIM7080G-S3)
 #define MODEM_TX             5
