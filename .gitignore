@@ -3,3 +3,8 @@
 hardware/ae-tracker-db/ae-tracker-db-backups.DS_Store
 hardware/ae-tracker-db/ae-tracker-db-backups/**
 .vscode/
+
+# KiCad transient session files
+**/~*.lck
+**/_autosave-*.kicad_pcb
+**/_autosave-*.kicad_sch
