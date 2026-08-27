@@ -36,4 +36,23 @@ uint8_t imuAddress();
 // with no IMU present -- returns a reading with valid == false.
 ImuReading imuRead();
 
+// Configures INT1 to assert on sustained movement, for use as a deep-sleep wake
+// source. The high-pass filter is enabled on the interrupt path only, so the
+// threshold is measured against change rather than against gravity -- without
+// it a 1g DC bias would sit above any useful threshold forever.
+//
+// thresholdMg is rounded to the LIS3DH's 16mg step (at +/-2g). durationSamples
+// is how long the condition must hold, counted in output-data-rate periods --
+// at the 50Hz set by imuBegin(), one sample is 20ms.
+//
+// Returns false if no IMU is present. Both defaults are starting points that
+// want tuning against a ski on the water; a hull bobbing at a mooring is the
+// case that decides them.
+bool imuEnableMotionWake(uint16_t thresholdMg = 352, uint8_t durationSamples = 3);
+
+// Reads INT1_SRC, which is what releases the latched interrupt and lets INT1
+// fall again. Must happen before re-arming, or the pin is still high and the
+// next sleep ends immediately.
+void imuClearMotionInterrupt();
+
 const char* orientationName(Orientation o);

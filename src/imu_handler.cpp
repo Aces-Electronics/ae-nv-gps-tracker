@@ -122,6 +122,62 @@ ImuReading imuRead() {
     return r;
 }
 
+// Adafruit's driver keeps writeRegister8/readRegister8 private and offers no
+// activity-interrupt API -- only click detection, which is a different feature.
+// The interrupt block is therefore driven straight over the bus this file
+// already owns.
+static void lisWrite8(uint8_t reg, uint8_t value) {
+    Wire1.beginTransmission(s_addr);
+    Wire1.write(reg);
+    Wire1.write(value);
+    Wire1.endTransmission();
+}
+
+static uint8_t lisRead8(uint8_t reg) {
+    Wire1.beginTransmission(s_addr);
+    Wire1.write(reg);
+    Wire1.endTransmission(false);
+    if (Wire1.requestFrom((uint8_t)s_addr, (uint8_t)1) != 1) return 0;
+    return Wire1.read();
+}
+
+// At +/-2g the INT1_THS step is 16mg.
+static const uint16_t INT1_THS_STEP_MG = 16;
+
+bool imuEnableMotionWake(uint16_t thresholdMg, uint8_t durationSamples) {
+    if (!s_present) return false;
+
+    // High-pass filter onto the interrupt path only. FDS stays clear on purpose:
+    // setting it would filter the output registers too, and imuRead() needs the
+    // gravity vector those still carry.
+    lisWrite8(LIS3DH_REG_CTRL2, 0x01); // HPIS1
+    (void)lisRead8(LIS3DH_REG_REFERENCE);
+
+    lisWrite8(LIS3DH_REG_CTRL3, 0x40); // I1_IA1 -> INT1 pin
+    lisWrite8(LIS3DH_REG_CTRL5, 0x08); // LIR_INT1: latch until INT1_SRC is read
+
+    uint8_t ths = thresholdMg / INT1_THS_STEP_MG;
+    if (ths == 0) ths = 1;      // 0 would fire on nothing at all
+    if (ths > 0x7F) ths = 0x7F; // register is 7-bit
+    lisWrite8(LIS3DH_REG_INT1THS, ths);
+    lisWrite8(LIS3DH_REG_INT1DUR, durationSamples);
+
+    // OR of the three high-event axes: movement along any axis counts. AOI and
+    // 6D stay clear, which is what makes this OR rather than AND-of-all.
+    lisWrite8(LIS3DH_REG_INT1CFG, 0x2A); // ZHIE | YHIE | XHIE
+
+    imuClearMotionInterrupt();
+
+    Serial.printf("[IMU] Motion wake armed: %umg (THS=%u), %u samples\n",
+                  ths * INT1_THS_STEP_MG, ths, durationSamples);
+    return true;
+}
+
+void imuClearMotionInterrupt() {
+    if (!s_present) return;
+    (void)lisRead8(LIS3DH_REG_INT1SRC);
+}
+
 const char* orientationName(Orientation o) {
     switch (o) {
         case Orientation::Flat:       return "Flat";

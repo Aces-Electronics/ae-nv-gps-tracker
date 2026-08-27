@@ -24,6 +24,8 @@ LilyGo T-SIM7080G-S3 based GPS tracker with NB-IoT connectivity for the AE-NV ec
 - ✅ Configurable reporting intervals (1-60 minutes)
 - ✅ Battery voltage monitoring
 - ✅ Deep sleep between reports, with GPS-failure backoff
+- ✅ Wake on motion (daughter board) — LIS3DH interrupt as a deep-sleep wake
+  source, rate-limited so a hull bobbing at a mooring can't drain the battery
 
 ## Telemetry Fields
 
@@ -45,6 +47,7 @@ The tracker publishes the following data via MQTT:
   "orientation": "Flat",
   "charge_state": "Charging",  // Charging | Idle | Fault | No Input
   "supply_enabled": true,      // Is the jetski allowed to feed the charger
+  "wake_reason": "Motion",     // Cold Boot | Timer | Motion
   "interval": 1
 }
 ```

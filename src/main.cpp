@@ -144,6 +144,57 @@ void modemPowerOff() {
     PMU.disableBLDO2(); // GPS Antenna
 }
 
+// Set after every successful publish. Lives in RTC memory because the whole
+// point is to still be there on the far side of a deep sleep.
+//
+// time() rather than millis(): the RTC timer keeps counting through deep sleep
+// and IDF restores the system clock from it on wake, so this stays monotonic
+// across cycles. It is never set from the network, so it is elapsed-time-since-
+// first-power-on, not a wall clock -- which is all a rate limit needs.
+RTC_DATA_ATTR static time_t s_lastReportTime = 0;
+
+// How soon after a report a motion wake is worth acting on. A hull bobbing at a
+// mooring must not be able to spend the battery on repeating itself.
+static const time_t MOTION_MIN_REPORT_S = 120;
+
+static bool wokeOnMotion() {
+    return esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1;
+}
+
+static const char* wakeReasonName() {
+    switch (esp_sleep_get_wakeup_cause()) {
+        case ESP_SLEEP_WAKEUP_TIMER:     return "Timer";
+        case ESP_SLEEP_WAKEUP_EXT1:      return "Motion";
+        case ESP_SLEEP_WAKEUP_UNDEFINED: return "Cold Boot";
+        default:                         return "Other";
+    }
+}
+
+// Arms the wake sources and goes. Shared by the end-of-cycle path and by the
+// early bail-out on a motion wake that arrived too soon to be worth a report.
+static void enterDeepSleep(int minutes) {
+    uint64_t sleep_time = (uint64_t)minutes * 60 * 1000000ULL;
+    if (sleep_time == 0) sleep_time = 60 * 1000000ULL;
+    esp_sleep_enable_timer_wakeup(sleep_time);
+
+    // Only ever armed when an IMU actually answered. With no daughter board
+    // fitted GPIO12 floats, and an ext1 source on a floating pin is a flat
+    // battery by morning.
+    const bool motionArmed = imuPresent();
+    if (motionArmed) {
+        // The interrupt latches, so a source left uncleared holds INT1 high and
+        // the next sleep would end the instant it started.
+        imuClearMotionInterrupt();
+        esp_sleep_enable_ext1_wakeup(1ULL << DB_IMU_INT1, ESP_EXT1_WAKEUP_ANY_HIGH);
+    }
+
+    powerPrepareForSleep();
+    Serial.printf("Entering Deep Sleep for %d minutes%s...\n",
+                  minutes, motionArmed ? " (or on motion)" : "");
+    Serial.flush();
+    esp_deep_sleep_start();
+}
+
 void goToSleep(bool got_fix) {
     modemPowerOff();
 
@@ -176,13 +227,7 @@ void goToSleep(bool got_fix) {
     }
     prefs.end();
 
-    uint64_t sleep_time = (uint64_t)actual_interval * 60 * 1000000ULL;
-    if (sleep_time == 0) sleep_time = 60 * 1000000ULL;
-
-    Serial.printf("Entering Deep Sleep for %d minutes...\n", actual_interval);
-    esp_sleep_enable_timer_wakeup(sleep_time);
-    powerPrepareForSleep();
-    esp_deep_sleep_start();
+    enterDeepSleep(actual_interval);
 }
 // --- Custom CGNSINF Parser for SIM7080G ---
 bool parseCGNSINF(String raw, float* lat, float* lon, float* speed, float* alt, int* sats, float* hdop) {
@@ -584,6 +629,7 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
             doc["orientation"] = orientationName(imu.orientation);
             doc["charge_state"] = chargeStateName(power.state);
             doc["supply_enabled"] = power.supplyEnabled;
+            doc["wake_reason"] = wakeReasonName();
 
             int csq = modem.getSignalQuality();
             int dbm = (csq == 99) ? -113 : (csq * 2) - 113;
@@ -596,6 +642,10 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
             Serial.println("[MQTT] Publishing: " + payload);
             if (mqtt.publish(mqtt_topic_up.c_str(), payload.c_str())) {
                 Serial.println("[MQTT] Publish Successful");
+                // Only a delivered report starts the motion rate limit. A failed
+                // publish leaves the previous timestamp standing, so the next
+                // movement is still allowed to try.
+                s_lastReportTime = time(NULL);
             } else {
                 Serial.printf("[MQTT] Publish FAILED (State: %d)\n", mqtt.state());
             }
@@ -651,7 +701,8 @@ void setup() {
 
     
     esp_reset_reason_t reason = esp_reset_reason();
-    Serial.printf("\n--- AE Tracker Boot (Reason: %d, FW: '%s') ---\n", reason, firmwareVersion());
+    Serial.printf("\n--- AE Tracker Boot (Reason: %d, Wake: %s, FW: '%s') ---\n",
+                  reason, wakeReasonName(), firmwareVersion());
 
     Wire.begin(I2C_SDA, I2C_SCL);
     if (!PMU.begin(Wire, AXP2101_SLAVE_ADDRESS, I2C_SDA, I2C_SCL)) {
@@ -666,7 +717,9 @@ void setup() {
     // powerBegin() comes first because it is what releases the pad hold from
     // the last sleep and gets the CAN transceiver out of an undefined state.
     powerBegin();
-    imuBegin();
+    if (imuBegin()) {
+        imuEnableMotionWake();
+    }
 
     pinMode(0, INPUT_PULLUP);
     strip.begin();
@@ -676,7 +729,20 @@ void setup() {
     
     loadSettings();
     checkPowerConfig();
-    
+
+    // A motion wake this soon after a report has nothing new to say, and saying
+    // it would cost a GPS acquisition and a modem session. Bail before
+    // modemPowerOn(), which is where the expense starts.
+    if (wokeOnMotion()) {
+        time_t since = time(NULL) - s_lastReportTime;
+        if (since < MOTION_MIN_REPORT_S) {
+            Serial.printf("[Motion] Wake %llds after last report (min %llds) - back to sleep.\n",
+                          (long long)since, (long long)MOTION_MIN_REPORT_S);
+            enterDeepSleep(settings.report_interval_mins);
+        }
+        Serial.printf("[Motion] Wake %llds after last report - reporting.\n", (long long)since);
+    }
+
     modemPowerOn(); 
     initGNSS(); // Start GPS early
     
