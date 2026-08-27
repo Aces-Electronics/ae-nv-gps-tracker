@@ -43,6 +43,8 @@ The tracker publishes the following data via MQTT:
   "battery_voltage": 4.177,  // Legacy alias
   "rssi": 19,
   "orientation": "Flat",
+  "charge_state": "Charging",  // Charging | Idle | Fault | No Input
+  "supply_enabled": true,      // Is the jetski allowed to feed the charger
   "interval": 1
 }
 ```

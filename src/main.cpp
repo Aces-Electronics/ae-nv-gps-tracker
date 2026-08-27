@@ -12,6 +12,7 @@
 #include "crash_handler.h"
 #include "ota_handler.h"
 #include "imu_handler.h"
+#include "power_handler.h"
 
 // --- Configuration ---
 TrackerSettings settings;
@@ -181,6 +182,7 @@ void goToSleep(bool got_fix) {
 
     Serial.printf("Entering Deep Sleep for %d minutes...\n", actual_interval);
     esp_sleep_enable_timer_wakeup(sleep_time);
+    powerPrepareForSleep();
     esp_deep_sleep_start();
 }
 // --- Custom CGNSINF Parser for SIM7080G ---
@@ -481,6 +483,12 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
     // and a value from before that is not describing the same situation.
     ImuReading imu = imuRead();
 
+    // Same reasoning as the IMU: read at report time, not at boot. The policy is
+    // applied here too, so a decision to cut or restore the jetski feed is made
+    // against the battery voltage that is about to be published alongside it.
+    PowerStatus power = powerRead();
+    powerApplyChargePolicy(PMU.getBattVoltage() / 1000.0F, power);
+
     imei = getIMEIWithRetry();
     mqtt_topic_up = "ae-nv/tracker/" + imei + "/up";
     // The backend keys this device's devices row on the IMEI -- processTrackerData()
@@ -578,6 +586,8 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
             // boards with a working IMU is harder for the backend to reason
             // about than one that is always there.
             doc["orientation"] = orientationName(imu.orientation);
+            doc["charge_state"] = chargeStateName(power.state);
+            doc["supply_enabled"] = power.supplyEnabled;
 
             int csq = modem.getSignalQuality();
             int dbm = (csq == 99) ? -113 : (csq * 2) - 113;
@@ -657,6 +667,9 @@ void setup() {
     PMU.enableCellbatteryCharge();
 
     // Daughter board. Absence is reported and then ignored -- see imuBegin().
+    // powerBegin() comes first because it is what releases the pad hold from
+    // the last sleep and gets the CAN transceiver out of an undefined state.
+    powerBegin();
     imuBegin();
 
     pinMode(0, INPUT_PULLUP);
