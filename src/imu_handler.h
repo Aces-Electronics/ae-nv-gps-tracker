@@ -61,4 +61,10 @@ bool imuEnableMotionWake(uint16_t thresholdMg = 352, uint8_t durationSamples = 3
 // next sleep ends immediately.
 void imuClearMotionInterrupt();
 
+// Bench diagnostic: what the part says about itself, plus the bus levels.
+// WHO_AM_I is the discriminator when readings go to zero -- 0x33 means a real
+// LIS3DH that has lost its configuration, 0x00 means the bus is returning
+// zeros and the part may not be talking at all.
+void imuDumpState();
+
 const char* orientationName(Orientation o);

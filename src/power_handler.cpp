@@ -80,6 +80,8 @@ PowerStatus powerRead() {
         ps.state = ChargeState::Idle;
     }
 
+    Serial.printf("[Power] SUPPLY_EN pin reads %s\n",
+                  digitalRead(DB_SUPPLY_EN) == HIGH ? "HIGH (switch on)" : "LOW (switch off)");
     Serial.printf("[Power] PG=%s STAT=%s -> %s (supply %s)\n",
                   ps.supplyPresent ? "present" : "absent",
                   ps.state == ChargeState::Fault ? "blinking" : (steadyLow ? "low" : "high"),

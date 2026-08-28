@@ -90,6 +90,31 @@ static int lineMilliVolts(uint8_t pin) {
     return mv;
 }
 
+// Standard I2C bus recovery. A master that resets mid-transaction leaves the
+// slave part way through returning a byte: it is still holding SDA low, waiting
+// for clocks that never arrive, and the bus is wedged until it gets them. Nine
+// pulses on SCL let it finish the byte and release SDA, and a STOP leaves the
+// bus in a known state.
+//
+// Not hypothetical on this board. The boot that prompted this read SDA at 0mV
+// and could not drive it high -- indistinguishable from a short -- and then the
+// part answered normally, because the address probe had clocked the bus free on
+// its way past. Doing it deliberately is better than doing it by accident.
+static void i2cBusRecover() {
+    pinMode(DB_IMU_SDA, INPUT_PULLUP);
+    pinMode(DB_IMU_SCL, OUTPUT);
+    for (int i = 0; i < 9; i++) {
+        digitalWrite(DB_IMU_SCL, HIGH); delayMicroseconds(10);
+        digitalWrite(DB_IMU_SCL, LOW);  delayMicroseconds(10);
+    }
+    // STOP condition: SDA released high while SCL is high.
+    digitalWrite(DB_IMU_SCL, HIGH); delayMicroseconds(10);
+    pinMode(DB_IMU_SDA, OUTPUT);
+    digitalWrite(DB_IMU_SDA, LOW);  delayMicroseconds(10);
+    pinMode(DB_IMU_SDA, INPUT_PULLUP); delayMicroseconds(10);
+    pinMode(DB_IMU_SCL, INPUT_PULLUP);
+}
+
 // Only reached when a line is already stuck low, i.e. the bus is unusable
 // either way. Briefly drives the line high to separate a resistor still pulling
 // it down -- the S3 wins easily against 10k -- from a hard short to ground,
@@ -104,10 +129,14 @@ static void characteriseStuckLine(uint8_t pin, const char* name) {
     delayMicroseconds(200);
     const bool rose = digitalRead(pin) == HIGH;
     pinMode(pin, INPUT_PULLUP);
+    // "Cannot be moved" is NOT proof of a short. A slave actively driving the
+    // line wins against this pin just as a short does, and on SDA that is the
+    // more likely of the two -- which is why recovery is attempted before any
+    // of this is believed.
     Serial.printf("[IMU]   %s driven high -> %s: %s\n", name,
                   rose ? "rose" : "STILL LOW",
-                  rose ? "a resistor is pulling it down (pull-down still fitted?), not a short"
-                       : "cannot be moved - looks like a hard short to ground");
+                  rose ? "a resistor is pulling it down, not a short"
+                       : "a slave is holding it, or it is shorted to ground");
 }
 
 // Scans the whole 7-bit range. Only run when the LIS3DH did not answer, to
@@ -142,9 +171,17 @@ bool imuBegin() {
                   sdaIdleHigh ? "high" : "LOW", sdaMv,
                   sclIdleHigh ? "high" : "LOW", sclMv);
     if (!sdaIdleHigh || !sclIdleHigh) {
-        Serial.println("[IMU] A line is stuck low - a pull-down still fitted, a short, or a device holding the bus.");
-        if (!sdaIdleHigh) characteriseStuckLine(DB_IMU_SDA, "SDA");
-        if (!sclIdleHigh) characteriseStuckLine(DB_IMU_SCL, "SCL");
+        Serial.println("[IMU] A line is stuck low - trying bus recovery first.");
+        i2cBusRecover();
+        delayMicroseconds(500);
+        const bool sdaNow = digitalRead(DB_IMU_SDA) == HIGH;
+        const bool sclNow = digitalRead(DB_IMU_SCL) == HIGH;
+        Serial.printf("[IMU] After recovery: SDA=%s SCL=%s\n",
+                      sdaNow ? "high" : "LOW", sclNow ? "high" : "LOW");
+        // Only worth characterising what recovery could not fix; a line freed by
+        // clocking was a wedged slave, which these tests would misreport.
+        if (!sdaNow) characteriseStuckLine(DB_IMU_SDA, "SDA");
+        if (!sclNow) characteriseStuckLine(DB_IMU_SCL, "SCL");
     }
 
     Wire1.begin(DB_IMU_SDA, DB_IMU_SCL, DB_I2C_HZ);
@@ -299,6 +336,35 @@ bool imuEnableMotionWake(uint16_t thresholdMg, uint8_t durationSamples) {
 void imuClearMotionInterrupt() {
     if (!s_present) return;
     (void)lisRead8(LIS3DH_REG_INT1SRC);
+}
+
+void imuDumpState() {
+    if (!s_present) {
+        Serial.println("[IMU] not present");
+    } else {
+        const uint8_t wai = lisRead8(0x0F); // WHO_AM_I
+        const uint8_t c1  = lisRead8(LIS3DH_REG_CTRL1);
+        const uint8_t c4  = lisRead8(LIS3DH_REG_CTRL4);
+        Serial.printf("[IMU] addr=0x%02X WHO_AM_I=0x%02X (expect 0x33) CTRL1=0x%02X CTRL4=0x%02X\n",
+                      s_addr, wai, c1, c4);
+        if (wai == 0x00) {
+            Serial.println("[IMU]   WHO_AM_I is 0x00 - the bus is reading back zeros, not a configured part.");
+        } else if (wai == 0x33 && (c1 & 0xF0) == 0x00) {
+            Serial.println("[IMU]   ODR bits clear - the part is in power-down, so it has reset since init.");
+        }
+    }
+
+    // Taking the pins for the ADC removes them from the I2C peripheral, so the
+    // bus is reopened afterwards.
+    Wire1.end();
+    pinMode(DB_IMU_SDA, INPUT_PULLUP);
+    pinMode(DB_IMU_SCL, INPUT_PULLUP);
+    delayMicroseconds(500);
+    const int sdaMv = lineMilliVolts(DB_IMU_SDA);
+    const int sclMv = lineMilliVolts(DB_IMU_SCL);
+    Serial.printf("[IMU] bus now: SDA=%d mV  SCL=%d mV\n", sdaMv, sclMv);
+    Wire1.begin(DB_IMU_SDA, DB_IMU_SCL, DB_I2C_HZ);
+    delay(10);
 }
 
 const char* orientationName(Orientation o) {

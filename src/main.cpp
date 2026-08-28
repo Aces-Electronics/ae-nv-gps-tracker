@@ -758,6 +758,7 @@ void setup() {
         Serial.printf("--- pass %d ---\n", pass);
         if (!imuPresent()) imuBegin();
         if (imuPresent()) imuRead();
+        imuDumpState();
         powerRead();
         delay(1500);
     }
