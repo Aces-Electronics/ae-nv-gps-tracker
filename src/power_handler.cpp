@@ -130,12 +130,50 @@ static bool hasExternalPullup(uint8_t pin, int& mv) {
     pinMode(pin, INPUT_PULLDOWN);
     delayMicroseconds(1000);
     const bool stillHigh = digitalRead(pin) == HIGH;
-    analogRead(pin);
-    gpio_set_pull_mode((gpio_num_t)pin, GPIO_PULLDOWN_ONLY);
-    delayMicroseconds(500);
-    mv = analogReadMilliVolts(pin);
+
+    // On the S3 only GPIO1-20 reach an ADC. Asking any other pin for millivolts
+    // logs an error and hands back a zero, which reads as a real measurement and
+    // contradicts the digital verdict sitting next to it. -1 says "not measured".
+    if (pin >= 1 && pin <= 20) {
+        analogRead(pin);
+        gpio_set_pull_mode((gpio_num_t)pin, GPIO_PULLDOWN_ONLY);
+        delayMicroseconds(500);
+        mv = analogReadMilliVolts(pin);
+    } else {
+        mv = -1;
+    }
     pinMode(pin, INPUT_PULLUP);
     return stillHigh;
+}
+
+// Sweeps every GPIO that is safe to touch here, looking for the daughter
+// board's 10k pull-ups (R10 on STAT, R11 on PG, R12 on CS). Those hang off its
+// 3.3V rail, so wherever they turn up is where the board is actually wired --
+// which is the question when the expected pins are silent but the board is
+// demonstrably powered.
+//
+// Excluded deliberately: 19/20 are USB, 26-32 are SPI flash, 33-37 are the
+// octal PSRAM this build uses, and touching any of those ends the session
+// rather than informing it.
+void powerSweepPullups() {
+    static const uint8_t PINS[] = {
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+        21, 38, 39, 40, 41, 42, 45, 46, 47, 48
+    };
+    Serial.println("[Power] Sweeping GPIOs for external pull-ups...");
+    for (uint8_t pin : PINS) {
+        int mv = 0;
+        if (hasExternalPullup(pin, mv)) {
+            const char* known = "";
+            if (pin == I2C_SDA)      known = "  (PMU bus SDA)";
+            else if (pin == I2C_SCL) known = "  (PMU bus SCL)";
+            else if (pin == 0)       known = "  (boot button)";
+            else if (pin >= 38 && pin <= 40) known = "  (LilyGo SD card)";
+            if (mv >= 0) Serial.printf("[Power]   GPIO%-2u pulled up, %4d mV%s\n", pin, mv, known);
+            else         Serial.printf("[Power]   GPIO%-2u pulled up (no ADC on this pin)%s\n", pin, known);
+        }
+    }
+    Serial.println("[Power] Sweep done.");
 }
 
 void powerDumpPullups() {

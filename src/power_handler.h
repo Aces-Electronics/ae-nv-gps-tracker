@@ -39,4 +39,9 @@ void powerPrepareForSleep();
 // unconnected pin and a healthy idle bus look identical from the ESP32 side.
 void powerDumpPullups();
 
+// Finds every GPIO carrying an external pull-up. Use when the daughter board is
+// powered but its expected pins are silent -- it locates where the board is
+// really connected.
+void powerSweepPullups();
+
 const char* chargeStateName(ChargeState s);

@@ -754,6 +754,7 @@ void setup() {
     // USB CDC port down with it -- which makes every iteration on the bench a
     // wait for re-enumeration. This never sleeps and never touches the modem.
     Serial.println("\n=== DAUGHTER BOARD BENCH (no modem, no MQTT, no sleep) ===\n");
+    powerSweepPullups();
     for (int pass = 1; ; pass++) {
         Serial.printf("--- pass %d ---\n", pass);
         // Pull-up test first: it answers "is the board even here" without
