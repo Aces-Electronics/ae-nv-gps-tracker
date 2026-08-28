@@ -13,9 +13,24 @@ static Adafruit_LIS3DH lis(&Wire1);
 static bool    s_present = false;
 static uint8_t s_addr    = 0;
 
-// Gravity is 1g, so 0.7g on Z is a 45-degree cone around each pole. Outside
-// both cones the board is closer to edge-on than to either face.
+// Gravity is 1g, so 0.7g is a 45-degree cone around each pole. Outside both
+// cones the board is closer to edge-on than to either face.
 static const float FLAT_THRESHOLD_G = 0.7f;
+
+// How the LIS3DH sits once the daughter board is mounted the way it goes into
+// the ski. Measured on the bench in that exact orientation: x=+0.04 y=-1.00
+// z=-0.03, |v|=1.001g. An accelerometer at rest reads +1g along whichever of
+// its axes points up, so a steady -1g on Y means the chip's +Y faces down and
+// the "up" component of any reading is -Y.
+//
+// This is the single line that has to change if the mounting changes. It is not
+// the whole axis map: gravity pins the vertical axis and says nothing about
+// which way +X and +Z point relative to the hull, so fore-aft and lateral still
+// need a deliberate tilt test before anything relies on them.
+static float upComponent(float x, float y, float z) {
+    (void)x; (void)z;
+    return -y;
+}
 
 // Enough samples to average out hull slap and engine vibration without holding
 // up the wake. At 50 Hz a fresh sample lands every 20 ms, so this is a little
@@ -204,16 +219,17 @@ ImuReading imuRead() {
     r.y = sy / taken;
     r.z = sz / taken;
 
-    if (r.z >= FLAT_THRESHOLD_G) {
+    const float up = upComponent(r.x, r.y, r.z);
+    if (up >= FLAT_THRESHOLD_G) {
         r.orientation = Orientation::Flat;
-    } else if (r.z <= -FLAT_THRESHOLD_G) {
+    } else if (up <= -FLAT_THRESHOLD_G) {
         r.orientation = Orientation::UpsideDown;
     } else {
         r.orientation = Orientation::Vertical;
     }
 
-    Serial.printf("[IMU] x=%.2fg y=%.2fg z=%.2fg (%d/%d samples) -> %s\n",
-                  r.x, r.y, r.z, taken, SAMPLE_COUNT, orientationName(r.orientation));
+    Serial.printf("[IMU] x=%.2fg y=%.2fg z=%.2fg up=%+.2fg (%d/%d) -> %s\n",
+                  r.x, r.y, r.z, up, taken, SAMPLE_COUNT, orientationName(r.orientation));
     return r;
 }
 
