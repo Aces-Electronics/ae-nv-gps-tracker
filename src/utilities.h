@@ -74,16 +74,14 @@
 #define DB_IMU_ADDR_LOW      0x18
 #define DB_IMU_ADDR_HIGH     0x19
 
-// No I2C pull-ups are fitted on the daughter board: R8/R9 were pull-downs and
-// came off rather than going back on the right way up, so the bus rests on the
-// S3's internal pull-ups. Arduino's I2C init enables those (esp32-hal-i2c.c
-// sets sda/scl_pullup_en), but they are weak -- around 45k -- and 45k against
-// the bus capacitance needs far longer to reach VIH than 100kHz standard mode
-// allows. Dropping the clock buys the line the time it needs to get there.
+// Standard-mode I2C. The socketed board carries real pull-ups on both lines --
+// confirmed by making each win against the S3's internal pull-down, SDA at
+// 3101mV and SCL at 3093mV -- so the bus no longer depends on the ~45k
+// internals that forced this down to 50kHz on the earlier boards.
 //
-// This is a workaround for missing parts, not a design choice. Fit real 4.7k
-// pull-ups and this goes back to 100000 or higher.
-#define DB_I2C_HZ            50000
+// imuBegin() measures the pull-ups on every boot and says which it found, so a
+// board without them shows up in the log rather than as mysterious timeouts.
+#define DB_I2C_HZ            100000
 
 // Charger -- BQ25176J (U3), behind the TPS1H000-Q1 (U4) supply switch.
 //
