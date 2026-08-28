@@ -113,6 +113,34 @@ static bool externalPullupPresent(uint8_t pin, int& mv) {
     return stillHigh;
 }
 
+// Is the daughter board's 3.3V rail actually driven, or is it floating up
+// through the LIS3DH's ESD diodes off our own pull-ups?
+//
+// A meter cannot tell: a phantom rail charged through the ~45k internal
+// pull-ups still reads near 3V with only a voltmeter on it. What gives it away
+// is how it recovers. Pull both lines to ground to dump the charge on the
+// board's decoupling (C4 10uF + C6 100nF), release, and time the rise. Charging
+// 10uF through 45k is a ~0.5s time constant; a rail with a regulator behind it
+// snaps back in microseconds.
+//
+// Read the result narrowly. A fast rise proves little: an unconnected pin rises
+// fast because there is nothing to charge, and so does a phantom rail, because
+// pulling SDA low reverse-biases the very ESD diode that would have to conduct
+// to discharge it. Only a SLOW rise is conclusive, and it says the pull-up is
+// charging real capacitance that can only be the daughter board's.
+static uint32_t sdaRiseMicros() {
+    pinMode(DB_IMU_SDA, OUTPUT); digitalWrite(DB_IMU_SDA, LOW);
+    pinMode(DB_IMU_SCL, OUTPUT); digitalWrite(DB_IMU_SCL, LOW);
+    delay(250);
+    pinMode(DB_IMU_SCL, INPUT_PULLUP);
+    const uint32_t t0 = micros();
+    pinMode(DB_IMU_SDA, INPUT_PULLUP);
+    while (digitalRead(DB_IMU_SDA) == LOW) {
+        if (micros() - t0 > 2000000UL) return 0xFFFFFFFFUL;
+    }
+    return micros() - t0;
+}
+
 // Standard I2C bus recovery. A master that resets mid-transaction leaves the
 // slave part way through returning a byte: it is still holding SDA low, waiting
 // for clocks that never arrive, and the bus is wedged until it gets them. Nine
@@ -205,6 +233,15 @@ bool imuBegin() {
         // clocking was a wedged slave, which these tests would misreport.
         if (!sdaNow) characteriseStuckLine(DB_IMU_SDA, "SDA");
         if (!sclNow) characteriseStuckLine(DB_IMU_SCL, "SCL");
+    }
+
+    const uint32_t riseUs = sdaRiseMicros();
+    if (riseUs == 0xFFFFFFFFUL) {
+        Serial.println("[IMU] SDA never rose after being pulled low - line held down.");
+    } else {
+        Serial.printf("[IMU] SDA rise after discharge: %lu us%s\n", (unsigned long)riseUs,
+                      riseUs > 10000 ? "  <-- SLOW: charging the board's decoupling, so it IS connected"
+                                     : "  (fast: proves little - see comment)");
     }
 
     int sdaPdMv = 0, sclPdMv = 0;
