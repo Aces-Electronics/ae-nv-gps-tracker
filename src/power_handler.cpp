@@ -139,6 +139,17 @@ static bool hasExternalPullup(uint8_t pin, int& mv) {
 }
 
 void powerDumpPullups() {
+    // Positive control. The AXP2101 sits on I2C_SDA/I2C_SCL and that bus
+    // demonstrably works, so those lines must have real pull-ups. If this test
+    // cannot see them, the test is broken and nothing else it says counts.
+    int ctlSdaMv = 0, ctlSclMv = 0;
+    const bool ctlSda = hasExternalPullup(I2C_SDA, ctlSdaMv);
+    const bool ctlScl = hasExternalPullup(I2C_SCL, ctlSclMv);
+    Serial.printf("[Power] CONTROL (PMU bus, known good): SDA=%s (%d mV)  SCL=%s (%d mV)%s\n",
+                  ctlSda ? "FITTED" : "none", ctlSdaMv,
+                  ctlScl ? "FITTED" : "none", ctlSclMv,
+                  (ctlSda && ctlScl) ? "" : "   <-- CONTROL FAILED, distrust the rest");
+
     int statMv = 0, pgMv = 0;
     const bool stat = hasExternalPullup(DB_CHG_STAT, statMv);
     const bool pg   = hasExternalPullup(DB_CHG_PG, pgMv);
