@@ -14,8 +14,14 @@ enum class Orientation {
 };
 
 struct ImuReading {
-    bool        valid = false;
-    float       x = 0, y = 0, z = 0; // g, gravity included
+    bool  valid = false;
+    float x = 0, y = 0, z = 0;       // raw chip axes, g, gravity included
+
+    // The same vector in the vehicle's frame, so nothing downstream has to know
+    // how the board is mounted. At rest these read the direction that is UP:
+    // sitting level, up = +1g and fwd = stbd = 0.
+    float up = 0, fwd = 0, stbd = 0;
+
     Orientation orientation = Orientation::Unknown;
 };
 

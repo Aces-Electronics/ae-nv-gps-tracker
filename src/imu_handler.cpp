@@ -18,19 +18,26 @@ static uint8_t s_addr    = 0;
 static const float FLAT_THRESHOLD_G = 0.7f;
 
 // How the LIS3DH sits once the daughter board is mounted the way it goes into
-// the ski. Measured on the bench in that exact orientation: x=+0.04 y=-1.00
-// z=-0.03, |v|=1.001g. An accelerometer at rest reads +1g along whichever of
-// its axes points up, so a steady -1g on Y means the chip's +Y faces down and
-// the "up" component of any reading is -Y.
+// the ski, from a four-position tilt test on the bench. Held level it reads
+// x=+0.04 y=-1.00 z=-0.03 at |v|=1.001g, and tilting gives:
 //
-// This is the single line that has to change if the mounting changes. It is not
-// the whole axis map: gravity pins the vertical axis and says nothing about
-// which way +X and +Z point relative to the hull, so fore-aft and lateral still
-// need a deliberate tilt test before anything relies on them.
-static float upComponent(float x, float y, float z) {
-    (void)x; (void)z;
-    return -y;
-}
+//   roll right (stbd down)   x=+0.18 y=-0.79 z=-0.60   38 deg  -> -Z
+//   roll left  (port down)   x=-0.01 y=-0.72 z=+0.72   44 deg  -> +Z
+//   pitch fwd  (bow down)    x=+0.78 y=-0.67 z=+0.05   48 deg  -> +X
+//   pitch back (bow up)      x=-0.64 y=-0.76 z=-0.05   40 deg  -> -X
+//
+// X moved at most 0.18 during the roll tests and Z at most 0.06 during the
+// pitch tests, so the chip's axes line up with the hull's well enough to read
+// one per motion. An accelerometer at rest reads +1g along whichever axis
+// points up, so the measured vector points UP and the mapping is:
+//
+//   chip +X = aft        chip +Y = down      chip +Z = starboard
+//
+// These three functions are the whole of what this firmware knows about how the
+// board is mounted. A change of mounting changes them and nothing else.
+static float upComponent(float x, float y, float z)   { (void)x; (void)z; return -y; }
+static float fwdComponent(float x, float y, float z)  { (void)y; (void)z; return -x; }
+static float stbdComponent(float x, float y, float z) { (void)x; (void)y; return  z; }
 
 // Enough samples to average out hull slap and engine vibration without holding
 // up the wake. At 50 Hz a fresh sample lands every 20 ms, so this is a little
@@ -219,7 +226,11 @@ ImuReading imuRead() {
     r.y = sy / taken;
     r.z = sz / taken;
 
-    const float up = upComponent(r.x, r.y, r.z);
+    r.up   = upComponent(r.x, r.y, r.z);
+    r.fwd  = fwdComponent(r.x, r.y, r.z);
+    r.stbd = stbdComponent(r.x, r.y, r.z);
+
+    const float up = r.up;
     if (up >= FLAT_THRESHOLD_G) {
         r.orientation = Orientation::Flat;
     } else if (up <= -FLAT_THRESHOLD_G) {
@@ -228,8 +239,9 @@ ImuReading imuRead() {
         r.orientation = Orientation::Vertical;
     }
 
-    Serial.printf("[IMU] x=%.2fg y=%.2fg z=%.2fg up=%+.2fg (%d/%d) -> %s\n",
-                  r.x, r.y, r.z, up, taken, SAMPLE_COUNT, orientationName(r.orientation));
+    Serial.printf("[IMU] up=%+.2f fwd=%+.2f stbd=%+.2f g  (raw %.2f/%.2f/%.2f, %d/%d) -> %s\n",
+                  r.up, r.fwd, r.stbd, r.x, r.y, r.z,
+                  taken, SAMPLE_COUNT, orientationName(r.orientation));
     return r;
 }
 
