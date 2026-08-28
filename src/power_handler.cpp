@@ -2,6 +2,7 @@
 #include "utilities.h"
 #include "driver/gpio.h"
 #include "esp_adc_cal.h"
+#include <Wire.h>
 
 // Kept in RTC memory so the hysteresis band below has a previous decision to
 // hold onto across a sleep. A cold boot initialises it to true, which matches
@@ -126,6 +127,27 @@ void powerPrepareForSleep() {
 // Deliberately a local copy rather than shared with imu_handler: the two
 // modules have no other reason to know about each other, and this is eight
 // lines.
+// Probing a pin means taking it back from whatever peripheral owns it. For the
+// two I2C buses that is not recoverable on its own: the controller keeps
+// running, the pins no longer reach it, and every transfer afterwards fails
+// with ESP_ERR_TIMEOUT. Both buses are therefore rebuilt after any sweep or dump
+// that could have touched their pins.
+//
+// This is not theoretical. It broke Wire1 for the entire session after the first
+// sweep, and read as a daughter board fault.
+static void restoreI2CBuses() {
+    // end() before begin(). begin() on a bus that is already initialised does
+    // not re-attach the pins -- it returns having changed nothing -- so the
+    // controller stays alive with its pins pointing elsewhere and every
+    // transfer keeps timing out. Tearing it down first is what actually
+    // reconnects them.
+    Wire.end();
+    Wire.begin(I2C_SDA, I2C_SCL);
+    Wire1.end();
+    Wire1.begin(DB_IMU_SDA, DB_IMU_SCL, DB_I2C_HZ);
+    delay(10);
+}
+
 static bool hasExternalPullup(uint8_t pin, int& mv) {
     pinMode(pin, INPUT_PULLDOWN);
     delayMicroseconds(1000);
@@ -173,7 +195,8 @@ void powerSweepPullups() {
             else         Serial.printf("[Power]   GPIO%-2u pulled up (no ADC on this pin)%s\n", pin, known);
         }
     }
-    Serial.println("[Power] Sweep done.");
+    restoreI2CBuses();
+    Serial.println("[Power] Sweep done (I2C buses restored).");
 }
 
 void powerDumpPullups() {
@@ -198,6 +221,7 @@ void powerDumpPullups() {
     } else {
         Serial.println("[Power]   -> no pull-ups seen: board not seated, or its 3.3V rail is dead.");
     }
+    restoreI2CBuses();
 }
 
 const char* chargeStateName(ChargeState s) {
