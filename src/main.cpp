@@ -756,10 +756,20 @@ void setup() {
     Serial.println("\n=== DAUGHTER BOARD BENCH (no modem, no MQTT, no sleep) ===\n");
     for (int pass = 1; ; pass++) {
         Serial.printf("--- pass %d ---\n", pass);
-        if (!imuPresent()) imuBegin();
-        if (imuPresent()) imuRead();
-        imuDumpState();
+        // Pull-up test first: it answers "is the board even here" without
+        // touching the I2C peripheral, so it stays valid when the bus does not.
+        powerDumpPullups();
         powerRead();
+        if (imuPresent()) {
+            imuRead();
+            imuDumpState();
+        } else if (pass % 10 == 0) {
+            // Re-probing every pass churned Wire1.end()/begin() and the ADC pin
+            // modes hard enough to wedge the I2C peripheral mid-scan, which
+            // looked like a board fault and was not one.
+            Serial.println("[IMU] re-probing...");
+            imuBegin();
+        }
         delay(1500);
     }
 #endif

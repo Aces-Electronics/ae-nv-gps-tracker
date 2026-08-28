@@ -1,6 +1,7 @@
 #include "power_handler.h"
 #include "utilities.h"
 #include "driver/gpio.h"
+#include "esp_adc_cal.h"
 
 // Kept in RTC memory so the hysteresis band below has a previous decision to
 // hold onto across a sleep. A cold boot initialises it to true, which matches
@@ -120,6 +121,34 @@ void powerPrepareForSleep() {
 
     Serial.printf("[Power] Sleeping with jetski supply %s\n",
                   s_supplyEnabled ? "enabled" : "cut");
+}
+
+// Deliberately a local copy rather than shared with imu_handler: the two
+// modules have no other reason to know about each other, and this is eight
+// lines.
+static bool hasExternalPullup(uint8_t pin, int& mv) {
+    pinMode(pin, INPUT_PULLDOWN);
+    delayMicroseconds(1000);
+    const bool stillHigh = digitalRead(pin) == HIGH;
+    analogRead(pin);
+    gpio_set_pull_mode((gpio_num_t)pin, GPIO_PULLDOWN_ONLY);
+    delayMicroseconds(500);
+    mv = analogReadMilliVolts(pin);
+    pinMode(pin, INPUT_PULLUP);
+    return stillHigh;
+}
+
+void powerDumpPullups() {
+    int statMv = 0, pgMv = 0;
+    const bool stat = hasExternalPullup(DB_CHG_STAT, statMv);
+    const bool pg   = hasExternalPullup(DB_CHG_PG, pgMv);
+    Serial.printf("[Power] R10 on STAT: %s (%d mV)   R11 on PG: %s (%d mV)\n",
+                  stat ? "FITTED" : "none", statMv, pg ? "FITTED" : "none", pgMv);
+    if (stat || pg) {
+        Serial.println("[Power]   -> daughter board is seated AND its 3.3V rail is up.");
+    } else {
+        Serial.println("[Power]   -> no pull-ups seen: board not seated, or its 3.3V rail is dead.");
+    }
 }
 
 const char* chargeStateName(ChargeState s) {

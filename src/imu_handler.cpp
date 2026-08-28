@@ -81,13 +81,36 @@ static bool i2cAck(uint8_t addr) {
 // Self-checking by design: on an idle healthy line this has to come back near
 // the 3.3V rail. If a line digitalRead() calls high reads near zero here, the
 // pull is not surviving the ADC attach and every number from this is worthless.
-static int lineMilliVolts(uint8_t pin) {
+static int lineMilliVoltsWith(uint8_t pin, gpio_pull_mode_t pull) {
     analogRead(pin);
-    gpio_set_pull_mode((gpio_num_t)pin, GPIO_PULLUP_ONLY);
+    gpio_set_pull_mode((gpio_num_t)pin, pull);
     delayMicroseconds(500);
     const int mv = analogReadMilliVolts(pin);
     pinMode(pin, INPUT_PULLUP);
     return mv;
+}
+
+static int lineMilliVolts(uint8_t pin) {
+    return lineMilliVoltsWith(pin, GPIO_PULLUP_ONLY);
+}
+
+// Is a real pull-up resistor fitted, or is the line only being held up by the
+// ESP32's internal one?
+//
+// Turning the internal pull-up off is not enough to tell -- a floating line can
+// read high by chance. So the internal PULL-DOWN is engaged instead and the line
+// is asked to win against it. A fitted 4.7k against the internal ~45k holds the
+// node near 3.0V and still reads high; nothing but the internal pull-up loses
+// and the line goes low. That is a decisive test rather than a suggestive one.
+//
+// It matters because it is what decides the bus clock: a fitted pull-up can run
+// 100kHz+, the internal one cannot.
+static bool externalPullupPresent(uint8_t pin, int& mv) {
+    pinMode(pin, INPUT_PULLDOWN);
+    delayMicroseconds(1000);
+    const bool stillHigh = digitalRead(pin) == HIGH;
+    mv = lineMilliVoltsWith(pin, GPIO_PULLDOWN_ONLY); // pulldown held during the read
+    return stillHigh;
 }
 
 // Standard I2C bus recovery. A master that resets mid-transaction leaves the
@@ -182,6 +205,16 @@ bool imuBegin() {
         // clocking was a wedged slave, which these tests would misreport.
         if (!sdaNow) characteriseStuckLine(DB_IMU_SDA, "SDA");
         if (!sclNow) characteriseStuckLine(DB_IMU_SCL, "SCL");
+    }
+
+    int sdaPdMv = 0, sclPdMv = 0;
+    const bool sdaExt = externalPullupPresent(DB_IMU_SDA, sdaPdMv);
+    const bool sclExt = externalPullupPresent(DB_IMU_SCL, sclPdMv);
+    Serial.printf("[IMU] External pull-ups: SDA=%s (%d mV vs internal pulldown)  SCL=%s (%d mV)\n",
+                  sdaExt ? "FITTED" : "none", sdaPdMv, sclExt ? "FITTED" : "none", sclPdMv);
+    if (sdaExt && sclExt) {
+        Serial.printf("[IMU] Real pull-ups on both lines - %u Hz is conservative, this bus could run faster.\n",
+                      (unsigned)DB_I2C_HZ);
     }
 
     Wire1.begin(DB_IMU_SDA, DB_IMU_SCL, DB_I2C_HZ);

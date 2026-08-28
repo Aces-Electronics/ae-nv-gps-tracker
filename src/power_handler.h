@@ -33,4 +33,10 @@ void powerApplyChargePolicy(float battVolts, PowerStatus& status);
 // Call immediately before esp_deep_sleep_start().
 void powerPrepareForSleep();
 
+// Tests STAT and PG for the daughter board's own 10k pull-ups (R10/R11).
+// Those hang off the board's 3.3V rail, so seeing them proves the board is both
+// seated and powered -- which the I2C lines cannot tell you, since an
+// unconnected pin and a healthy idle bus look identical from the ESP32 side.
+void powerDumpPullups();
+
 const char* chargeStateName(ChargeState s);
