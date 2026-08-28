@@ -724,8 +724,10 @@ void setup() {
 
     
     esp_reset_reason_t reason = esp_reset_reason();
-    Serial.printf("\n--- AE Tracker Boot (Reason: %d, Wake: %s, FW: '%s') ---\n",
-                  reason, wakeReasonName(), firmwareVersion());
+    // __DATE__/__TIME__ are stamped at compile time, so this is proof of which
+    // build is actually running rather than which one was last built.
+    Serial.printf("\n--- AE Tracker Boot (Reason: %d, Wake: %s, FW: '%s', built %s %s) ---\n",
+                  reason, wakeReasonName(), firmwareVersion(), __DATE__, __TIME__);
 
     Wire.begin(I2C_SDA, I2C_SCL);
     if (!PMU.begin(Wire, AXP2101_SLAVE_ADDRESS, I2C_SDA, I2C_SCL)) {
@@ -755,7 +757,46 @@ void setup() {
     // wait for re-enumeration. This never sleeps and never touches the modem.
     Serial.println("\n=== DAUGHTER BOARD BENCH (no modem, no MQTT, no sleep) ===\n");
     powerSweepPullups();
+    // Live pin monitor. The slower checks below run once every few seconds, but
+    // this prints at ~2Hz so that touching a pin on the bench visibly changes
+    // something -- which is the only way to demonstrate, rather than assert,
+    // that these reads reach real hardware.
+    pinMode(0, INPUT_PULLUP);
+    pinMode(DB_CHG_STAT, INPUT_PULLUP);
+    pinMode(DB_CHG_PG, INPUT_PULLUP);
+    pinMode(DB_IMU_INT1, INPUT_PULLUP);
+    pinMode(DB_IMU_INT2, INPUT_PULLUP);
+
+    // Latching, because catching a probe touch means being watching at exactly
+    // the right instant, and coordinating that over a serial capture is a good
+    // way to mistake a missed window for a dead pin. Sampled at ~1kHz so any
+    // touch longer than a millisecond is caught, and remembered until reset:
+    // poke the pins whenever, read the answer whenever.
+    static const uint8_t WATCH[] = { 0, DB_CHG_STAT, DB_CHG_PG, DB_IMU_SDA,
+                                     DB_IMU_SCL, DB_IMU_INT1, DB_IMU_INT2 };
+    static const char*   WATCH_NAME[] = { "BOOT(0)", "STAT(8)", "PG(9)", "SDA(10)",
+                                          "SCL(11)", "INT1(12)", "INT2(13)" };
+    bool everLow[sizeof(WATCH)] = { false };
+
     for (int pass = 1; ; pass++) {
+        for (int i = 0; i < 6; i++) {
+            for (int t = 0; t < 500; t++) {
+                for (size_t p = 0; p < sizeof(WATCH); p++) {
+                    if (digitalRead(WATCH[p]) == LOW) everLow[p] = true;
+                }
+                delay(1);
+            }
+            Serial.print("[Pins] now:");
+            for (size_t p = 0; p < sizeof(WATCH); p++) {
+                Serial.printf(" %s=%d", WATCH_NAME[p], digitalRead(WATCH[p]));
+            }
+            Serial.print("   EVER-LOW since boot:");
+            bool any = false;
+            for (size_t p = 0; p < sizeof(WATCH); p++) {
+                if (everLow[p]) { Serial.printf(" %s", WATCH_NAME[p]); any = true; }
+            }
+            Serial.println(any ? "" : " (none)");
+        }
         Serial.printf("--- pass %d ---\n", pass);
         // Pull-up test first: it answers "is the board even here" without
         // touching the I2C peripheral, so it stays valid when the bus does not.
