@@ -748,6 +748,21 @@ void setup() {
     strip.begin();
     strip.show();
 
+#ifdef DB_BENCH_MODE
+    // Bench build: exercises the daughter board and nothing else. The normal
+    // firmware reaches deep sleep within a few minutes, and deep sleep takes the
+    // USB CDC port down with it -- which makes every iteration on the bench a
+    // wait for re-enumeration. This never sleeps and never touches the modem.
+    Serial.println("\n=== DAUGHTER BOARD BENCH (no modem, no MQTT, no sleep) ===\n");
+    for (int pass = 1; ; pass++) {
+        Serial.printf("--- pass %d ---\n", pass);
+        if (!imuPresent()) imuBegin();
+        if (imuPresent()) imuRead();
+        powerRead();
+        delay(1500);
+    }
+#endif
+
 #ifdef CAN_SNIFFER_MODE
     // Bring-up build: never returns. Deliberately after powerBegin() so the
     // transceiver starts from a defined state, and before anything touches the

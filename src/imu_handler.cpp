@@ -24,6 +24,24 @@ static const float FLAT_THRESHOLD_G = 0.7f;
 static const int SAMPLE_COUNT    = 32;
 static const int SAMPLE_DELAY_MS = 20;
 
+// The first transaction after Wire1.begin() does not reliably get an ACK on
+// this board. With no pull-ups fitted the bus is held up by ~45k internals, and
+// the very first START goes out before the line has properly settled. The proof
+// is in the boot log that prompted this: the probe reported no ACK at 0x19, and
+// the bus scan immediately afterwards -- same function, same address -- found
+// the part at 0x19, because by then a dozen transactions had already run.
+//
+// So a single silent attempt is not evidence of absence. Retry before
+// concluding anything.
+static bool i2cAck(uint8_t addr);
+static bool i2cAckRetry(uint8_t addr, int attempts = 4) {
+    for (int i = 0; i < attempts; i++) {
+        if (i2cAck(addr)) return true;
+        delay(2);
+    }
+    return false;
+}
+
 // Probing for an ACK rather than calling lis.begin() twice: begin() failing
 // part-way leaves the library holding a device object for the wrong address,
 // and recovering from that is an implementation detail of a third-party lib
@@ -108,6 +126,10 @@ bool imuBegin() {
     }
 
     Wire1.begin(DB_IMU_SDA, DB_IMU_SCL, DB_I2C_HZ);
+    // Weak pull-ups mean the lines take real time to reach idle after the
+    // peripheral takes the pins. Cheap insurance against probing into a bus
+    // that has not finished rising.
+    delay(10);
 
     // SDO/SA0 floats on this board and the LIS3DH pulls that pin up internally,
     // so 0x19 is the expected answer -- see the note in utilities.h. 0x18 is
@@ -116,7 +138,7 @@ bool imuBegin() {
     const uint8_t candidates[] = { DB_IMU_ADDR_HIGH, DB_IMU_ADDR_LOW };
     uint8_t found = 0;
     for (uint8_t addr : candidates) {
-        if (i2cAck(addr)) {
+        if (i2cAckRetry(addr)) {
             found = addr;
             break;
         }
