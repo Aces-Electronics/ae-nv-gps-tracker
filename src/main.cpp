@@ -751,68 +751,53 @@ void setup() {
     strip.show();
 
 #ifdef DB_BENCH_MODE
-    // Bench build: exercises the daughter board and nothing else. The normal
-    // firmware reaches deep sleep within a few minutes, and deep sleep takes the
-    // USB CDC port down with it -- which makes every iteration on the bench a
-    // wait for re-enumeration. This never sleeps and never touches the modem.
-    Serial.println("\n=== DAUGHTER BOARD BENCH (no modem, no MQTT, no sleep) ===\n");
+    // Bench build: charger and IMU only. No modem, no MQTT, no deep sleep --
+    // deep sleep drops the USB CDC and makes every iteration a wait for
+    // re-enumeration.
+    Serial.println("\n=== DAUGHTER BOARD BENCH: continuous log ===");
+    Serial.println("Columns: elapsed | battery | PG | STAT | charge state | supply switch\n");
     powerSweepPullups();
-    // Live pin monitor. The slower checks below run once every few seconds, but
-    // this prints at ~2Hz so that touching a pin on the bench visibly changes
-    // something -- which is the only way to demonstrate, rather than assert,
-    // that these reads reach real hardware.
-    pinMode(0, INPUT_PULLUP);
-    pinMode(DB_CHG_STAT, INPUT_PULLUP);
-    pinMode(DB_CHG_PG, INPUT_PULLUP);
-    pinMode(DB_IMU_INT1, INPUT_PULLUP);
-    pinMode(DB_IMU_INT2, INPUT_PULLUP);
 
-    // Latching, because catching a probe touch means being watching at exactly
-    // the right instant, and coordinating that over a serial capture is a good
-    // way to mistake a missed window for a dead pin. Sampled at ~1kHz so any
-    // touch longer than a millisecond is caught, and remembered until reset:
-    // poke the pins whenever, read the answer whenever.
-    static const uint8_t WATCH[] = { 0, DB_CHG_STAT, DB_CHG_PG, DB_IMU_SDA,
-                                     DB_IMU_SCL, DB_IMU_INT1, DB_IMU_INT2 };
-    static const char*   WATCH_NAME[] = { "BOOT(0)", "STAT(8)", "PG(9)", "SDA(10)",
-                                          "SCL(11)", "INT1(12)", "INT2(13)" };
-    bool everLow[sizeof(WATCH)] = { false };
+    const uint32_t t0 = millis();
+    for (uint32_t n = 1; ; n++) {
+        // powerRead() spends ~700ms watching STAT, because a blink is how this
+        // charger reports a fault and one sample cannot tell a blink from a
+        // level. That sets the cadence at roughly a line per second.
+        PowerStatus ps = powerRead();
+        const float vbat = PMU.getBattVoltage() / 1000.0F;
 
-    for (int pass = 1; ; pass++) {
-        for (int i = 0; i < 6; i++) {
-            for (int t = 0; t < 500; t++) {
-                for (size_t p = 0; p < sizeof(WATCH); p++) {
-                    if (digitalRead(WATCH[p]) == LOW) everLow[p] = true;
-                }
-                delay(1);
+        Serial.printf("[Log %6.1fs] Vbat=%.3fV  PG=%-7s STAT=%-8s %-9s supply=%s\n",
+                      (millis() - t0) / 1000.0f, vbat,
+                      ps.supplyPresent ? "present" : "absent",
+                      ps.charging ? "charging" : "idle",
+                      chargeStateName(ps.state),
+                      ps.supplyEnabled ? "ON" : "CUT");
+
+        // Cutoff demonstration, once, ten seconds in. This is the one part of
+        // the power design nothing else exercises: whether SUPPLY_EN actually
+        // operates the TPS1H000. If it does, PG drops to absent within a
+        // sample, because the charger stops seeing an input.
+        static bool cutDone = false;
+        if (!cutDone && (millis() - t0) > 10000) {
+            cutDone = true;
+            PowerStatus tmp;
+            Serial.println("\n[TEST] === cutting the supply for 8s ===");
+            powerApplyChargePolicy(4.50f, tmp);   // above CHARGE_STOP_V -> cut
+            for (int i = 0; i < 8; i++) {
+                PowerStatus c = powerRead();
+                Serial.printf("[TEST]   cut+%ds  PG=%s  supply=%s\n", i,
+                              c.supplyPresent ? "present" : "ABSENT",
+                              c.supplyEnabled ? "ON" : "CUT");
             }
-            Serial.print("[Pins] now:");
-            for (size_t p = 0; p < sizeof(WATCH); p++) {
-                Serial.printf(" %s=%d", WATCH_NAME[p], digitalRead(WATCH[p]));
-            }
-            Serial.print("   EVER-LOW since boot:");
-            bool any = false;
-            for (size_t p = 0; p < sizeof(WATCH); p++) {
-                if (everLow[p]) { Serial.printf(" %s", WATCH_NAME[p]); any = true; }
-            }
-            Serial.println(any ? "" : " (none)");
+            Serial.println("[TEST] === restoring ===\n");
+            powerApplyChargePolicy(3.50f, tmp);   // below CHARGE_RESUME_V -> on
         }
-        Serial.printf("--- pass %d ---\n", pass);
-        // Pull-up test first: it answers "is the board even here" without
-        // touching the I2C peripheral, so it stays valid when the bus does not.
-        powerDumpPullups();
-        powerRead();
-        if (imuPresent()) {
-            imuRead();
-            imuDumpState();
-        } else if (pass % 10 == 0) {
-            // Re-probing every pass churned Wire1.end()/begin() and the ADC pin
-            // modes hard enough to wedge the I2C peripheral mid-scan, which
-            // looked like a board fault and was not one.
-            Serial.println("[IMU] re-probing...");
-            imuBegin();
-        }
-        delay(1500);
+
+        // The IMU is not what is being watched here, and a read costs another
+        // 640ms, so it goes in occasionally rather than in the way.
+        if (imuPresent() && (n % 8 == 0)) imuRead();
+
+        delay(200);
     }
 #endif
 
