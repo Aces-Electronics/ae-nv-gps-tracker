@@ -38,7 +38,8 @@ The tracker publishes the following data via MQTT:
 {
   "mac": "860016043157614",
   "model": "ae-sim7080g-tracker",
-  "lat": -28.02575,
+  "fix": true,               // Did this wake get a GPS fix at all
+  "lat": -28.02575,          // lat/lon/alt/speed/sats/hdop are omitted if !fix
   "lon": 153.3879,
   "alt": -11.981,
   "speed": 0,
@@ -201,6 +202,18 @@ The firmware uses robust satellite count parsing with fallback logic:
 
 - **Active Mode**: GPS acquisition + MQTT publish
 - **BLE Window**: 90 seconds on boot for configuration
+- **Charge cutoff**: the jetski feed is cut above **4.20V** and restored below
+  **3.70V**, decided at report time against the PMU's battery reading and
+  latched across sleep in RTC memory.
+
+  Wide on purpose. The BQ25176J regulates to 4.2V and terminates there by
+  itself, so a cell it is looking after never reaches the stop threshold under
+  charge and rests well above the resume one afterwards — meaning the switch
+  stays on and the charger runs its own loop. That is the intent until the
+  supply-sense divider is reworked and this can be decided on real jetski
+  voltage. What remains is a backstop: 4.20V catches a cell being pushed past
+  full by a charger that is *not* terminating, which is the one case where
+  opening the switch is the only thing that can stop it.
 - **Deep Sleep**: Cadence follows the ski, not the clock.
   - **Running** (CAN bus awake) → the configured `report_interval_mins`,
     5 minutes by default, settable over BLE. GPS-failure backoff applies
@@ -216,6 +229,25 @@ The firmware uses robust satellite count parsing with fallback logic:
 - **Wake on motion**: The LIS3DH interrupt is an `ext1` deep-sleep wake source.
   Motion reports are rate-limited to one per 120s, checked before the modem is
   powered, so a suppressed wake costs ~200ms rather than a GPS acquisition.
+
+  **Tapping the board will not wake it, and that is the design.** `INT1_DURATION`
+  is counted in ODR periods, so the default three samples at 50Hz require 60ms
+  of *continuous* over-threshold motion, and normal mode band-limits to roughly
+  ODR/2 = 25Hz before the comparator sees anything. A finger tap is a few
+  milliseconds of mostly high-frequency energy — filtered down, and over long
+  before the duration counter arrives. Shake the board instead.
+
+  To check the path live rather than by waiting out a sleep cycle, the
+  `db-bench` build watches INT1 for 15 seconds on startup and prints every
+  latched event with the axes that caused it.
+
+  On every wake from sleep the firmware reads the LIS3DH's interrupt block back
+  *before* re-arming it and says whether it survived. Those registers are
+  volatile, so retained values prove the part held its 3.3V rail through the
+  sleep and reset defaults prove it did not — which settles the question a
+  missed wake otherwise only raises. (It should always survive: the daughter
+  board's 3V3 is J4.1 = AXP2101 DCDC1, the same rail that keeps the ESP32's own
+  RTC domain alive. Nothing in this firmware touches DCDC1.)
 - **Adaptive threshold**: After a motion wake, GPS decides whether it was real.
   A good fix showing under 2 km/h counts as unexplained; three consecutive
   unexplained wakes raise the threshold one step (352mg base, 176mg steps,

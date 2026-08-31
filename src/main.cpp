@@ -291,9 +291,6 @@ static void enterDeepSleep(int minutes) {
     // battery by morning.
     const bool motionArmed = imuPresent();
     if (motionArmed) {
-        // The interrupt latches, so a source left uncleared holds INT1 high and
-        // the next sleep would end the instant it started.
-        imuClearMotionInterrupt();
         esp_sleep_enable_ext1_wakeup(1ULL << DB_IMU_INT1, ESP_EXT1_WAKEUP_ANY_HIGH);
     }
 
@@ -301,6 +298,15 @@ static void enterDeepSleep(int minutes) {
     Serial.printf("Entering Deep Sleep for %d minutes%s...\n",
                   minutes, motionArmed ? " (or on motion)" : "");
     Serial.flush();
+
+    // Clearing the latch is the last thing that happens. The interrupt latches,
+    // so a source left uncleared holds INT1 high and the sleep ends the instant
+    // it starts -- and every millisecond between the clear and the sleep is a
+    // window where a knock can re-latch it and do exactly that. Doing this after
+    // the logging and the flush shrinks that window from a serial write to an
+    // I2C read, which is the smallest it can be made from here.
+    if (motionArmed) imuClearMotionInterrupt();
+
     esp_deep_sleep_start();
 }
 
@@ -640,7 +646,7 @@ void onDownlink(char* topic, uint8_t* payload, unsigned int length) {
     }
 }
 
-void transmitData(float lat, float lon, float speed, float alt, int sats, float hdop) {
+void transmitData(bool has_fix, float lat, float lon, float speed, float alt, int sats, float hdop) {
     Serial.println("[Lifecycle] Preparing Transmission...");
 
     // Sampled here rather than in setup() so the reported orientation is the one
@@ -734,12 +740,26 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
             }
             doc["model"] = "AE Tracker - " + suffix;
             
-            doc["lat"] = lat;
-            doc["lon"] = lon;
-            doc["alt"] = alt;
-            doc["speed"] = speed;
-            doc["sats"] = sats;
-            doc["hdop"] = hdop;
+            // Absent rather than zero, on the same reasoning that keeps rpm
+            // out of a parked ski's report. lat/lon default to 0,0 when the
+            // acquisition times out, and 0,0 is not a null -- it is a real
+            // coordinate in the Gulf of Guinea that a map will plot without
+            // complaint, several thousand kilometres from anything this device
+            // will ever see. A report with no position should say so and let
+            // the backend keep the last known one, rather than assert a
+            // position that is wrong.
+            //
+            // The flag goes out either way, so "no fix this wake" is a fact the
+            // report carries rather than something inferred from missing keys.
+            doc["fix"] = has_fix;
+            if (has_fix) {
+                doc["lat"] = lat;
+                doc["lon"] = lon;
+                doc["alt"] = alt;
+                doc["speed"] = speed;
+                doc["sats"] = sats;
+                doc["hdop"] = hdop;
+            }
             
             doc["voltage"] = PMU.getVbusVoltage() / 1000.0F; 
             doc["device_voltage"] = PMU.getBattVoltage() / 1000.0F; 
@@ -906,6 +926,12 @@ void setup() {
     Serial.println("\n=== DAUGHTER BOARD BENCH: continuous log ===");
     Serial.println("Columns: elapsed | battery | PG | STAT | charge state | supply switch\n");
     powerSweepPullups();
+
+    // Before the charger log, because it is the one thing here that needs
+    // somebody standing at the bench to do something. The wake path is
+    // otherwise only exercised by a real sleep cycle, which takes minutes and
+    // reports its verdict through a USB port that deep sleep drops.
+    imuWatchMotionInterrupt(15000);
     // canSelfTest() is deliberately NOT called here. It uses TWAI_MODE_NO_ACK,
     // which transmits -- and this build gets flashed onto a tracker that may be
     // plugged into a ski. A bench convenience that drives a vehicle bus the
@@ -1049,7 +1075,7 @@ void setup() {
     // which is the normal state for a parked ski.
     g_engine = canReadEngine(1000);
 
-    transmitData(lat, lon, speed, alt, sats, hdop);
+    transmitData(has_fix, lat, lon, speed, alt, sats, hdop);
 
     // After the report, so a threshold change is decided on the same fix that
     // was just published and re-arms before this wake ends.
