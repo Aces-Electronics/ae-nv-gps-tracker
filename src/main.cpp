@@ -744,7 +744,14 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
             doc["voltage"] = PMU.getVbusVoltage() / 1000.0F; 
             doc["device_voltage"] = PMU.getBattVoltage() / 1000.0F; 
             doc["battery_voltage"] = PMU.getBattVoltage() / 1000.0F; 
-            doc["soc"] = PMU.getBatteryPercent();
+            // The AXP2101 keeps a fuel gauge and this reads it, but it answers
+            // -1 when isBatteryConnect() is false rather than failing. Publishing
+            // that verbatim put "-1%" on the dashboard, which reads as a
+            // measurement rather than as an absent battery -- and a tracker
+            // running from USB with no cell fitted is exactly the bench case
+            // where it happens.
+            const int socPct = PMU.getBatteryPercent();
+            if (socPct >= 0) doc["soc"] = socPct;
 
             // Always emitted, "Unknown" included: the field has been in the
             // documented payload all along, and a key that appears only on
