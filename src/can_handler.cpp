@@ -107,6 +107,10 @@ static void recordFrame(const twai_message_t& msg) {
             s_seen[i].count++;
             s_seen[i].dlc = msg.data_length_code;
             memcpy(s_seen[i].lastData, msg.data, sizeof(s_seen[i].lastData));
+            for (uint8_t b = 0; b < 8; b++) {
+                if (msg.data[b] < s_seen[i].minData[b]) s_seen[i].minData[b] = msg.data[b];
+                if (msg.data[b] > s_seen[i].maxData[b]) s_seen[i].maxData[b] = msg.data[b];
+            }
             return;
         }
     }
@@ -128,6 +132,7 @@ static void recordFrame(const twai_message_t& msg) {
     e.dlc      = msg.data_length_code;
     e.count    = 1;
     memcpy(e.lastData, msg.data, sizeof(e.lastData));
+    for (uint8_t b = 0; b < 8; b++) { e.minData[b] = msg.data[b]; e.maxData[b] = msg.data[b]; }
 }
 
 size_t canSniff(uint32_t durationMs) {
@@ -179,9 +184,93 @@ void canLogSeen() {
         for (uint8_t b = 0; b < e.dlc && b < 8; b++) {
             Serial.printf("%02X ", e.lastData[b]);
         }
+        // Only the bytes that have actually moved, with the span they moved
+        // over. Everything else is constant and not worth reading.
+        Serial.print(" var:");
+        bool any = false;
+        for (uint8_t b = 0; b < e.dlc && b < 8; b++) {
+            if (e.maxData[b] != e.minData[b]) {
+                Serial.printf(" b%u[%02X-%02X]", b, e.minData[b], e.maxData[b]);
+                any = true;
+            }
+        }
+        if (!any) Serial.print(" none (all bytes constant)");
         Serial.println();
     }
     Serial.println();
+}
+
+bool canSelfTest(CanBitrate rate) {
+    Serial.printf("\n[CAN] Self-test at %s (no other node needed)\n", canBitrateName(rate));
+
+    twai_timing_config_t t_config;
+    if (!timingFor(rate, t_config)) return false;
+
+    if (s_installed) canEnd();
+
+    // NO_ACK rather than LISTEN_ONLY: this one has to transmit. It is still
+    // safe on a live bus in the sense that it never expects an ACK, but it does
+    // drive the lines -- so this is a bench test, not something to run plugged
+    // into a ski.
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
+        (gpio_num_t)DB_CAN_TX, (gpio_num_t)DB_CAN_RX, TWAI_MODE_NO_ACK);
+    g_config.rx_queue_len = 16;
+    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+
+    esp_err_t err = twai_driver_install(&g_config, &t_config, &f_config);
+    if (err != ESP_OK) {
+        Serial.printf("[CAN] driver_install failed: %s\n", esp_err_to_name(err));
+        return false;
+    }
+    transceiverActive(true);   // Rs low = normal mode; standby cannot transmit
+    delay(5);
+
+    if (twai_start() != ESP_OK) {
+        Serial.println("[CAN] start failed");
+        twai_driver_uninstall();
+        transceiverActive(false);
+        return false;
+    }
+
+    twai_message_t tx = {};
+    tx.identifier = 0x123;
+    tx.data_length_code = 8;
+    for (int i = 0; i < 8; i++) tx.data[i] = 0xA0 + i;
+
+    bool ok = false;
+    if (twai_transmit(&tx, pdMS_TO_TICKS(200)) != ESP_OK) {
+        Serial.println("[CAN] transmit failed - controller could not send.");
+    } else {
+        twai_message_t rx;
+        if (twai_receive(&rx, pdMS_TO_TICKS(300)) != ESP_OK) {
+            Serial.println("[CAN] transmitted, but nothing came back.");
+            Serial.println("[CAN]   TX reached the controller; the loop through the transceiver did not.");
+            Serial.println("[CAN]   Suspect Rs stuck high (standby), no transceiver power, or CANH/CANL.");
+        } else if (rx.identifier != tx.identifier || rx.data_length_code != tx.data_length_code) {
+            Serial.printf("[CAN] got a frame but it is not ours: id=0x%03X dlc=%u\n",
+                          rx.identifier, rx.data_length_code);
+        } else {
+            bool same = true;
+            for (int i = 0; i < 8; i++) if (rx.data[i] != tx.data[i]) same = false;
+            Serial.printf("[CAN] LOOPBACK OK: id=0x%03X dlc=%u data%s intact\n",
+                          rx.identifier, rx.data_length_code, same ? "" : " NOT");
+            ok = same;
+        }
+    }
+
+    twai_status_info_t st;
+    if (twai_get_status_info(&st) == ESP_OK) {
+        Serial.printf("[CAN] tx_err=%u rx_err=%u bus_err=%u tx_failed=%u state=%d\n",
+                      st.tx_error_counter, st.rx_error_counter,
+                      (unsigned)st.bus_error_count, (unsigned)st.tx_failed_count, (int)st.state);
+    }
+
+    twai_stop();
+    twai_driver_uninstall();
+    transceiverActive(false);
+    s_installed = false;
+    Serial.printf("[CAN] Self-test %s\n\n", ok ? "PASSED" : "did not pass");
+    return ok;
 }
 
 void canSnifferLoop() {

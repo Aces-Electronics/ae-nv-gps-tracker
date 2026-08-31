@@ -19,6 +19,13 @@ struct CanFrameSummary {
     uint8_t  dlc      = 0;
     uint8_t  lastData[8] = {0};
     uint32_t count    = 0;
+
+    // Per-byte range across every frame seen for this ID. A byte that never
+    // moves is a constant, a header or padding; a byte that does is carrying
+    // something. On a bus of 16 IDs x 8 bytes that distinction is the whole
+    // difference between a wall of hex and a short list worth decoding.
+    uint8_t  minData[8] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    uint8_t  maxData[8] = {0};
 };
 
 // How many distinct IDs the table can hold before it stops taking new ones.
@@ -49,6 +56,18 @@ void canResetSeen();
 size_t canSeenCount();
 const CanFrameSummary* canSeen(size_t index);
 void canLogSeen();
+
+// Bench self-test: does the CAN hardware work at all, with no other node?
+//
+// TWAI_MODE_NO_ACK transmits without requiring an acknowledgement, and the
+// transceiver loops the bus back into its own receiver, so a frame that returns
+// has proved controller -> GPIO17 -> driver -> bus -> receiver -> GPIO18 ->
+// controller. That is the whole path bar another node.
+//
+// Caveat worth knowing before reading a failure as broken hardware: JP1 has
+// been cut, so the bus carries no termination. A lone node usually still hears
+// itself, but a marginal result here is not proof of a fault.
+bool canSelfTest(CanBitrate rate = CanBitrate::Rate250k);
 
 // Boots straight into detect-then-sniff and never returns. This is what the
 // can-sniffer build runs instead of the tracker's normal cycle.

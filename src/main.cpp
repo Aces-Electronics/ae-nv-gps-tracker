@@ -757,6 +757,11 @@ void setup() {
     Serial.println("\n=== DAUGHTER BOARD BENCH: continuous log ===");
     Serial.println("Columns: elapsed | battery | PG | STAT | charge state | supply switch\n");
     powerSweepPullups();
+    // canSelfTest() is deliberately NOT called here. It uses TWAI_MODE_NO_ACK,
+    // which transmits -- and this build gets flashed onto a tracker that may be
+    // plugged into a ski. A bench convenience that drives a vehicle bus the
+    // moment someone forgets where the board is plugged in is not worth having.
+    // Run it explicitly from a bench build when you want it.
 
     const uint32_t t0 = millis();
     for (uint32_t n = 1; ; n++) {
