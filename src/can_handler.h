@@ -77,6 +77,32 @@ bool canSelfTest(CanBitrate rate = CanBitrate::Rate250k);
 // Both frames captured with the engine stopped read 0000.
 int32_t canDecodeRpm(const CanFrameSummary& f);
 
+// What one short listen on the ski's bus yielded.
+struct EngineData {
+    bool    busAlive = false; // any frame at all -- i.e. is the ski awake
+    bool    rpmValid = false;
+    int32_t rpm      = 0;
+    bool    tempValid = false;
+    uint8_t tempRaw  = 0;     // 0x342 b4; scaling still unknown, sent raw
+};
+
+// Listens for `listenMs` and pulls out what the tracker reports. Cheap enough
+// to do on every wake: the bus runs at ~980 frames/s, so a second is a
+// thousand frames and everything of interest repeats at 50-100Hz.
+//
+// The bit rate is not swept here. It is known to be 500 kbit/s on this ski
+// (docs/can/seadoo-can.md) and a sweep would cost three times as long on the
+// overwhelmingly common case of a sleeping bus. busAlive false just means the
+// ignition is off, which is the normal state for a parked ski.
+EngineData canReadEngine(uint32_t listenMs = 1000);
+
+// Captures every frame for `seconds` into RAM and then dumps it as CSV.
+//
+// Streaming at full rate is not an option: ~980 frames/s is roughly 39 kB/s of
+// text against an 11.5 kB/s serial link, so a live dump would silently drop
+// most of the bus and look like a quiet one. Buffer first, print after.
+void canRawCapture(uint32_t seconds);
+
 // Time-series watch on the IDs carrying engine data, printed several times a
 // second. Ranges say which bytes are alive; only a series says what they mean,
 // because that is what can be held against a gauge reading.

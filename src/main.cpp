@@ -48,6 +48,12 @@ static const unsigned long DOWNLINK_WAIT_MS = 3000;
 // because the publish path now checks against it -- see transmitData().
 static const uint16_t MQTT_BUFFER_SIZE = 768;
 
+// Reporting interval when nothing has been provisioned. A parked ski has
+// nothing new to say, so the timer is a heartbeat -- proof of life and a
+// battery reading -- and movement is what actually triggers a report.
+// Already-provisioned units keep whatever is in NVS; set it over BLE to change.
+static const uint32_t HEARTBEAT_DEFAULT_MINS = 1440;
+
 OtaCommand g_otaCmd;
 bool g_otaPending = false;
 
@@ -66,7 +72,7 @@ void loadSettings() {
     settings.mqtt_broker = prefs.getString("broker", "mqtt.aceselectronics.com.au");
     settings.mqtt_user = prefs.getString("user", "aesmartshunt");
     settings.mqtt_pass = prefs.getString("pass", "AERemoteAccess2024!");
-    settings.report_interval_mins = prefs.getUInt("interval", 5);
+    settings.report_interval_mins = prefs.getUInt("interval", HEARTBEAT_DEFAULT_MINS);
     if (settings.report_interval_mins < 5) settings.report_interval_mins = 5;
 
     // getString()'s default only covers a *missing* key. A stored zero-length
@@ -163,6 +169,46 @@ RTC_DATA_ATTR static time_t s_lastReportTime = 0;
 // mooring must not be able to spend the battery on repeating itself.
 static const time_t MOTION_MIN_REPORT_S = 120;
 
+
+// --- Adaptive motion threshold -------------------------------------------
+//
+// The LIS3DH wake threshold in milli-g. It starts sensitive and climbs only
+// when the tracker keeps waking for movement that GPS says did not happen --
+// wash from a passing boat, wind, someone leaning on the hull. Every step up
+// costs sensitivity to real theft, so the ladder is short and it drops straight
+// back to the floor the moment genuine travel is seen.
+static const uint16_t MOTION_THRESHOLD_BASE_MG = 352;
+static const uint16_t MOTION_THRESHOLD_STEP_MG = 176;
+static const uint16_t MOTION_THRESHOLD_MAX_MG  = 1408;
+
+// Consecutive unexplained motion wakes before the threshold goes up. Three,
+// because one is noise and two is a coincidence.
+static const int FALSE_WAKES_BEFORE_RAISE = 3;
+
+// Under this, GPS is reporting its own noise rather than travel. A stationary
+// receiver commonly shows a knot or two.
+static const float STATIONARY_SPEED_KMH = 2.0f;
+
+RTC_DATA_ATTR static int s_falseWakeCount = 0;
+
+uint16_t g_motionThresholdMg = MOTION_THRESHOLD_BASE_MG;
+EngineData g_engine;
+
+static uint16_t loadMotionThreshold() {
+    prefs.begin("tracker", true);
+    uint16_t v = prefs.getUShort("mot_thr", MOTION_THRESHOLD_BASE_MG);
+    prefs.end();
+    if (v < MOTION_THRESHOLD_BASE_MG) v = MOTION_THRESHOLD_BASE_MG;
+    if (v > MOTION_THRESHOLD_MAX_MG)  v = MOTION_THRESHOLD_MAX_MG;
+    return v;
+}
+
+static void saveMotionThreshold(uint16_t mg) {
+    prefs.begin("tracker", false);
+    prefs.putUShort("mot_thr", mg);
+    prefs.end();
+}
+
 static bool wokeOnMotion() {
     return esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1;
 }
@@ -174,6 +220,55 @@ static const char* wakeReasonName() {
         case ESP_SLEEP_WAKEUP_UNDEFINED: return "Cold Boot";
         default:                         return "Other";
     }
+}
+
+// Run once per wake, after the GPS attempt, and only for wakes that came from
+// the accelerometer. GPS is the arbiter: a good fix showing no speed means the
+// interrupt was not a ski going anywhere.
+static void updateMotionThreshold(bool gotFix, float speedKmh) {
+    if (!wokeOnMotion()) return;
+
+    if (!gotFix) {
+        // No fix is not evidence. Raising the threshold on a wake that could not
+        // be classified would slowly deafen the tracker for reasons that have
+        // nothing to do with motion -- a garage roof is not a false positive.
+        Serial.println("[Motion] Motion wake with no fix; threshold unchanged.");
+        return;
+    }
+
+    if (speedKmh >= STATIONARY_SPEED_KMH) {
+        s_falseWakeCount = 0;
+        if (g_motionThresholdMg != MOTION_THRESHOLD_BASE_MG) {
+            Serial.printf("[Motion] Real travel at %.1f km/h -> threshold back to %umg\n",
+                          speedKmh, MOTION_THRESHOLD_BASE_MG);
+            g_motionThresholdMg = MOTION_THRESHOLD_BASE_MG;
+            saveMotionThreshold(g_motionThresholdMg);
+            imuEnableMotionWake(g_motionThresholdMg);
+        }
+        return;
+    }
+
+    s_falseWakeCount++;
+    Serial.printf("[Motion] Motion wake but GPS says %.1f km/h (%d/%d unexplained)\n",
+                  speedKmh, s_falseWakeCount, FALSE_WAKES_BEFORE_RAISE);
+
+    if (s_falseWakeCount < FALSE_WAKES_BEFORE_RAISE) return;
+    s_falseWakeCount = 0;
+
+    if (g_motionThresholdMg >= MOTION_THRESHOLD_MAX_MG) {
+        Serial.printf("[Motion] Already at the %umg ceiling; not going deafer than this.\n",
+                      MOTION_THRESHOLD_MAX_MG);
+        return;
+    }
+
+    uint16_t next = g_motionThresholdMg + MOTION_THRESHOLD_STEP_MG;
+    if (next > MOTION_THRESHOLD_MAX_MG) next = MOTION_THRESHOLD_MAX_MG;
+    g_motionThresholdMg = next;
+    saveMotionThreshold(g_motionThresholdMg);
+    // Re-arm now: the level in the part is whatever was set at boot, and the
+    // new one has to be in place before the next sleep.
+    imuEnableMotionWake(g_motionThresholdMg);
+    Serial.printf("[Motion] Threshold raised to %umg\n", g_motionThresholdMg);
 }
 
 // Arms the wake sources and goes. Shared by the end-of-cycle path and by the
@@ -637,6 +732,28 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
             doc["supply_enabled"] = power.supplyEnabled;
             doc["wake_reason"] = wakeReasonName();
 
+            // Vehicle frame, so the backend never has to know how the board is
+            // mounted. Two decimals is well inside what a +/-2g part resolves.
+            if (imu.valid) {
+                doc["accel_up"]   = roundf(imu.up   * 100) / 100.0f;
+                doc["accel_fwd"]  = roundf(imu.fwd  * 100) / 100.0f;
+                doc["accel_stbd"] = roundf(imu.stbd * 100) / 100.0f;
+            }
+
+            // Engine data, only when the ski's bus was actually awake. Sending
+            // rpm=0 for a parked ski would be indistinguishable from a running
+            // engine at a standstill, so absent means absent.
+            doc["engine_bus"] = g_engine.busAlive;
+            if (g_engine.rpmValid)  doc["rpm"] = g_engine.rpm;
+            // Raw because the scaling is genuinely unknown -- see
+            // docs/can/seadoo-can.md. Better an honest count than a fabricated
+            // temperature nobody can check.
+            if (g_engine.tempValid) doc["engine_temp_raw"] = g_engine.tempRaw;
+
+            // Published so the adaptive logic can be seen working from the
+            // backend rather than only from a serial cable.
+            doc["motion_threshold_mg"] = g_motionThresholdMg;
+
             int csq = modem.getSignalQuality();
             int dbm = (csq == 99) ? -113 : (csq * 2) - 113;
             doc["rssi"] = dbm;
@@ -742,8 +859,9 @@ void setup() {
     // powerBegin() comes first because it is what releases the pad hold from
     // the last sleep and gets the CAN transceiver out of an undefined state.
     powerBegin();
+    g_motionThresholdMg = loadMotionThreshold();
     if (imuBegin()) {
-        imuEnableMotionWake();
+        imuEnableMotionWake(g_motionThresholdMg);
     }
 
     pinMode(0, INPUT_PULLUP);
@@ -844,8 +962,18 @@ void setup() {
     
     modem.sendAT("+CGNSPWR=0");
     modem.waitResponse();
-    
+
+    // A second on the ski's bus. Cheap at ~980 frames/s -- everything of
+    // interest repeats at 50-100Hz -- and a quiet bus just means ignition off,
+    // which is the normal state for a parked ski.
+    g_engine = canReadEngine(1000);
+
     transmitData(lat, lon, speed, alt, sats, hdop);
+
+    // After the report, so a threshold change is decided on the same fix that
+    // was just published and re-arms before this wake ends.
+    updateMotionThreshold(has_fix, speed);
+
     goToSleep(has_fix);
 }
 

@@ -24,8 +24,11 @@ LilyGo T-SIM7080G-S3 based GPS tracker with NB-IoT connectivity for the AE-NV ec
 - ✅ Configurable reporting intervals (1-60 minutes)
 - ✅ Battery voltage monitoring
 - ✅ Deep sleep between reports, with GPS-failure backoff
-- ✅ Wake on motion (daughter board) — LIS3DH interrupt as a deep-sleep wake
-  source, rate-limited so a hull bobbing at a mooring can't drain the battery
+- ✅ **Daily heartbeat + wake on motion** — the timer is proof of life; movement
+  is what actually triggers a report
+- ✅ **Adaptive motion threshold** — climbs when the tracker keeps waking for
+  movement GPS says didn't happen, drops straight back on real travel
+- ✅ **Jetski engine data over CAN** — RPM decoded from the ECU (daughter board)
 
 ## Telemetry Fields
 
@@ -48,7 +51,14 @@ The tracker publishes the following data via MQTT:
   "charge_state": "Charging",  // Charging | Idle | Fault | No Input
   "supply_enabled": true,      // Is the jetski allowed to feed the charger
   "wake_reason": "Motion",     // Cold Boot | Timer | Motion
-  "interval": 1
+  "accel_up": 1.00,            // Vehicle frame, g. Omitted if no IMU
+  "accel_fwd": -0.02,
+  "accel_stbd": 0.03,
+  "engine_bus": true,          // Was the ski's CAN bus awake at all
+  "rpm": 1455,                 // Omitted unless engine_bus
+  "engine_temp_raw": 140,      // 0x342 b4, raw count — scaling unknown
+  "motion_threshold_mg": 352,  // Current adaptive wake threshold
+  "interval": 1440
 }
 ```
 
@@ -190,8 +200,24 @@ The firmware uses robust satellite count parsing with fallback logic:
 
 - **Active Mode**: GPS acquisition + MQTT publish
 - **BLE Window**: 90 seconds on boot for configuration
-- **Deep Sleep**: Between reports. Interval comes from settings, extended by a
-  backoff when GPS fails repeatedly (5/15/30/60/180 min)
+- **Deep Sleep**: Between reports. A newly provisioned tracker defaults to a
+  **1440-minute (daily) heartbeat**; movement is the real trigger. Extended by a
+  backoff when GPS fails repeatedly (5/15/30/60/180 min).
+- **Wake on motion**: The LIS3DH interrupt is an `ext1` deep-sleep wake source.
+  Motion reports are rate-limited to one per 120s, checked before the modem is
+  powered, so a suppressed wake costs ~200ms rather than a GPS acquisition.
+- **Adaptive threshold**: After a motion wake, GPS decides whether it was real.
+  A good fix showing under 2 km/h counts as unexplained; three consecutive
+  unexplained wakes raise the threshold one step (352mg base, 176mg steps,
+  1408mg ceiling). Genuine travel resets it to the floor immediately. A wake
+  with *no* fix changes nothing — a garage roof is not a false positive. The
+  current value is persisted in NVS and published as `motion_threshold_mg`.
+
+### Upgrading an already-provisioned tracker
+
+The daily heartbeat is a *default*, applied only when NVS has no stored
+interval. A unit provisioned before this change keeps whatever it has (commonly
+5 minutes) until the interval is set over BLE.
 
 ## Known Issues
 

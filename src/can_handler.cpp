@@ -273,6 +273,82 @@ bool canSelfTest(CanBitrate rate) {
     return ok;
 }
 
+EngineData canReadEngine(uint32_t listenMs) {
+    EngineData e;
+
+    if (!canBeginListenOnly(CanBitrate::Rate500k)) {
+        Serial.println("[CAN] Could not open the bus this wake.");
+        return e;
+    }
+
+    const uint32_t t0 = millis();
+    twai_message_t msg;
+    uint32_t frames = 0;
+    while (millis() - t0 < listenMs) {
+        if (twai_receive(&msg, pdMS_TO_TICKS(20)) != ESP_OK) continue;
+        frames++;
+        e.busAlive = true;
+
+        if (msg.identifier == 0x102 && msg.data_length_code >= 2) {
+            e.rpm = (((uint32_t)msg.data[0] << 8) | msg.data[1]) / 4;
+            e.rpmValid = true;
+        } else if (msg.identifier == 0x342 && msg.data_length_code >= 5) {
+            e.tempRaw = msg.data[4];
+            e.tempValid = true;
+        }
+    }
+
+    canEnd();   // also puts the transceiver back in standby
+
+    if (!e.busAlive) {
+        Serial.println("[CAN] Bus quiet - ignition off.");
+    } else {
+        Serial.printf("[CAN] %u frames; rpm=%ld temp_raw=%u\n",
+                      frames, e.rpmValid ? (long)e.rpm : -1L, e.tempRaw);
+    }
+    return e;
+}
+
+void canRawCapture(uint32_t seconds) {
+    struct Entry { uint32_t ms; uint16_t id; uint8_t dlc; uint8_t data[8]; };
+    const size_t cap = (size_t)seconds * 1200;   // headroom over the ~980/s seen
+
+    // PSRAM: this board has it, and a capture worth having is far larger than
+    // the internal heap should be asked for.
+    Entry* buf = (Entry*)ps_malloc(cap * sizeof(Entry));
+    if (!buf) buf = (Entry*)malloc(cap * sizeof(Entry));
+    if (!buf) {
+        Serial.printf("[CAN] Could not allocate %u frames for capture.\n", (unsigned)cap);
+        return;
+    }
+
+    Serial.printf("[CAN] Raw capture: %us, room for %u frames. Buffering...\n",
+                  (unsigned)seconds, (unsigned)cap);
+
+    size_t n = 0;
+    const uint32_t t0 = millis();
+    twai_message_t msg;
+    while (millis() - t0 < seconds * 1000 && n < cap) {
+        if (twai_receive(&msg, pdMS_TO_TICKS(5)) != ESP_OK) continue;
+        buf[n].ms  = millis() - t0;
+        buf[n].id  = (uint16_t)msg.identifier;
+        buf[n].dlc = msg.data_length_code;
+        memcpy(buf[n].data, msg.data, 8);
+        n++;
+    }
+
+    Serial.printf("[CAN] Captured %u frames. Dumping CSV.\n", (unsigned)n);
+    Serial.println("---8<--- BEGIN CAN CSV ---8<---");
+    Serial.println("ms,id,dlc,d0,d1,d2,d3,d4,d5,d6,d7");
+    for (size_t i = 0; i < n; i++) {
+        Serial.printf("%lu,%03X,%u", (unsigned long)buf[i].ms, buf[i].id, buf[i].dlc);
+        for (int b = 0; b < 8; b++) Serial.printf(",%02X", buf[i].data[b]);
+        Serial.println();
+    }
+    Serial.println("---8<--- END CAN CSV ---8<---");
+    free(buf);
+}
+
 int32_t canDecodeRpm(const CanFrameSummary& f) {
     if (f.id != 0x102 || f.extended || f.dlc < 2) return -1;
     return (((uint32_t)f.lastData[0] << 8) | f.lastData[1]) / 4;
@@ -348,6 +424,7 @@ void canSnifferLoop() {
     // what can be held against a gauge.
     canSniff(10000);
     canLogSeen();
+    canRawCapture(10);
     canWatchLoop();
 }
 
