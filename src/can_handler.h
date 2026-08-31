@@ -71,11 +71,10 @@ bool canSelfTest(CanBitrate rate = CanBitrate::Rate250k);
 
 // Engine RPM from a 0x102 frame, or -1 if it is not one.
 //
-// Bosch ME17.8.5, b0/b1 big-endian at a quarter rpm per bit. The ID and byte
-// positions come from published work on this ECU; the scaling is inferred and
-// wants checking against the tacho. It is the only candidate that lands
-// anywhere believable -- the observed maximum 0x74FF is 7488 rpm at /4, against
-// a 4-TEC redline of roughly 7300-8000, where little-endian would claim 16349.
+// Bosch ME17.8.5, b0/b1 big-endian at a quarter rpm per bit. CONFIRMED against
+// the tacho on a running ski, not inferred: idle decoded to a 1455 mean against
+// a gauge reading 1400-1500, and a rev decoded to 6554 against a reported ~6500.
+// Both frames captured with the engine stopped read 0000.
 int32_t canDecodeRpm(const CanFrameSummary& f);
 
 // Time-series watch on the IDs carrying engine data, printed several times a

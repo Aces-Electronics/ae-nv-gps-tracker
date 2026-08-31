@@ -287,7 +287,7 @@ static const CanFrameSummary* findSeen(uint32_t id) {
 
 void canWatchLoop() {
     Serial.println("\n[CAN] === WATCH: engine-data IDs over time ===");
-    Serial.println("[CAN] RPM decoded from 0x102 b0/b1 big-endian /4 -- CHECK IT AGAINST THE TACHO.");
+    Serial.println("[CAN] RPM: 0x102 b0/b1 big-endian /4, confirmed against the tacho.");
     Serial.println("[CAN] Hold a steady idle, then rev slowly up and back.\n");
 
     const uint32_t t0 = millis();
