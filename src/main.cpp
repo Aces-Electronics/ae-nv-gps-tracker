@@ -948,6 +948,56 @@ void setup() {
     }
 #endif
 
+#ifdef SPEED_SURVEY_MODE
+    // Finding the speed signal needs CAN bytes and a speed reference in the
+    // same log. GPS is that reference: independent of the bus, already aboard,
+    // and honest about its own quality via sats and HDOP. No MQTT, no sleep --
+    // ride, then read the CSV back and correlate offline exactly as RPM was
+    // correlated against the tacho.
+    //
+    // Published sources put SeaDoo speed on 0x208 or 0x268. Neither ID exists
+    // on this bus (see docs/can/seadoo-can.md), so it has to be found rather
+    // than looked up, and this emits every byte of every ID rather than
+    // guessing which to watch.
+    modemPowerOn();
+    initGNSS();
+    if (!canBeginListenOnly(CanBitrate::Rate500k)) {
+        Serial.println("[SURVEY] Could not open the CAN bus. Halting.");
+        while (true) delay(1000);
+    }
+    canResetSeen();
+
+    Serial.println("\n=== SPEED SURVEY ===");
+    Serial.println("Ride at a few steady speeds and hold each for ~15s.");
+    Serial.println("---8<--- BEGIN SURVEY CSV ---8<---");
+    Serial.println("t_ms,gps_kmh,sats,hdop,id,d0,d1,d2,d3,d4,d5,d6,d7");
+
+    const uint32_t t0 = millis();
+    float gpsKmh = -1; int gpsSats = 0; float gpsHdop = 99;
+    while (true) {
+        canDrain(400);
+
+        modem.sendAT("+CGNSINF");
+        if (modem.waitResponse(800L, "+CGNSINF: ") == 1) {
+            String res = modem.stream.readStringUntil('\n');
+            res.trim();
+            float la, lo, sp, al, hd; int st;
+            if (parseCGNSINF(res, &la, &lo, &sp, &al, &st, &hd)) {
+                gpsKmh = sp; gpsSats = st; gpsHdop = hd;
+            }
+        }
+
+        const uint32_t ms = millis() - t0;
+        for (size_t i = 0; i < canSeenCount(); i++) {
+            const CanFrameSummary* f = canSeen(i);
+            if (!f) continue;
+            Serial.printf("%lu,%.2f,%d,%.2f,%03X", (unsigned long)ms, gpsKmh, gpsSats, gpsHdop, f->id);
+            for (int b = 0; b < 8; b++) Serial.printf(",%02X", f->lastData[b]);
+            Serial.println();
+        }
+    }
+#endif
+
 #ifdef CAN_SNIFFER_MODE
     // Bring-up build: never returns. Deliberately after powerBegin() so the
     // transceiver starts from a defined state, and before anything touches the

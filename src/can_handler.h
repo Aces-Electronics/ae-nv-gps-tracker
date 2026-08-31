@@ -52,6 +52,10 @@ CanBitrate canDetectBitrate(uint32_t msPerRate = 750);
 // canBeginListenOnly() first. Returns the number of distinct IDs known so far.
 size_t canSniff(uint32_t durationMs);
 
+// Drains and records for `ms` without printing anything. canSniff() logs a
+// summary, which is noise inside a loop that is emitting CSV.
+void canDrain(uint32_t ms);
+
 void canResetSeen();
 size_t canSeenCount();
 const CanFrameSummary* canSeen(size_t index);
