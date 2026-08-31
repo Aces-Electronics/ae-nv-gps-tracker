@@ -69,6 +69,20 @@ void canLogSeen();
 // itself, but a marginal result here is not proof of a fault.
 bool canSelfTest(CanBitrate rate = CanBitrate::Rate250k);
 
+// Engine RPM from a 0x102 frame, or -1 if it is not one.
+//
+// Bosch ME17.8.5, b0/b1 big-endian at a quarter rpm per bit. The ID and byte
+// positions come from published work on this ECU; the scaling is inferred and
+// wants checking against the tacho. It is the only candidate that lands
+// anywhere believable -- the observed maximum 0x74FF is 7488 rpm at /4, against
+// a 4-TEC redline of roughly 7300-8000, where little-endian would claim 16349.
+int32_t canDecodeRpm(const CanFrameSummary& f);
+
+// Time-series watch on the IDs carrying engine data, printed several times a
+// second. Ranges say which bytes are alive; only a series says what they mean,
+// because that is what can be held against a gauge reading.
+void canWatchLoop();
+
 // Boots straight into detect-then-sniff and never returns. This is what the
 // can-sniffer build runs instead of the tracker's normal cycle.
 void canSnifferLoop();

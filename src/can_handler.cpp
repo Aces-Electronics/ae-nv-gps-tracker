@@ -273,6 +273,55 @@ bool canSelfTest(CanBitrate rate) {
     return ok;
 }
 
+int32_t canDecodeRpm(const CanFrameSummary& f) {
+    if (f.id != 0x102 || f.extended || f.dlc < 2) return -1;
+    return (((uint32_t)f.lastData[0] << 8) | f.lastData[1]) / 4;
+}
+
+static const CanFrameSummary* findSeen(uint32_t id) {
+    for (size_t i = 0; i < s_seenCount; i++) {
+        if (s_seen[i].id == id && !s_seen[i].extended) return &s_seen[i];
+    }
+    return nullptr;
+}
+
+void canWatchLoop() {
+    Serial.println("\n[CAN] === WATCH: engine-data IDs over time ===");
+    Serial.println("[CAN] RPM decoded from 0x102 b0/b1 big-endian /4 -- CHECK IT AGAINST THE TACHO.");
+    Serial.println("[CAN] Hold a steady idle, then rev slowly up and back.\n");
+
+    const uint32_t t0 = millis();
+    uint32_t lastPrint = 0;
+    twai_message_t msg;
+
+    while (true) {
+        // Drain hard between prints. At ~980 frames/s the queue overruns in
+        // well under the print interval, and a stale payload would look like a
+        // signal that had stopped moving.
+        while (twai_receive(&msg, pdMS_TO_TICKS(2)) == ESP_OK) recordFrame(msg);
+
+        if (millis() - lastPrint < 200) continue;
+        lastPrint = millis();
+
+        const CanFrameSummary* f102 = findSeen(0x102);
+        const CanFrameSummary* f122 = findSeen(0x122);
+        const CanFrameSummary* f320 = findSeen(0x320);
+        const CanFrameSummary* f342 = findSeen(0x342);
+        const CanFrameSummary* f110 = findSeen(0x110);
+
+        Serial.printf("[%7.1fs] RPM=%5ld", (millis() - t0) / 1000.0f,
+                      f102 ? (long)canDecodeRpm(*f102) : -1L);
+        if (f102) Serial.printf(" (raw %02X%02X)", f102->lastData[0], f102->lastData[1]);
+        if (f122) Serial.printf(" | 0x122 %02X %02X %02X %02X %02X %02X",
+                                f122->lastData[0], f122->lastData[1], f122->lastData[2],
+                                f122->lastData[3], f122->lastData[4], f122->lastData[5]);
+        if (f110) Serial.printf(" | 110.b3=%02X", f110->lastData[3]);
+        if (f320) Serial.printf(" | 320.b4=%02X", f320->lastData[4]);
+        if (f342) Serial.printf(" | 342.b4=%02X", f342->lastData[4]);
+        Serial.println();
+    }
+}
+
 void canSnifferLoop() {
     Serial.println("\n=== CAN SNIFFER (listen-only) ===");
     Serial.println("This build never reaches the tracker cycle: no modem, no MQTT, no sleep.");
@@ -294,10 +343,12 @@ void canSnifferLoop() {
     }
 
     canResetSeen();
-    while (true) {
-        canSniff(10000);
-        canLogSeen();
-    }
+    // One discovery pass for the ID list and per-byte ranges, then straight into
+    // the time series -- the table says which bytes are alive, the series is
+    // what can be held against a gauge.
+    canSniff(10000);
+    canLogSeen();
+    canWatchLoop();
 }
 
 const char* canBitrateName(CanBitrate r) {
