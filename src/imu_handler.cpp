@@ -4,6 +4,8 @@
 #include <Adafruit_LIS3DH.h>
 #include <Adafruit_Sensor.h>
 #include "driver/gpio.h"
+#include "driver/rtc_io.h"
+#include "esp_sleep.h"
 
 // The AXP2101 owns Wire (I2C_SDA/I2C_SCL). The daughter board lands the LIS3DH
 // on a different pin pair entirely -- see the J4 map in utilities.h -- so this
@@ -56,6 +58,8 @@ static const int SAMPLE_DELAY_MS = 20;
 // So a single silent attempt is not evidence of absence. Retry before
 // concluding anything.
 static bool i2cAck(uint8_t addr);
+static uint8_t lisRead8(uint8_t reg);
+static void reportRetainedConfig();
 static bool i2cAckRetry(uint8_t addr, int attempts = 4) {
     for (int i = 0; i < attempts; i++) {
         if (i2cAck(addr)) return true;
@@ -279,8 +283,18 @@ bool imuBegin() {
         return false;
     }
 
+    // Before lis.begin(), because Adafruit's begin() writes CTRL1, CTRL3 and
+    // CTRL4 on its way past -- and CTRL3 is one of the registers that carries
+    // the answer. s_addr is set early only so lisRead8() has an address; the
+    // real assignment still happens below, once the part has identified itself.
+    s_addr = found;
+    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_UNDEFINED) {
+        reportRetainedConfig();
+    }
+
     if (!lis.begin(found)) {
         Serial.printf("[IMU] 0x%02X ACKed but is not a LIS3DH (WHO_AM_I mismatch)\n", found);
+        s_addr = 0; // imuAddress() promises 0 when nothing was found
         return false;
     }
 
@@ -373,6 +387,113 @@ static uint8_t lisRead8(uint8_t reg) {
 
 // At +/-2g the INT1_THS step is 16mg.
 static const uint16_t INT1_THS_STEP_MG = 16;
+
+// Did the LIS3DH keep its power through deep sleep?
+//
+// The argument says it must: the daughter board's 3.3V arrives on J4.1, which
+// is the LilyGo header's 3V3 = AXP2101 DCDC1 -- the same rail that keeps the
+// S3's own RTC domain alive while it sleeps. Nothing in this firmware touches
+// DCDC1; modemPowerOff() disables DC3 and BLDO2 only. A rail the ESP32 needs to
+// wake up at all cannot be off while it is asleep.
+//
+// But that is an argument, and "the accelerometer must have been unpowered" is
+// a cheap conclusion to reach when a wake does not happen. These registers
+// settle it as a measurement. They are volatile and they are not battery
+// backed, so a part that lost its rail answers with reset defaults (all zero),
+// and a part that did not answers with exactly what imuEnableMotionWake() wrote
+// before the sleep. There is no third reading that means "powered but idle".
+//
+// Only meaningful on a wake from sleep. On a cold boot the defaults are the
+// truthful answer and say nothing about the rail, which is why the caller
+// checks the wake cause first.
+static void reportRetainedConfig() {
+    // After an ext1 wake the pad is still routed to the RTC IO mux, so the
+    // digital GPIO the Arduino API reads is not what the pin is actually doing.
+    // Handing it back first is what makes the level below a real measurement.
+    rtc_gpio_deinit((gpio_num_t)DB_IMU_INT1);
+    pinMode(DB_IMU_INT1, INPUT);
+
+    const uint8_t c2  = lisRead8(LIS3DH_REG_CTRL2);
+    const uint8_t c3  = lisRead8(LIS3DH_REG_CTRL3);
+    const uint8_t c5  = lisRead8(LIS3DH_REG_CTRL5);
+    const uint8_t cfg = lisRead8(LIS3DH_REG_INT1CFG);
+    const uint8_t ths = lisRead8(LIS3DH_REG_INT1THS);
+    const uint8_t dur = lisRead8(LIS3DH_REG_INT1DUR);
+    const int     pin = digitalRead(DB_IMU_INT1);
+
+    // Read last on purpose: reading INT1_SRC is what releases the latch, so
+    // taking it earlier would clear the evidence the line above is reporting.
+    const uint8_t src = lisRead8(LIS3DH_REG_INT1SRC);
+
+    Serial.printf("[IMU] Retained: CTRL2=0x%02X CTRL3=0x%02X CTRL5=0x%02X INT1_CFG=0x%02X "
+                  "THS=%u DUR=%u SRC=0x%02X  INT1 pin=%s\n",
+                  c2, c3, c5, cfg, ths, dur, src, pin ? "HIGH" : "low");
+
+    const bool armed = (cfg == 0x2A && c3 == 0x40 && c5 == 0x08);
+    const bool blank = (cfg == 0x00 && c3 == 0x00 && c5 == 0x00 && ths == 0x00);
+
+    if (armed) {
+        Serial.printf("[IMU]   -> config survived the sleep, so the part held its 3.3V rail. "
+                      "It was armed at %umg over %u samples (%ums).\n",
+                      ths * INT1_THS_STEP_MG, dur, dur * 20);
+        // IA is the interrupt-active flag; the low six bits say which axis and
+        // direction. Set means this part did fire, whether or not that is what
+        // ended the sleep.
+        if (src & 0x40) Serial.printf("[IMU]   -> IA set: it latched a motion event (axes 0x%02X).\n", src & 0x3F);
+        else            Serial.println("[IMU]   -> IA clear: it never saw motion past the threshold.");
+    } else if (blank) {
+        Serial.println("[IMU]   -> reset defaults: the part power-cycled during sleep, so nothing was armed.");
+        Serial.println("[IMU]      That would be a real rail fault -- 3V3 on J4.1 should not drop while the S3 sleeps.");
+    } else {
+        Serial.println("[IMU]   -> neither armed nor blank: something else has written the interrupt block.");
+    }
+}
+
+// Live proof of the interrupt path, without waiting on a sleep cycle.
+//
+// Worth having because the shipping configuration deliberately rejects the
+// obvious bench test. INT1_DURATION is counted in ODR periods, so the default
+// three samples at 50Hz demand 60ms of continuous over-threshold motion, and
+// normal mode band-limits to about ODR/2 = 25Hz before the comparator ever sees
+// the signal. A finger tap is a few milliseconds of mostly high-frequency
+// energy: it is filtered down and it is over long before the duration counter
+// gets there. Tapping the board and seeing nothing is this working as designed,
+// not evidence of a dead accelerometer.
+//
+// So: shake it. This prints every latched event, so a gesture that would wake
+// the tracker can be found by trying, and one that would not can be recognised.
+void imuWatchMotionInterrupt(uint32_t ms) {
+    if (!s_present) {
+        Serial.println("[IMU] No IMU - nothing to watch.");
+        return;
+    }
+    rtc_gpio_deinit((gpio_num_t)DB_IMU_INT1);
+    pinMode(DB_IMU_INT1, INPUT);
+    imuClearMotionInterrupt();
+
+    Serial.printf("\n[IMU] Watching INT1 for %lus. Shake the board -- a tap is too short to count.\n",
+                  (unsigned long)(ms / 1000));
+
+    const uint32_t t0 = millis();
+    uint32_t events = 0;
+    while (millis() - t0 < ms) {
+        if (digitalRead(DB_IMU_INT1) == HIGH) {
+            const uint8_t src = lisRead8(LIS3DH_REG_INT1SRC); // reading it releases the latch
+            events++;
+            Serial.printf("[IMU]   +%5.1fs  INT1 HIGH  SRC=0x%02X  (%s%s%s)\n",
+                          (millis() - t0) / 1000.0f, src,
+                          (src & 0x02) ? "X " : "", (src & 0x08) ? "Y " : "", (src & 0x20) ? "Z" : "");
+        }
+        delay(5);
+    }
+
+    if (events) {
+        Serial.printf("[IMU] %lu event(s) -- the interrupt path works end to end.\n", (unsigned long)events);
+    } else {
+        Serial.println("[IMU] No events. Either the motion was too brief/gentle for the armed threshold,");
+        Serial.println("[IMU]   or INT1 is not reaching GPIO12. Re-run and shake it harder to tell them apart.");
+    }
+}
 
 bool imuEnableMotionWake(uint16_t thresholdMg, uint8_t durationSamples) {
     if (!s_present) return false;

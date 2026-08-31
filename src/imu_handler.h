@@ -61,6 +61,13 @@ bool imuEnableMotionWake(uint16_t thresholdMg = 352, uint8_t durationSamples = 3
 // next sleep ends immediately.
 void imuClearMotionInterrupt();
 
+// Bench diagnostic: watches INT1 for a while and prints every latched event.
+//
+// The shipping arm is a sustained-motion detector, not a tap detector -- see the
+// note on the definition -- so this exists to find a gesture that does trigger
+// it, rather than concluding from a tap that nothing works.
+void imuWatchMotionInterrupt(uint32_t ms);
+
 // Bench diagnostic: what the part says about itself, plus the bus levels.
 // WHO_AM_I is the discriminator when readings go to zero -- 0x33 means a real
 // LIS3DH that has lost its configuration, 0x00 means the bus is returning
