@@ -70,7 +70,10 @@ bool otaParseCommand(const uint8_t* payload, unsigned int length, OtaCommand& ou
     // command. Treating that as "no command" is the whole point of the check.
     if (payload == nullptr || length == 0) return false;
 
-    StaticJsonDocument<384> doc;
+    // Elastic in ArduinoJson 7, where StaticJsonDocument is deprecated. Nothing
+    // unbounded can reach here: `length` is whatever arrived inside the MQTT
+    // receive buffer, so the old 384-byte ceiling was never the real limit.
+    JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payload, length);
     if (err) {
         Serial.printf("[OTA] Downlink is not JSON (%s)\n", err.c_str());

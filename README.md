@@ -8,18 +8,27 @@ LilyGo T-SIM7080G-S3 based GPS tracker with NB-IoT connectivity for the AE-NV ec
 - **GPS**: Integrated GNSS (GPS/GLONASS/Beidou/Galileo)
 - **Connectivity**: NB-IoT / LTE Cat-M1
 - **Battery**: LiPo with AXP2101 PMU
-- **Sensors**: MMA8452Q accelerometer for orientation detection
+- **Daughter board**: `ae-tracker-db` — LIS3DH accelerometer, SN65HVD231 CAN
+  transceiver, and a BQ25176J charger that tops the LiPo up from the jetski's
+  supply through an MCU-switchable cutoff. Plugs onto the LilyGo's 16-pin
+  expansion header; the J4 pin map is in [`src/utilities.h`](src/utilities.h).
 
 ## Features
 
 - ✅ GPS tracking with satellite count and HDOP
 - ✅ NB-IoT connectivity via Telstra network
 - ✅ MQTT telemetry publishing to AE-NV backend
-- ✅ BLE configuration interface (90s window on boot)
-- ✅ Orientation detection (Flat/Vertical/Upside Down)
+- ✅ BLE configuration interface (15s window on cold boot)
+- ✅ Orientation detection (Flat/Vertical/Upside Down) — needs the daughter
+  board; reports `Unknown` without it
 - ✅ Configurable reporting intervals (1-60 minutes)
 - ✅ Battery voltage monitoring
-- ✅ Deep sleep support (planned)
+- ✅ Deep sleep between reports, with GPS-failure backoff
+- ✅ **Daily heartbeat + wake on motion** — the timer is proof of life; movement
+  is what actually triggers a report
+- ✅ **Adaptive motion threshold** — climbs when the tracker keeps waking for
+  movement GPS says didn't happen, drops straight back on real travel
+- ✅ **Jetski engine data over CAN** — RPM decoded from the ECU (daughter board)
 
 ## Telemetry Fields
 
@@ -39,7 +48,18 @@ The tracker publishes the following data via MQTT:
   "battery_voltage": 4.177,  // Legacy alias
   "rssi": 19,
   "orientation": "Flat",
-  "interval": 1
+  "charge_state": "Charging",  // Charging | Idle | Fault | No Input
+  "supply_enabled": true,      // Is the jetski allowed to feed the charger
+  "wake_reason": "Motion",     // Cold Boot | Timer | Motion
+  "accel_up": 1.00,            // Vehicle frame, g. Omitted if no IMU
+  "accel_fwd": -0.02,
+  "accel_stbd": 0.03,
+  "engine_bus": true,          // Was the ski's CAN bus awake at all
+  "ski_running": true,         // Drives the reporting cadence
+  "rpm": 1455,                 // Omitted unless engine_bus
+  "engine_temp_raw": 140,      // 0x342 b4, raw count — scaling unknown
+  "motion_threshold_mg": 352,  // Current adaptive wake threshold
+  "interval": 1440
 }
 ```
 
@@ -63,9 +83,31 @@ pio run -d /path/to/ae-sim7080g-tracker -t upload --upload-port /dev/ttyACM6
 pio device monitor --port /dev/ttyACM6 -b 115200
 ```
 
+### CAN bring-up build
+
+A separate environment boots straight into a listen-only CAN sniffer and never
+reaches the tracker's normal cycle — no modem, no MQTT, no sleep:
+
+```bash
+pio run -e can-sniffer -t upload && pio device monitor -b 115200
+```
+
+It scans 250k → 500k → 125k, keeps whichever rate hears frames, then prints a
+table of distinct IDs with hit counts and the last payload for each, refreshed
+every 10 seconds.
+
+**Listen-only never drives the bus**, not even the ACK bit, so this is safe to
+plug into a running ski before anything is known about the bus or its rate. The
+shipping firmware is unaffected — `default_envs` keeps this out of a bare
+`pio run`, and the linker drops the sniffer and the TWAI driver from it.
+
+Note that the daughter board's CAN termination jumper (JP1) is bridged by
+default. A vehicle bus is already terminated at both ends, so JP1 most likely
+wants cutting before connecting to a real ski.
+
 ### Configuration
 
-The tracker can be configured via BLE during the 90-second window on boot:
+The tracker can be configured via BLE during the 15-second window on cold boot:
 
 - **Report Interval**: 1-60 minutes
 - **Home Location**: Set via web UI
@@ -159,7 +201,30 @@ The firmware uses robust satellite count parsing with fallback logic:
 
 - **Active Mode**: GPS acquisition + MQTT publish
 - **BLE Window**: 90 seconds on boot for configuration
-- **Deep Sleep**: Planned implementation for extended battery life
+- **Deep Sleep**: Cadence follows the ski, not the clock.
+  - **Running** (CAN bus awake) → the configured `report_interval_mins`,
+    5 minutes by default, settable over BLE. GPS-failure backoff applies
+    (5/15/30/60/180 min).
+  - **Parked** → a **1440-minute (daily) heartbeat**. Backoff is not applied;
+    stretching a day further on one missed fix trades away the only thing a
+    heartbeat is for.
+
+  CAN traffic is the running signal because the ski's bus only wakes with the
+  ignition. Supply voltage above ~13V would be the better test — it survives a
+  CAN fault — but the supply-sense divider is mis-scaled and reads nothing
+  usable yet (see `R15`/`R16` in [`src/utilities.h`](src/utilities.h)).
+- **Wake on motion**: The LIS3DH interrupt is an `ext1` deep-sleep wake source.
+  Motion reports are rate-limited to one per 120s, checked before the modem is
+  powered, so a suppressed wake costs ~200ms rather than a GPS acquisition.
+- **Adaptive threshold**: After a motion wake, GPS decides whether it was real.
+  A good fix showing under 2 km/h counts as unexplained; three consecutive
+  unexplained wakes raise the threshold one step (352mg base, 176mg steps,
+  1408mg ceiling). Genuine travel resets it to the floor immediately. A wake
+  with *no* fix changes nothing — a garage roof is not a false positive. The
+  current value is persisted in NVS and published as `motion_threshold_mg`.
+
+No migration is needed for already-provisioned trackers: a stored 5-minute
+interval now describes the *running* case, which is what it was always for.
 
 ## Known Issues
 

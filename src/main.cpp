@@ -11,6 +11,9 @@
 #include "ble_handler.h"
 #include "crash_handler.h"
 #include "ota_handler.h"
+#include "imu_handler.h"
+#include "power_handler.h"
+#include "can_handler.h"
 
 // --- Configuration ---
 TrackerSettings settings;
@@ -31,7 +34,6 @@ BLEHandler ble;
 String imei = "";
 String mqtt_topic_up = "";
 String mqtt_topic_dn = "";
-bool stay_awake = false; // Enable Sleep for Backoff Strategy
 
 // How long the MQTT session is held open after publishing, waiting for the
 // retained downlink. The broker sends a retained message immediately on SUBACK,
@@ -40,6 +42,25 @@ bool stay_awake = false; // Enable Sleep for Backoff Strategy
 // time per wake -- on a five-minute cycle that is roughly 5 mAh/day at a
 // registered-idle 25 mA, and the loop exits the moment something arrives.
 static const unsigned long DOWNLINK_WAIT_MS = 3000;
+
+// PubSubClient sizes one buffer for both directions, so this has to hold the
+// outgoing telemetry frame and the incoming retained OTA command alike. Named
+// because the publish path now checks against it -- see transmitData().
+static const uint16_t MQTT_BUFFER_SIZE = 768;
+
+// Cadence follows the ski, not the clock.
+//
+// A running engine is worth following closely, so that case uses the
+// configured report_interval_mins (5 minutes by default, settable over BLE). A
+// parked ski has nothing to say between one day and the next, so it gets a
+// heartbeat -- proof of life, a battery reading, a position -- and relies on
+// the accelerometer to wake it if anything actually happens.
+//
+// Splitting it this way also means a unit already provisioned with a 5-minute
+// interval is correct as it stands: that value now describes the running case,
+// which is what it was always meant for.
+static const uint32_t HEARTBEAT_DEFAULT_MINS = 5;
+static const uint32_t PARKED_INTERVAL_MINS   = 1440;
 
 OtaCommand g_otaCmd;
 bool g_otaPending = false;
@@ -59,7 +80,7 @@ void loadSettings() {
     settings.mqtt_broker = prefs.getString("broker", "mqtt.aceselectronics.com.au");
     settings.mqtt_user = prefs.getString("user", "aesmartshunt");
     settings.mqtt_pass = prefs.getString("pass", "AERemoteAccess2024!");
-    settings.report_interval_mins = prefs.getUInt("interval", 5);
+    settings.report_interval_mins = prefs.getUInt("interval", HEARTBEAT_DEFAULT_MINS);
     if (settings.report_interval_mins < 5) settings.report_interval_mins = 5;
 
     // getString()'s default only covers a *missing* key. A stored zero-length
@@ -143,13 +164,163 @@ void modemPowerOff() {
     PMU.disableBLDO2(); // GPS Antenna
 }
 
+// Set after every successful publish. Lives in RTC memory because the whole
+// point is to still be there on the far side of a deep sleep.
+//
+// time() rather than millis(): the RTC timer keeps counting through deep sleep
+// and IDF restores the system clock from it on wake, so this stays monotonic
+// across cycles. It is never set from the network, so it is elapsed-time-since-
+// first-power-on, not a wall clock -- which is all a rate limit needs.
+RTC_DATA_ATTR static time_t s_lastReportTime = 0;
+
+// How soon after a report a motion wake is worth acting on. A hull bobbing at a
+// mooring must not be able to spend the battery on repeating itself.
+static const time_t MOTION_MIN_REPORT_S = 120;
+
+
+// --- Adaptive motion threshold -------------------------------------------
+//
+// The LIS3DH wake threshold in milli-g. It starts sensitive and climbs only
+// when the tracker keeps waking for movement that GPS says did not happen --
+// wash from a passing boat, wind, someone leaning on the hull. Every step up
+// costs sensitivity to real theft, so the ladder is short and it drops straight
+// back to the floor the moment genuine travel is seen.
+static const uint16_t MOTION_THRESHOLD_BASE_MG = 352;
+static const uint16_t MOTION_THRESHOLD_STEP_MG = 176;
+static const uint16_t MOTION_THRESHOLD_MAX_MG  = 1408;
+
+// Consecutive unexplained motion wakes before the threshold goes up. Three,
+// because one is noise and two is a coincidence.
+static const int FALSE_WAKES_BEFORE_RAISE = 3;
+
+// Under this, GPS is reporting its own noise rather than travel. A stationary
+// receiver commonly shows a knot or two.
+static const float STATIONARY_SPEED_KMH = 2.0f;
+
+RTC_DATA_ATTR static int s_falseWakeCount = 0;
+
+uint16_t g_motionThresholdMg = MOTION_THRESHOLD_BASE_MG;
+EngineData g_engine;
+
+static uint16_t loadMotionThreshold() {
+    prefs.begin("tracker", true);
+    uint16_t v = prefs.getUShort("mot_thr", MOTION_THRESHOLD_BASE_MG);
+    prefs.end();
+    if (v < MOTION_THRESHOLD_BASE_MG) v = MOTION_THRESHOLD_BASE_MG;
+    if (v > MOTION_THRESHOLD_MAX_MG)  v = MOTION_THRESHOLD_MAX_MG;
+    return v;
+}
+
+static void saveMotionThreshold(uint16_t mg) {
+    prefs.begin("tracker", false);
+    prefs.putUShort("mot_thr", mg);
+    prefs.end();
+}
+
+static bool wokeOnMotion() {
+    return esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1;
+}
+
+static const char* wakeReasonName() {
+    switch (esp_sleep_get_wakeup_cause()) {
+        case ESP_SLEEP_WAKEUP_TIMER:     return "Timer";
+        case ESP_SLEEP_WAKEUP_EXT1:      return "Motion";
+        case ESP_SLEEP_WAKEUP_UNDEFINED: return "Cold Boot";
+        default:                         return "Other";
+    }
+}
+
+// Run once per wake, after the GPS attempt, and only for wakes that came from
+// the accelerometer. GPS is the arbiter: a good fix showing no speed means the
+// interrupt was not a ski going anywhere.
+static void updateMotionThreshold(bool gotFix, float speedKmh) {
+    if (!wokeOnMotion()) return;
+
+    if (!gotFix) {
+        // No fix is not evidence. Raising the threshold on a wake that could not
+        // be classified would slowly deafen the tracker for reasons that have
+        // nothing to do with motion -- a garage roof is not a false positive.
+        Serial.println("[Motion] Motion wake with no fix; threshold unchanged.");
+        return;
+    }
+
+    if (speedKmh >= STATIONARY_SPEED_KMH) {
+        s_falseWakeCount = 0;
+        if (g_motionThresholdMg != MOTION_THRESHOLD_BASE_MG) {
+            Serial.printf("[Motion] Real travel at %.1f km/h -> threshold back to %umg\n",
+                          speedKmh, MOTION_THRESHOLD_BASE_MG);
+            g_motionThresholdMg = MOTION_THRESHOLD_BASE_MG;
+            saveMotionThreshold(g_motionThresholdMg);
+            imuEnableMotionWake(g_motionThresholdMg);
+        }
+        return;
+    }
+
+    s_falseWakeCount++;
+    Serial.printf("[Motion] Motion wake but GPS says %.1f km/h (%d/%d unexplained)\n",
+                  speedKmh, s_falseWakeCount, FALSE_WAKES_BEFORE_RAISE);
+
+    if (s_falseWakeCount < FALSE_WAKES_BEFORE_RAISE) return;
+    s_falseWakeCount = 0;
+
+    if (g_motionThresholdMg >= MOTION_THRESHOLD_MAX_MG) {
+        Serial.printf("[Motion] Already at the %umg ceiling; not going deafer than this.\n",
+                      MOTION_THRESHOLD_MAX_MG);
+        return;
+    }
+
+    uint16_t next = g_motionThresholdMg + MOTION_THRESHOLD_STEP_MG;
+    if (next > MOTION_THRESHOLD_MAX_MG) next = MOTION_THRESHOLD_MAX_MG;
+    g_motionThresholdMg = next;
+    saveMotionThreshold(g_motionThresholdMg);
+    // Re-arm now: the level in the part is whatever was set at boot, and the
+    // new one has to be in place before the next sleep.
+    imuEnableMotionWake(g_motionThresholdMg);
+    Serial.printf("[Motion] Threshold raised to %umg\n", g_motionThresholdMg);
+}
+
+// Arms the wake sources and goes. Shared by the end-of-cycle path and by the
+// early bail-out on a motion wake that arrived too soon to be worth a report.
+static void enterDeepSleep(int minutes) {
+    uint64_t sleep_time = (uint64_t)minutes * 60 * 1000000ULL;
+    if (sleep_time == 0) sleep_time = 60 * 1000000ULL;
+    esp_sleep_enable_timer_wakeup(sleep_time);
+
+    // Only ever armed when an IMU actually answered. With no daughter board
+    // fitted GPIO12 floats, and an ext1 source on a floating pin is a flat
+    // battery by morning.
+    const bool motionArmed = imuPresent();
+    if (motionArmed) {
+        // The interrupt latches, so a source left uncleared holds INT1 high and
+        // the next sleep would end the instant it started.
+        imuClearMotionInterrupt();
+        esp_sleep_enable_ext1_wakeup(1ULL << DB_IMU_INT1, ESP_EXT1_WAKEUP_ANY_HIGH);
+    }
+
+    powerPrepareForSleep();
+    Serial.printf("Entering Deep Sleep for %d minutes%s...\n",
+                  minutes, motionArmed ? " (or on motion)" : "");
+    Serial.flush();
+    esp_deep_sleep_start();
+}
+
 void goToSleep(bool got_fix) {
     modemPowerOff();
 
+    // CAN traffic is the signal that the ski is running: the bus only wakes
+    // with the ignition. Supply voltage above ~13V would say the same thing and
+    // is the better test -- it survives a CAN fault -- but the supply-sense
+    // divider is mis-scaled and reads nothing usable yet (docs/can and the
+    // R15/R16 note in utilities.h), so this is the one signal available.
+    const bool skiRunning = g_engine.busAlive;
+
     prefs.begin("tracker", false);
     int fails = prefs.getUInt("gps_fail", 0);
-    int actual_interval = settings.report_interval_mins;
+    int actual_interval = skiRunning ? (int)settings.report_interval_mins
+                                     : (int)PARKED_INTERVAL_MINS;
     if (actual_interval == 0) actual_interval = 5;
+    Serial.printf("[Lifecycle] Ski %s -> %d minute interval\n",
+                  skiRunning ? "RUNNING" : "parked", actual_interval);
 
     if (got_fix) {
         if (fails > 0) {
@@ -168,19 +339,19 @@ void goToSleep(bool got_fix) {
         else if (fails == 2) actual_interval = 15;  // 15 mins
         else if (fails == 1) actual_interval = 5;   // 5 mins
         
-        if (actual_interval < settings.report_interval_mins) {
+        // Backoff only means anything while the ski is running. Parked, the
+        // interval is already a day and stretching it further on a missed fix
+        // would trade away the one thing a heartbeat is for.
+        if (!skiRunning) {
+            actual_interval = PARKED_INTERVAL_MINS;
+        } else if (actual_interval < (int)settings.report_interval_mins) {
             actual_interval = settings.report_interval_mins;
         }
         Serial.printf("[Backoff] Applying Backoff Sleep: %d minutes\n", actual_interval);
     }
     prefs.end();
 
-    uint64_t sleep_time = (uint64_t)actual_interval * 60 * 1000000ULL;
-    if (sleep_time == 0) sleep_time = 60 * 1000000ULL;
-
-    Serial.printf("Entering Deep Sleep for %d minutes...\n", actual_interval);
-    esp_sleep_enable_timer_wakeup(sleep_time);
-    esp_deep_sleep_start();
+    enterDeepSleep(actual_interval);
 }
 // --- Custom CGNSINF Parser for SIM7080G ---
 bool parseCGNSINF(String raw, float* lat, float* lon, float* speed, float* alt, int* sats, float* hdop) {
@@ -263,39 +434,60 @@ void initGNSS() {
     modem.waitResponse();
 }
 
+// One field of a comma-separated CGNSINF line, or "" if the line is too short.
+// Only the two logging paths use this; parseCGNSINF() splits the whole line
+// itself because it needs most of the fields at once.
+static String cgnsinfField(const String& raw, int index) {
+    int from = 0;
+    for (int i = 0; i <= index; i++) {
+        int next = raw.indexOf(',', from);
+        if (next == -1) {
+            return (i == index) ? raw.substring(from) : String("");
+        }
+        if (i == index) return raw.substring(from, next);
+        from = next + 1;
+    }
+    return String("");
+}
+
+// Fix status (field 1) and satellites in view (field 14) -- the two numbers
+// worth watching while a fix is still coming in.
+static void logGPSProgress(const char* tag, const String& raw) {
+    String fix = cgnsinfField(raw, 1);
+    String sv  = cgnsinfField(raw, 14);
+    if (fix.length() == 0) fix = "0";
+    if (sv.length() == 0)  sv  = "0";
+    Serial.printf("[GPS] %s Fix=%s SatsView=%s\n", tag, fix.c_str(), sv.c_str());
+}
+
 void pollGPSDiagnostic() {
     modem.sendAT("+CGNSINF");
     if (modem.waitResponse(1000L, "+CGNSINF: ") == 1) {
         String res = modem.stream.readStringUntil('\n');
         res.trim();
         Serial.printf("[GPS-RAW] [%s]\n", res.c_str());
-        
-        // Quick parse for logs: <run>,<fix>,...
-        int firstComma = res.indexOf(',');
-        int secondComma = res.indexOf(',', firstComma + 1);
-        if (firstComma != -1 && secondComma != -1) {
-            String fixStr = res.substring(firstComma + 1, secondComma);
-            if (fixStr.length() == 0) fixStr = "0";
-            
-            // Extract SatsView (index 14)
-            int commaCount = 0;
-            String satsView = "0";
-            int from = 0;
-            for (int i=0; i<15; i++) {
-                int next = res.indexOf(',', from);
-                if (next == -1) {
-                    if (i == 14) satsView = res.substring(from);
-                    break;
-                }
-                if (i == 14) {
-                    satsView = res.substring(from, next);
-                }
-                from = next + 1;
-            }
-            if (satsView.length() == 0) satsView = "0";
-            Serial.printf("[GPS] Background... Fix=%s SatsView=%s\n", fixStr.c_str(), satsView.c_str());
-        }
+        logGPSProgress("Background...", res);
     }
+}
+
+// The BLE window is the only way in to change settings, but on a scheduled wake
+// there is nobody standing there to use it -- and 15s of advertising is a large
+// share of a cycle whose useful work is a GPS fix and one publish. So it opens
+// on a cold boot, and on demand when the boot button is held down through reset.
+// A timer wake goes straight to work.
+//
+// Requires pinMode(0, INPUT_PULLUP) to have run already.
+static bool shouldRunBLEWindow() {
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_UNDEFINED) {
+        Serial.println("[BLE] Cold boot - opening config window.");
+        return true;
+    }
+    if (digitalRead(0) == LOW) {
+        Serial.println("[BLE] Boot button held - opening config window.");
+        return true;
+    }
+    Serial.println("[BLE] Timer wake - skipping config window.");
+    return false;
 }
 
 void runBLEWindow(unsigned long duration_ms) {
@@ -421,31 +613,7 @@ bool getPreciseLocation(float* lat, float* lon, float* speed, float* alt, int* s
                     break; 
                 }
             } else {
-                // Diagnostic Logging
-                int firstComma = res.indexOf(',');
-                int secondComma = res.indexOf(',', firstComma + 1);
-                if (firstComma != -1 && secondComma != -1) {
-                    String fixStatus = res.substring(firstComma + 1, secondComma);
-                    if (fixStatus.length() == 0) fixStatus = "0";
-                    
-                    // Sats View is at index 14
-                    int commaCount = 0;
-                    String sv = "0";
-                    int from = 0;
-                    for (int i=0; i<15; i++) {
-                        int next = res.indexOf(',', from);
-                        if (next == -1) {
-                            if (i == 14) sv = res.substring(from);
-                            break;
-                        }
-                        if (i == 14) {
-                            sv = res.substring(from, next);
-                        }
-                        from = next + 1;
-                    }
-                    if (sv.length() == 0) sv = "0";
-                    Serial.printf("[GPS] Wait... FixStatus=%s SatsView=%s\n", fixStatus.c_str(), sv.c_str());
-                }
+                logGPSProgress("Wait...", res);
             }
         }
         delay(1000);
@@ -474,6 +642,17 @@ void onDownlink(char* topic, uint8_t* payload, unsigned int length) {
 
 void transmitData(float lat, float lon, float speed, float alt, int sats, float hdop) {
     Serial.println("[Lifecycle] Preparing Transmission...");
+
+    // Sampled here rather than in setup() so the reported orientation is the one
+    // at report time: GPS acquisition ahead of this can run for five minutes,
+    // and a value from before that is not describing the same situation.
+    ImuReading imu = imuRead();
+
+    // Same reasoning as the IMU: read at report time, not at boot. The policy is
+    // applied here too, so a decision to cut or restore the jetski feed is made
+    // against the battery voltage that is about to be published alongside it.
+    PowerStatus power = powerRead();
+    powerApplyChargePolicy(PMU.getBattVoltage() / 1000.0F, power);
 
     imei = getIMEIWithRetry();
     mqtt_topic_up = "ae-nv/tracker/" + imei + "/up";
@@ -510,7 +689,7 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
         
         Serial.printf("[MQTT] Connecting to %s...", settings.mqtt_broker.c_str());
         mqtt.setServer(settings.mqtt_broker.c_str(), 1883);
-        mqtt.setBufferSize(768); // Send the full JSON, and receive an OTA command in one frame
+        mqtt.setBufferSize(MQTT_BUFFER_SIZE); // Full JSON out, OTA command in, one frame each
         mqtt.setCallback(onDownlink);
         if (mqtt.connect(imei.c_str(), settings.mqtt_user.c_str(), settings.mqtt_pass.c_str())) {
             Serial.println(" Connected");
@@ -540,7 +719,7 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
             }
 
             
-            StaticJsonDocument<768> doc;
+            JsonDocument doc;
             doc["mac"] = imei;
             // The key the worker reads for every other product
             // (backend-worker/src/index.ts:2154). Nothing has ever set it here, which
@@ -566,7 +745,39 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
             doc["device_voltage"] = PMU.getBattVoltage() / 1000.0F; 
             doc["battery_voltage"] = PMU.getBattVoltage() / 1000.0F; 
             doc["soc"] = PMU.getBatteryPercent();
-            
+
+            // Always emitted, "Unknown" included: the field has been in the
+            // documented payload all along, and a key that appears only on
+            // boards with a working IMU is harder for the backend to reason
+            // about than one that is always there.
+            doc["orientation"] = orientationName(imu.orientation);
+            doc["charge_state"] = chargeStateName(power.state);
+            doc["supply_enabled"] = power.supplyEnabled;
+            doc["wake_reason"] = wakeReasonName();
+
+            // Vehicle frame, so the backend never has to know how the board is
+            // mounted. Two decimals is well inside what a +/-2g part resolves.
+            if (imu.valid) {
+                doc["accel_up"]   = roundf(imu.up   * 100) / 100.0f;
+                doc["accel_fwd"]  = roundf(imu.fwd  * 100) / 100.0f;
+                doc["accel_stbd"] = roundf(imu.stbd * 100) / 100.0f;
+            }
+
+            // Engine data, only when the ski's bus was actually awake. Sending
+            // rpm=0 for a parked ski would be indistinguishable from a running
+            // engine at a standstill, so absent means absent.
+            doc["engine_bus"] = g_engine.busAlive;
+            doc["ski_running"] = g_engine.busAlive;
+            if (g_engine.rpmValid)  doc["rpm"] = g_engine.rpm;
+            // Raw because the scaling is genuinely unknown -- see
+            // docs/can/seadoo-can.md. Better an honest count than a fabricated
+            // temperature nobody can check.
+            if (g_engine.tempValid) doc["engine_temp_raw"] = g_engine.tempRaw;
+
+            // Published so the adaptive logic can be seen working from the
+            // backend rather than only from a serial cable.
+            doc["motion_threshold_mg"] = g_motionThresholdMg;
+
             int csq = modem.getSignalQuality();
             int dbm = (csq == 99) ? -113 : (csq * 2) - 113;
             doc["rssi"] = dbm;
@@ -576,8 +787,29 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
             String payload;
             serializeJson(doc, payload);
             Serial.println("[MQTT] Publishing: " + payload);
+
+            // StaticJsonDocument<768> used to cap the document at the same size
+            // as the buffer, so an over-long report came out truncated but went.
+            // JsonDocument has no ceiling, so the ceiling moved here.
+            //
+            // PubSubClient refuses an oversized frame by returning false without
+            // touching the wire, and the failure path below can only report
+            // mqtt.state(), which still says "connected". A report that vanishes
+            // for a reason nothing in the log names is the outcome worth
+            // avoiding -- this is what makes the cause explicit. The formula is
+            // PubSubClient's own: 5 bytes of fixed header, 2 for topic length,
+            // then topic and payload.
+            const size_t frameLen = 5 + 2 + mqtt_topic_up.length() + payload.length();
+            if (frameLen > MQTT_BUFFER_SIZE) {
+                Serial.printf("[MQTT] Frame is %u bytes, buffer is %u -- publish will be refused. Payload needs trimming.\n",
+                              (unsigned)frameLen, (unsigned)MQTT_BUFFER_SIZE);
+            }
             if (mqtt.publish(mqtt_topic_up.c_str(), payload.c_str())) {
                 Serial.println("[MQTT] Publish Successful");
+                // Only a delivered report starts the motion rate limit. A failed
+                // publish leaves the previous timestamp standing, so the next
+                // movement is still allowed to try.
+                s_lastReportTime = time(NULL);
             } else {
                 Serial.printf("[MQTT] Publish FAILED (State: %d)\n", mqtt.state());
             }
@@ -633,7 +865,10 @@ void setup() {
 
     
     esp_reset_reason_t reason = esp_reset_reason();
-    Serial.printf("\n--- AE Tracker Boot (Reason: %d, FW: '%s') ---\n", reason, firmwareVersion());
+    // __DATE__/__TIME__ are stamped at compile time, so this is proof of which
+    // build is actually running rather than which one was last built.
+    Serial.printf("\n--- AE Tracker Boot (Reason: %d, Wake: %s, FW: '%s', built %s %s) ---\n",
+                  reason, wakeReasonName(), firmwareVersion(), __DATE__, __TIME__);
 
     Wire.begin(I2C_SDA, I2C_SCL);
     if (!PMU.begin(Wire, AXP2101_SLAVE_ADDRESS, I2C_SDA, I2C_SCL)) {
@@ -643,20 +878,107 @@ void setup() {
     PMU.enableBattVoltageMeasure();
     PMU.enableBattDetection();
     PMU.enableCellbatteryCharge();
-    
+
+    // Daughter board. Absence is reported and then ignored -- see imuBegin().
+    // powerBegin() comes first because it is what releases the pad hold from
+    // the last sleep and gets the CAN transceiver out of an undefined state.
+    powerBegin();
+    g_motionThresholdMg = loadMotionThreshold();
+    if (imuBegin()) {
+        imuEnableMotionWake(g_motionThresholdMg);
+    }
+
     pinMode(0, INPUT_PULLUP);
     strip.begin();
     strip.show();
+
+#ifdef DB_BENCH_MODE
+    // Bench build: charger and IMU only. No modem, no MQTT, no deep sleep --
+    // deep sleep drops the USB CDC and makes every iteration a wait for
+    // re-enumeration.
+    Serial.println("\n=== DAUGHTER BOARD BENCH: continuous log ===");
+    Serial.println("Columns: elapsed | battery | PG | STAT | charge state | supply switch\n");
+    powerSweepPullups();
+    // canSelfTest() is deliberately NOT called here. It uses TWAI_MODE_NO_ACK,
+    // which transmits -- and this build gets flashed onto a tracker that may be
+    // plugged into a ski. A bench convenience that drives a vehicle bus the
+    // moment someone forgets where the board is plugged in is not worth having.
+    // Run it explicitly from a bench build when you want it.
+
+    const uint32_t t0 = millis();
+    for (uint32_t n = 1; ; n++) {
+        // powerRead() spends ~700ms watching STAT, because a blink is how this
+        // charger reports a fault and one sample cannot tell a blink from a
+        // level. That sets the cadence at roughly a line per second.
+        PowerStatus ps = powerRead();
+        const float vbat = PMU.getBattVoltage() / 1000.0F;
+
+        Serial.printf("[Log %6.1fs] Vbat=%.3fV  PG=%-7s STAT=%-8s %-9s supply=%s\n",
+                      (millis() - t0) / 1000.0f, vbat,
+                      ps.supplyPresent ? "present" : "absent",
+                      ps.charging ? "charging" : "idle",
+                      chargeStateName(ps.state),
+                      ps.supplyEnabled ? "ON" : "CUT");
+
+        // Cutoff demonstration, once, ten seconds in. This is the one part of
+        // the power design nothing else exercises: whether SUPPLY_EN actually
+        // operates the TPS1H000. If it does, PG drops to absent within a
+        // sample, because the charger stops seeing an input.
+        static bool cutDone = false;
+        if (!cutDone && (millis() - t0) > 10000) {
+            cutDone = true;
+            PowerStatus tmp;
+            Serial.println("\n[TEST] === cutting the supply for 8s ===");
+            powerApplyChargePolicy(4.50f, tmp);   // above CHARGE_STOP_V -> cut
+            for (int i = 0; i < 8; i++) {
+                PowerStatus c = powerRead();
+                Serial.printf("[TEST]   cut+%ds  PG=%s  supply=%s\n", i,
+                              c.supplyPresent ? "present" : "ABSENT",
+                              c.supplyEnabled ? "ON" : "CUT");
+            }
+            Serial.println("[TEST] === restoring ===\n");
+            powerApplyChargePolicy(3.50f, tmp);   // below CHARGE_RESUME_V -> on
+        }
+
+        // The IMU is not what is being watched here, and a read costs another
+        // 640ms, so it goes in occasionally rather than in the way.
+        if (imuPresent() && (n % 8 == 0)) imuRead();
+
+        delay(200);
+    }
+#endif
+
+#ifdef CAN_SNIFFER_MODE
+    // Bring-up build: never returns. Deliberately after powerBegin() so the
+    // transceiver starts from a defined state, and before anything touches the
+    // modem -- none of that is wanted with a laptop on the diag port.
+    canSnifferLoop();
+#endif
     
     Serial1.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
     
     loadSettings();
     checkPowerConfig();
-    
+
+    // A motion wake this soon after a report has nothing new to say, and saying
+    // it would cost a GPS acquisition and a modem session. Bail before
+    // modemPowerOn(), which is where the expense starts.
+    if (wokeOnMotion()) {
+        time_t since = time(NULL) - s_lastReportTime;
+        if (since < MOTION_MIN_REPORT_S) {
+            Serial.printf("[Motion] Wake %llds after last report (min %llds) - back to sleep.\n",
+                          (long long)since, (long long)MOTION_MIN_REPORT_S);
+            enterDeepSleep(settings.report_interval_mins);
+        }
+        Serial.printf("[Motion] Wake %llds after last report - reporting.\n", (long long)since);
+    }
+
     modemPowerOn(); 
     initGNSS(); // Start GPS early
     
-    runBLEWindow(15000); 
+    if (shouldRunBLEWindow()) {
+        runBLEWindow(15000);
+    }
     
     float lat=0, lon=0, speed=0, alt=0, hdop=99; 
     int sats=0;
@@ -664,8 +986,18 @@ void setup() {
     
     modem.sendAT("+CGNSPWR=0");
     modem.waitResponse();
-    
+
+    // A second on the ski's bus. Cheap at ~980 frames/s -- everything of
+    // interest repeats at 50-100Hz -- and a quiet bus just means ignition off,
+    // which is the normal state for a parked ski.
+    g_engine = canReadEngine(1000);
+
     transmitData(lat, lon, speed, alt, sats, hdop);
+
+    // After the report, so a threshold change is decided on the same fix that
+    // was just published and re-arms before this wake ends.
+    updateMotionThreshold(has_fix, speed);
+
     goToSleep(has_fix);
 }
 

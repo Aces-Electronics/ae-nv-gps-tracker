@@ -6,11 +6,17 @@ The AE-SIM7080G-S3 tracker currently operates in a continuous active mode with c
 
 ## Current Power Consumption
 
-The tracker is currently in "STAY AWAKE" mode for development, which means:
-- ESP32-S3 remains fully active between reports
-- GPS module stays powered
-- SIM7080G modem maintains network connection
-- Estimated battery life: ~24-48 hours (unoptimized)
+Deep sleep is implemented -- `goToSleep()` powers the modem and GPS antenna
+rail down and calls `esp_deep_sleep_start()` with a timer wake. The "STAY
+AWAKE" development mode this document was written against is gone.
+
+What has never been done is measuring any of it. Every number below is a target,
+not a baseline, and the first job is still to put a profiler on a real unit.
+
+Known remaining draws between reports:
+- Nothing has verified the AXP2101 rails are all down in sleep
+- The daughter board's CAN transceiver is parked in standby (~370uA typ) rather
+  than fully unpowered
 
 ## Target Power Profile
 
@@ -40,11 +46,9 @@ Implement deep sleep mode and use a power profiler to verify power consumption t
 
 ### Phase 2: Deep Sleep Implementation
 
-1. **Modify Main Loop**
-   - Remove the "STAY AWAKE" debug mode
-   - Implement `esp_deep_sleep_start()` after MQTT publish
-   - Configure wake timer based on `settings.report_interval_mins`
-   - Handle RTC memory for preserving state across sleep cycles
+1. **Modify Main Loop** — DONE. `goToSleep()` sleeps on a timer derived from
+   `settings.report_interval_mins`, and `power_handler.cpp` already keeps state
+   across sleep in RTC memory and holds the supply-switch pad.
 
 2. **Peripheral Management**
    - Power down GPS module before sleep
@@ -98,8 +102,9 @@ Implement deep sleep mode and use a power profiler to verify power consumption t
 
 ## Reference Files
 
-- `/home/acea/ae-nv/ae-sim7080g-tracker/src/main.cpp` - Main firmware
-- `/home/acea/ae-nv/ae-sim7080g-tracker/platformio.ini` - Build configuration
+- `src/main.cpp` - Main firmware
+- `src/power_handler.cpp` - Supply switch, charger status, deep-sleep pad holds
+- `platformio.ini` - Build configuration
 - ESP32-S3 Deep Sleep Documentation: https://docs.espressif.com/projects/esp-idf/en/latest/esp32s3/api-reference/system/sleep_modes.html
 - SIM7080G AT Command Manual (for power modes)
 
