@@ -48,11 +48,19 @@ static const unsigned long DOWNLINK_WAIT_MS = 3000;
 // because the publish path now checks against it -- see transmitData().
 static const uint16_t MQTT_BUFFER_SIZE = 768;
 
-// Reporting interval when nothing has been provisioned. A parked ski has
-// nothing new to say, so the timer is a heartbeat -- proof of life and a
-// battery reading -- and movement is what actually triggers a report.
-// Already-provisioned units keep whatever is in NVS; set it over BLE to change.
-static const uint32_t HEARTBEAT_DEFAULT_MINS = 1440;
+// Cadence follows the ski, not the clock.
+//
+// A running engine is worth following closely, so that case uses the
+// configured report_interval_mins (5 minutes by default, settable over BLE). A
+// parked ski has nothing to say between one day and the next, so it gets a
+// heartbeat -- proof of life, a battery reading, a position -- and relies on
+// the accelerometer to wake it if anything actually happens.
+//
+// Splitting it this way also means a unit already provisioned with a 5-minute
+// interval is correct as it stands: that value now describes the running case,
+// which is what it was always meant for.
+static const uint32_t HEARTBEAT_DEFAULT_MINS = 5;
+static const uint32_t PARKED_INTERVAL_MINS   = 1440;
 
 OtaCommand g_otaCmd;
 bool g_otaPending = false;
@@ -299,10 +307,20 @@ static void enterDeepSleep(int minutes) {
 void goToSleep(bool got_fix) {
     modemPowerOff();
 
+    // CAN traffic is the signal that the ski is running: the bus only wakes
+    // with the ignition. Supply voltage above ~13V would say the same thing and
+    // is the better test -- it survives a CAN fault -- but the supply-sense
+    // divider is mis-scaled and reads nothing usable yet (docs/can and the
+    // R15/R16 note in utilities.h), so this is the one signal available.
+    const bool skiRunning = g_engine.busAlive;
+
     prefs.begin("tracker", false);
     int fails = prefs.getUInt("gps_fail", 0);
-    int actual_interval = settings.report_interval_mins;
+    int actual_interval = skiRunning ? (int)settings.report_interval_mins
+                                     : (int)PARKED_INTERVAL_MINS;
     if (actual_interval == 0) actual_interval = 5;
+    Serial.printf("[Lifecycle] Ski %s -> %d minute interval\n",
+                  skiRunning ? "RUNNING" : "parked", actual_interval);
 
     if (got_fix) {
         if (fails > 0) {
@@ -321,7 +339,12 @@ void goToSleep(bool got_fix) {
         else if (fails == 2) actual_interval = 15;  // 15 mins
         else if (fails == 1) actual_interval = 5;   // 5 mins
         
-        if (actual_interval < settings.report_interval_mins) {
+        // Backoff only means anything while the ski is running. Parked, the
+        // interval is already a day and stretching it further on a missed fix
+        // would trade away the one thing a heartbeat is for.
+        if (!skiRunning) {
+            actual_interval = PARKED_INTERVAL_MINS;
+        } else if (actual_interval < (int)settings.report_interval_mins) {
             actual_interval = settings.report_interval_mins;
         }
         Serial.printf("[Backoff] Applying Backoff Sleep: %d minutes\n", actual_interval);
@@ -744,6 +767,7 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
             // rpm=0 for a parked ski would be indistinguishable from a running
             // engine at a standstill, so absent means absent.
             doc["engine_bus"] = g_engine.busAlive;
+            doc["ski_running"] = g_engine.busAlive;
             if (g_engine.rpmValid)  doc["rpm"] = g_engine.rpm;
             // Raw because the scaling is genuinely unknown -- see
             // docs/can/seadoo-can.md. Better an honest count than a fabricated

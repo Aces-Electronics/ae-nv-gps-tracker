@@ -55,6 +55,7 @@ The tracker publishes the following data via MQTT:
   "accel_fwd": -0.02,
   "accel_stbd": 0.03,
   "engine_bus": true,          // Was the ski's CAN bus awake at all
+  "ski_running": true,         // Drives the reporting cadence
   "rpm": 1455,                 // Omitted unless engine_bus
   "engine_temp_raw": 140,      // 0x342 b4, raw count — scaling unknown
   "motion_threshold_mg": 352,  // Current adaptive wake threshold
@@ -200,9 +201,18 @@ The firmware uses robust satellite count parsing with fallback logic:
 
 - **Active Mode**: GPS acquisition + MQTT publish
 - **BLE Window**: 90 seconds on boot for configuration
-- **Deep Sleep**: Between reports. A newly provisioned tracker defaults to a
-  **1440-minute (daily) heartbeat**; movement is the real trigger. Extended by a
-  backoff when GPS fails repeatedly (5/15/30/60/180 min).
+- **Deep Sleep**: Cadence follows the ski, not the clock.
+  - **Running** (CAN bus awake) → the configured `report_interval_mins`,
+    5 minutes by default, settable over BLE. GPS-failure backoff applies
+    (5/15/30/60/180 min).
+  - **Parked** → a **1440-minute (daily) heartbeat**. Backoff is not applied;
+    stretching a day further on one missed fix trades away the only thing a
+    heartbeat is for.
+
+  CAN traffic is the running signal because the ski's bus only wakes with the
+  ignition. Supply voltage above ~13V would be the better test — it survives a
+  CAN fault — but the supply-sense divider is mis-scaled and reads nothing
+  usable yet (see `R15`/`R16` in [`src/utilities.h`](src/utilities.h)).
 - **Wake on motion**: The LIS3DH interrupt is an `ext1` deep-sleep wake source.
   Motion reports are rate-limited to one per 120s, checked before the modem is
   powered, so a suppressed wake costs ~200ms rather than a GPS acquisition.
@@ -213,11 +223,8 @@ The firmware uses robust satellite count parsing with fallback logic:
   with *no* fix changes nothing — a garage roof is not a false positive. The
   current value is persisted in NVS and published as `motion_threshold_mg`.
 
-### Upgrading an already-provisioned tracker
-
-The daily heartbeat is a *default*, applied only when NVS has no stored
-interval. A unit provisioned before this change keeps whatever it has (commonly
-5 minutes) until the interval is set over BLE.
+No migration is needed for already-provisioned trackers: a stored 5-minute
+interval now describes the *running* case, which is what it was always for.
 
 ## Known Issues
 

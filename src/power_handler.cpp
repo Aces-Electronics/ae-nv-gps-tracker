@@ -72,10 +72,14 @@ PowerStatus powerRead() {
     // Steady either way is a state. Anything in between is STAT blinking, and
     // that is the only way this charger reports a fault -- so it outranks the
     // other readings rather than being averaged into them.
-    if (!steadyLow && !steadyHigh) {
-        ps.state = ChargeState::Fault;
-    } else if (!ps.supplyPresent) {
+    if (!ps.supplyPresent) {
+        // Checked before the blink test on purpose. With no input the charger
+        // is not driving STAT at all, so a pin wandering between reads is noise
+        // on an open-drain line with nothing on it -- reporting that as a
+        // charger fault is how a parked, healthy ski ends up looking broken.
         ps.state = ChargeState::NoInput;
+    } else if (!steadyLow && !steadyHigh) {
+        ps.state = ChargeState::Fault;
     } else if (steadyLow) {
         ps.state = ChargeState::Charging;
     } else {
