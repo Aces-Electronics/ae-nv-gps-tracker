@@ -199,6 +199,10 @@ static const float STATIONARY_SPEED_KMH = 2.0f;
 
 RTC_DATA_ATTR static int s_falseWakeCount = 0;
 
+// Counts passes of the deep-sleep wake test so it can alternate the pad holds
+// across sleeps instead of needing two builds.
+RTC_DATA_ATTR static int s_sleepTestPass = 0;
+
 uint16_t g_motionThresholdMg = MOTION_THRESHOLD_BASE_MG;
 EngineData g_engine;
 
@@ -925,13 +929,70 @@ void setup() {
     // re-enumeration.
     Serial.println("\n=== DAUGHTER BOARD BENCH: continuous log ===");
     Serial.println("Columns: elapsed | battery | PG | STAT | charge state | supply switch\n");
-    powerSweepPullups();
+    // First, before anything else has touched a pin. powerSweepPullups() walks
+    // GPIO12 among the rest and leaves an internal pull-up on it, and INT1 is
+    // the one signal here that must be measured exactly as the LIS3DH drives it.
+    //
+    // The static self-test runs ahead of the shake watch because it needs nobody
+    // present and it cannot come back ambiguous -- and if it fails, the shake
+    // test that follows has nothing left to tell anyone. It leaves the interrupt
+    // block reconfigured, so the shipping arm has to be put back before the
+    // watch, or the watch would be measuring the self-test's settings.
+    imuDumpFilteredData(6000);
+    imuInterruptSelfTest();
 
-    // Before the charger log, because it is the one thing here that needs
-    // somebody standing at the bench to do something. The wake path is
-    // otherwise only exercised by a real sleep cycle, which takes minutes and
-    // reports its verdict through a USB port that deep sleep drops.
-    imuWatchMotionInterrupt(15000);
+    // Duration sweep. Everything else has now been measured and works -- the
+    // filter removes gravity to 24mg, the generator trips on gravity, and INT1
+    // reaches GPIO12 -- which leaves INT1_DURATION as the only thing between a
+    // 700mg shake and a wake that never came. It is counted in ODR periods, so
+    // the shipping 3 demands 60ms of CONTINUOUS over-threshold motion, and the
+    // counter resets the moment the condition lapses. Shaking is oscillatory:
+    // |axis| passes back through zero at every reversal, so 60ms unbroken is a
+    // far stronger demand than it looks. Running 0 against 3 over the same
+    // gesture is what turns that from an argument into a measurement.
+    // Each setting is retried until a window is actually shaken hard enough to
+    // mean something. Two runs of this were wasted on fixed 15s windows that
+    // opened and closed while nobody was at the bench, and a window nobody
+    // shook produces the same silence as a configuration that does not work.
+    // Waiting for the gesture instead of for the clock is what removes that
+    // ambiguity -- and it lets whoever is holding the board take their time.
+    const uint8_t DURATIONS[] = { 0, 3 };
+    MotionWatchResult results[2];
+    for (int i = 0; i < 2; i++) {
+        const uint8_t d = DURATIONS[i];
+        Serial.printf("\n[IMU] ===== duration sweep: INT1_DURATION=%u (%ums at 50Hz) =====\n",
+                      d, d * 20);
+        for (int attempt = 1; attempt <= 6; attempt++) {
+            imuEnableMotionWake(g_motionThresholdMg, d);
+            results[i] = imuWatchMotionInterrupt(10000);
+            if (results[i].conclusive()) break;
+            Serial.printf("[IMU] Window %d peaked at only %.0fmg -- not a real test. Shake during the next one.\n",
+                          attempt, results[i].peakMg);
+        }
+    }
+
+    Serial.println("\n[IMU] ===== duration sweep result =====");
+    for (int i = 0; i < 2; i++) {
+        Serial.printf("[IMU]   DUR=%u (%2ums): peak %4.0fmg  latched=%-3s  pin=%s\n",
+                      DURATIONS[i], DURATIONS[i] * 20, results[i].peakMg,
+                      results[i].latched ? "YES" : "no",
+                      results[i].pinHigh ? "HIGH" : "low");
+    }
+    if (results[0].latched && !results[1].latched) {
+        Serial.println("[IMU]   -> DUR is the blocker: the same shake wakes it at 0 and not at 3.");
+        Serial.println("[IMU]      60ms of CONTINUOUS over-threshold motion is more than shaking sustains.");
+    } else if (results[0].latched && results[1].latched) {
+        Serial.println("[IMU]   -> Both fired, so DUR=3 is not what stopped the earlier attempts.");
+    } else if (!results[0].latched && results[0].conclusive()) {
+        Serial.println("[IMU]   -> Even DUR=0 did not fire on real motion. The threshold or the axis");
+        Serial.println("[IMU]      enables are wrong, not the duration.");
+    } else {
+        Serial.println("[IMU]   -> Never shaken hard enough to conclude anything. Re-run.");
+    }
+
+    imuEnableMotionWake(g_motionThresholdMg);
+
+    powerSweepPullups();
     // canSelfTest() is deliberately NOT called here. It uses TWAI_MODE_NO_ACK,
     // which transmits -- and this build gets flashed onto a tracker that may be
     // plugged into a ski. A bench convenience that drives a vehicle bus the
@@ -978,6 +1039,146 @@ void setup() {
         if (imuPresent() && (n % 8 == 0)) imuRead();
 
         delay(200);
+    }
+#endif
+
+#ifdef SLEEP_TEST_MODE
+    // Isolates ONE variable: whether powerPrepareForSleep()'s pad holds are what
+    // stop an ext1 wake on GPIO12.
+    //
+    // Everything else has been measured on this board and works. The LIS3DH
+    // latches on a real shake at the shipping 352mg over 60ms, INT1 reaches
+    // GPIO12, and the high-pass filter removes gravity to 24mg at rest. So a
+    // tracker that still does not wake is failing between esp_sleep_enable_
+    // ext1_wakeup() and the pad, and the only thing this firmware does in
+    // between is gpio_hold_en() on two other RTC pads plus a blanket
+    // gpio_deep_sleep_hold_en().
+    //
+    // Suspicion, and the reason this is worth a build of its own: the holds are
+    // applied BEFORE esp_deep_sleep_start(), and it is inside that call that IDF
+    // runs ext1_wakeup_prepare() and re-points GPIO12 at the RTC IO mux. An
+    // autohold already in force is a plausible way for that configuration to be
+    // frozen out -- and it would look exactly like this, with everything working
+    // awake and nothing waking asleep.
+    //
+    // Alternating in RTC memory rather than by rebuilding means both cases run
+    // against the same board, the same arm, and the same person shaking it.
+    {
+        // The log lives in NVS, not RTC memory, and that is the whole point.
+        //
+        // Opening the USB CDC port RESETS this board -- the S3's native USB
+        // implements the auto-programming reset on the CDC control lines -- so
+        // attaching to watch a wake destroys the evidence of it: RTC memory is
+        // wiped and esp_sleep_get_wakeup_cause() reports UNDEFINED. Every boot
+        // banner this session has claimed "Cold Boot" for exactly that reason.
+        // Flash survives the reset, so the wake cause is written down at the
+        // moment it is still true and read back later, when attaching no longer
+        // costs anything.
+        //
+        // The procedure this build is built for: flash it, LEAVE THE PORT ALONE
+        // for several cycles, shake it during some of the sleeps, and only then
+        // attach to read the history back.
+        Serial.println("\n=== DEEP SLEEP WAKE TEST ===");
+
+        prefs.begin("sleeptest", false);
+        String log = prefs.getString("log", "");
+        const int pass = prefs.getUInt("pass", 0);
+
+        // Recorded before anything else can disturb it.
+        const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+        const char* causeStr = (cause == ESP_SLEEP_WAKEUP_EXT1)  ? "MOTION"
+                             : (cause == ESP_SLEEP_WAKEUP_TIMER) ? "timer"
+                             : (cause == ESP_SLEEP_WAKEUP_UNDEFINED) ? "reset/cold"
+                             : "other";
+        // pass is the count of sleeps ALREADY taken, so the one being reported
+        // here is pass-1, and its holds setting follows the same alternation.
+        // Even passes are the ext1 positive control, odd are a normal motion arm.
+        // Pad holds are off throughout now: they were tested both ways over four
+        // clean battery sleeps and made no difference, so keeping them in would
+        // only add a variable back that has already been ruled out.
+        const bool prevWasControl = (pass > 0) && (((pass - 1) % 2) == 0);
+
+        if (pass > 0) {
+            // IA is the whole question now. ext1 did not wake this board with
+            // holds on OR off, while the same part latches reliably on a shake
+            // when awake. Those two facts only reconcile one of two ways, and
+            // the latch tells them apart: LIR_INT1 holds INT1 high until
+            // INT1_SRC is read, so a fire during sleep is still recorded at the
+            // next wake, whatever ended it.
+            //
+            //   IA=1 on a timer wake -> the LIS3DH fired and ext1 ignored it.
+            //   IA=0 on a timer wake -> the part never fired while asleep at all,
+            //                           despite firing on the same gesture awake.
+            const uint8_t wsrc = imuWakeSrc();
+            const uint8_t wcfg = imuWakeCfg();
+            char entry[96];
+            snprintf(entry, sizeof(entry), "%d:%s:%s:IA%s:cfg%02X ", pass, causeStr,
+                     prevWasControl ? "CONTROL" : "motion",
+                     (wsrc == 0xFF) ? "?" : ((wsrc & 0x40) ? "1" : "0"),
+                     wcfg);
+            log += entry;
+            if (log.length() > 400) log = log.substring(log.length() - 400);
+            prefs.putString("log", log);
+        }
+
+        Serial.printf("[SleepTest] History (pass:wokeby:mode:IA:cfg): %s\n",
+                      log.length() ? log.c_str() : "(none yet)");
+        if (log.indexOf("MOTION:CONTROL") >= 0) {
+            Serial.println("[SleepTest] >>> ext1 WORKS: gravity held INT1 high and woke the board.");
+            Serial.println("[SleepTest]     So the wake source is fine, and the fault is the sensor");
+            Serial.println("[SleepTest]     not firing while the ESP32 sleeps.");
+        } else if (log.indexOf("timer:CONTROL") >= 0) {
+            Serial.println("[SleepTest] >>> ext1 IS BROKEN: INT1 was held HIGH for the whole sleep and");
+            Serial.println("[SleepTest]     the board still slept out its timer. Nothing about the");
+            Serial.println("[SleepTest]     accelerometer can explain or fix that.");
+        }
+        if (log.indexOf(":IA1") >= 0) {
+            Serial.println("[SleepTest] >>> The LIS3DH latched during a sleep at least once.");
+        }
+
+        const bool runControl = (pass % 2) == 0;
+        prefs.putUInt("pass", pass + 1);
+        prefs.end();
+
+        // Attaching a terminal to this board resets it -- the S3's USB-Serial-JTAG
+        // controller issues a chip reset when the host drives DTR/RTS, and macOS
+        // does that on open. Fighting that turned out to be the wrong approach:
+        // NVS survives a reset, so the reset is harmless as long as the board is
+        // still awake afterwards to be read from and flashed.
+        //
+        // So a reset buys a grace window and a real sleep wake does not. Every
+        // attach lands in this branch (a reset reports UNDEFINED), which is what
+        // makes the port reliably catchable instead of a 2-second lottery -- and
+        // it is why this stopped needing a BOOT+RST between every flash.
+        if (cause == ESP_SLEEP_WAKEUP_UNDEFINED) {
+            Serial.println("[SleepTest] Reset detected -- holding awake 20s so this can be read and reflashed.");
+            for (int i = 0; i < 4; i++) {
+                delay(5000);
+                Serial.printf("[SleepTest] (awake %ds) History: %s\n", (i + 1) * 5, log.c_str());
+            }
+        }
+
+        bool controlArmed = false;
+        if (runControl) {
+            Serial.println("[SleepTest] Mode: ext1 POSITIVE CONTROL -- gravity will hold INT1 high.");
+            controlArmed = imuForceInterruptHigh();
+            Serial.println("[SleepTest]   If ext1 works this sleep ends immediately. No shaking needed.");
+        } else {
+            Serial.println("[SleepTest] Mode: normal motion arm (352mg, HPF on).");
+            imuEnableMotionWake(g_motionThresholdMg);
+            imuClearMotionInterrupt();
+        }
+
+        Serial.printf("[SleepTest] Sleeping 20s with ext1 armed on GPIO%d. INT1 reads %s going in.\n",
+                      DB_IMU_INT1, digitalRead(DB_IMU_INT1) == HIGH ? "HIGH" : "low");
+        Serial.println("[SleepTest] Run this on BATTERY -- with USB attached every wake is reported");
+        Serial.println("[SleepTest]   as a cold boot and the result is meaningless.");
+        (void)controlArmed;
+        Serial.flush();
+
+        esp_sleep_enable_timer_wakeup(20ULL * 1000000ULL);
+        esp_sleep_enable_ext1_wakeup(1ULL << DB_IMU_INT1, ESP_EXT1_WAKEUP_ANY_HIGH);
+        esp_deep_sleep_start();
     }
 #endif
 
