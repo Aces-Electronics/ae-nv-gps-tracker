@@ -28,7 +28,9 @@ LilyGo T-SIM7080G-S3 based GPS tracker with NB-IoT connectivity for the AE-NV ec
   is what actually triggers a report
 - ✅ **Adaptive motion threshold** — climbs when the tracker keeps waking for
   movement GPS says didn't happen, drops straight back on real travel
-- ✅ **Jetski engine data over CAN** — RPM decoded from the ECU (daughter board)
+- ✅ **Jetski engine data over CAN** — rpm, coolant, engine hours and iBR
+  trim position decoded from the ECU (daughter board). See
+  [`docs/can/seadoo-can.md`](docs/can/seadoo-can.md).
 
 ## Telemetry Fields
 
@@ -58,7 +60,13 @@ The tracker publishes the following data via MQTT:
   "engine_bus": true,          // Was the ski's CAN bus awake at all
   "ski_running": true,         // Drives the reporting cadence
   "rpm": 1455,                 // Omitted unless engine_bus
-  "engine_temp_raw": 140,      // 0x342 b4, raw count — scaling unknown
+  "coolant_raw": 110,          // 0x102 b3, raw count — identity confirmed,
+                               //   scaling not. raw-40 gives a believable 70C
+  "engine_temp_raw": 140,      // 0x342 b4, raw count. NOT the coolant temp —
+                               //   kept because it is a real signal, unidentified
+  "engine_minutes": 5856,      // 0x342 b6:b7. Confirmed against the dash to the
+                               //   minute: 5856 = 97h36m
+  "ibr_trim": 5,               // 0x012 b2, iBR up/down position, 1..9
   "motion_sensitivity": "Medium", // Low | Medium | High -- the selected floor
   "motion_threshold_mg": 176,  // Where the adaptive ladder currently sits
   "motion_suppressed": 0,      // Motion wakes rate-limited away since last report
@@ -95,9 +103,28 @@ reaches the tracker's normal cycle — no modem, no MQTT, no sleep:
 pio run -e can-sniffer -t upload && pio device monitor -b 115200
 ```
 
-It scans 250k → 500k → 125k, keeps whichever rate hears frames, then prints a
-table of distinct IDs with hit counts and the last payload for each, refreshed
-every 10 seconds.
+It scans 250k → 500k → 125k, keeps whichever rate hears frames, prints a table
+of distinct IDs with hit counts and per-byte ranges, then runs one probe: an
+8-second learn phase, a single `*** GO ***`, and a 40-second window that records
+every frame **and** narrates which bytes changed while you work a control.
+
+The learn phase is the trick. It marks every byte that moves while the vehicle
+is left alone — engine signals, counters, checksums — so afterwards it can
+report only the bytes that held still and then moved. Operate one control and
+the output is a short list naming that control's bytes.
+
+Two things worth knowing before relying on it:
+
+- **It prints its own blind spot.** A byte that moved during learning is hidden
+  from the narration, which permanently hides both halves of any multiplexed
+  signal. The excluded bytes are listed up front, and the CSV has every frame
+  regardless — the narration is a convenience, the CSV is the evidence.
+- **One prompt, then it halts.** Earlier versions recorded and narrated in
+  separate phases with a `GO` for each, and the natural thing was to act on the
+  second one, which was no longer recording. Three sessions were lost that way.
+
+This is how the iBR up/down decode was found: the position byte and its command
+byte both showed up in the narration within seconds of pressing a button.
 
 **Listen-only never drives the bus**, not even the ACK bit, so this is safe to
 plug into a running ski before anything is known about the bus or its rate. The

@@ -34,6 +34,7 @@ BLEHandler ble;
 String imei = "";
 String mqtt_topic_up = "";
 String mqtt_topic_dn = "";
+String mqtt_topic_cfg;
 
 // How long the MQTT session is held open after publishing, waiting for the
 // retained downlink. The broker sends a retained message immediately on SUBACK,
@@ -152,6 +153,8 @@ void loadSettings() {
         settings.apn = "telstra.internet";
     }
     
+    settings.debug_payload = prefs.getBool("dbg", false);
+
     Serial.println("Settings Loaded from NVS.");
     Serial.printf("[Settings] Broker: %s\n", settings.mqtt_broker.c_str());
     Serial.printf("[Settings] Name: %s\n", settings.name.c_str());
@@ -159,6 +162,8 @@ void loadSettings() {
     Serial.printf("[Settings] Motion sensitivity: %s (%umg floor)\n",
                   motionSensitivityName(settings.motion_sensitivity),
                   motionBaseFor(settings.motion_sensitivity));
+    Serial.printf("[Settings] Payload: %s\n",
+                  settings.debug_payload ? "DEBUG (verbose)" : "normal (essentials)");
     prefs.end();
 }
 
@@ -171,6 +176,7 @@ void saveSettings() {
     prefs.putString("pass", settings.mqtt_pass);
     prefs.putUInt("interval", settings.report_interval_mins);
     prefs.putUChar("mot_sens", settings.motion_sensitivity);
+    prefs.putBool("dbg", settings.debug_payload);
     prefs.end();
     Serial.println("Settings Saved to NVS.");
 }
@@ -843,12 +849,52 @@ bool getPreciseLocation(float* lat, float* lon, float* speed, float* alt, int* s
     }
 }
 
+// Set when a CFG downlink changed something this wake. Published once so the
+// backend can retire its retained command against a frame that proves the device
+// actually applied it, rather than against a timeout.
+static bool g_cfgApplied = false;
+
 void onDownlink(char* topic, uint8_t* payload, unsigned int length) {
     Serial.printf("[MQTT] Downlink on %s (%u bytes)\n", topic, length);
 
-    // Only OTA is subscribed, so the topic is not re-checked here. A zero-length
-    // payload is the backend withdrawing the retained command; otaParseCommand()
-    // rejects it and g_otaPending stays false.
+    // Two topics are subscribed now, so the topic IS checked. It used to be safe
+    // to skip -- there was only OTA -- and a config frame handed to
+    // otaParseCommand() would simply be rejected, but silently, which is exactly
+    // the failure that takes an afternoon to find.
+    const String t(topic ? topic : "");
+
+    if (t.endsWith("/CFG")) {
+        // A zero-length payload is the backend withdrawing a retained command.
+        // Nothing to apply, and importantly not an error.
+        if (length == 0) {
+            Serial.println("[CFG] Retained command withdrawn.");
+            return;
+        }
+        JsonDocument cfg;
+        if (deserializeJson(cfg, payload, length) != DeserializationError::Ok) {
+            Serial.println("[CFG] Malformed command, ignored.");
+            return;
+        }
+        if (cfg["debug"].is<bool>()) {
+            const bool want = cfg["debug"].as<bool>();
+            if (want != settings.debug_payload) {
+                settings.debug_payload = want;
+                saveSettings();
+                Serial.printf("[CFG] Debug payload -> %s (persisted)\n", want ? "ON" : "OFF");
+            } else {
+                Serial.printf("[CFG] Debug payload already %s\n", want ? "ON" : "OFF");
+            }
+            // Applied on THIS wake: transmitData() has not built its document yet
+            // when the downlink arrives on SUBACK, so the change shows up in the
+            // very frame that confirms it rather than a whole sleep cycle later.
+            g_cfgApplied = true;
+        }
+        return;
+    }
+
+    // Anything else is the OTA topic. A zero-length payload is the backend
+    // withdrawing the retained command; otaParseCommand() rejects it and
+    // g_otaPending stays false.
     if (otaParseCommand(payload, length, g_otaCmd)) {
         g_otaPending = true;
         Serial.printf("[OTA] Command: v%s %s\n", g_otaCmd.version.c_str(), g_otaCmd.url.c_str());
@@ -882,9 +928,11 @@ void transmitData(bool has_fix, float lat, float lon, float speed, float alt, in
     // it publishes under is what it must subscribe under, so this is derived from
     // the same string rather than from the IMEI directly.
     mqtt_topic_dn = "ae/downlink/" + imei + "/OTA";
+    mqtt_topic_cfg = "ae/downlink/" + imei + "/CFG";
     Serial.printf("[MQTT] MAC/IMEI: %s\n", imei.c_str());
     Serial.printf("[MQTT] Topic: %s\n", mqtt_topic_up.c_str());
     Serial.printf("[MQTT] Downlink: %s\n", mqtt_topic_dn.c_str());
+    Serial.printf("[MQTT] Config:   %s\n", mqtt_topic_cfg.c_str());
 
     Serial.println("[Lifecycle] Connecting to Network...");
     
@@ -918,6 +966,14 @@ void transmitData(bool has_fix, float lat, float lon, float speed, float alt, in
             // copy dropped on a marginal LTE-M link is not repeated.
             if (!mqtt.subscribe(mqtt_topic_dn.c_str(), 1)) {
                 Serial.println("[MQTT] Subscribe FAILED (no downlink this wake)");
+            }
+            // Same reasoning as the OTA topic: subscribed before publishing, so a
+            // retained config change lands on SUBACK and is applied to the frame
+            // this wake is about to send. A separate topic rather than a field on
+            // the OTA one, because the two are retained independently -- clearing
+            // a config command must not clear a pending firmware update.
+            if (!mqtt.subscribe(mqtt_topic_cfg.c_str(), 1)) {
+                Serial.println("[MQTT] Config subscribe FAILED (no config this wake)");
             }
 
             // Check for previous crash logs
@@ -960,19 +1016,37 @@ void transmitData(bool has_fix, float lat, float lon, float speed, float alt, in
             //
             // The flag goes out either way, so "no fix this wake" is a fact the
             // report carries rather than something inferred from missing keys.
+            const bool dbg = settings.debug_payload;
+
             doc["fix"] = has_fix;
             if (has_fix) {
                 doc["lat"] = lat;
                 doc["lon"] = lon;
-                doc["alt"] = alt;
                 doc["speed"] = speed;
                 doc["sats"] = sats;
-                doc["hdop"] = hdop;
+                // Altitude and HDOP describe the quality of the fix rather than
+                // the fix. Kept for debug, where a suspect position needs them.
+                if (dbg) {
+                    doc["alt"] = alt;
+                    doc["hdop"] = hdop;
+                }
             }
-            
-            doc["voltage"] = PMU.getVbusVoltage() / 1000.0F; 
-            doc["device_voltage"] = PMU.getBattVoltage() / 1000.0F; 
-            doc["battery_voltage"] = PMU.getBattVoltage() / 1000.0F; 
+
+            // Which frame this is. Published ALWAYS, and it is the single most
+            // important field here: without it a missing coolant_raw is
+            // ambiguous between "debug is off" and "the ski's bus was asleep",
+            // and the wrong one of those sends somebody out to the ski.
+            doc["debug"] = dbg;
+            if (g_cfgApplied) doc["cfg_applied"] = true;
+
+            doc["device_voltage"] = PMU.getBattVoltage() / 1000.0F;
+            if (dbg) {
+                // USB VBUS, not the ski's supply -- the divider cannot read the
+                // ski yet. Debug-only until it means what its name suggests.
+                doc["voltage"] = PMU.getVbusVoltage() / 1000.0F;
+                // Legacy alias for device_voltage. Nothing new should read it.
+                doc["battery_voltage"] = PMU.getBattVoltage() / 1000.0F;
+            }
             // The AXP2101 keeps a fuel gauge and this reads it, but it answers
             // -1 when isBatteryConnect() is false rather than failing. Publishing
             // that verbatim put "-1%" on the dashboard, which reads as a
@@ -986,14 +1060,16 @@ void transmitData(bool has_fix, float lat, float lon, float speed, float alt, in
             // documented payload all along, and a key that appears only on
             // boards with a working IMU is harder for the backend to reason
             // about than one that is always there.
-            doc["orientation"] = orientationName(imu.orientation);
-            doc["charge_state"] = chargeStateName(power.state);
-            doc["supply_enabled"] = power.supplyEnabled;
             doc["wake_reason"] = wakeReasonName();
+            doc["charge_state"] = chargeStateName(power.state);
+            if (dbg) {
+                doc["orientation"] = orientationName(imu.orientation);
+                doc["supply_enabled"] = power.supplyEnabled;
+            }
 
             // Vehicle frame, so the backend never has to know how the board is
             // mounted. Two decimals is well inside what a +/-2g part resolves.
-            if (imu.valid) {
+            if (dbg && imu.valid) {
                 doc["accel_up"]   = roundf(imu.up   * 100) / 100.0f;
                 doc["accel_fwd"]  = roundf(imu.fwd  * 100) / 100.0f;
                 doc["accel_stbd"] = roundf(imu.stbd * 100) / 100.0f;
@@ -1008,22 +1084,38 @@ void transmitData(bool has_fix, float lat, float lon, float speed, float alt, in
             // Raw because the scaling is genuinely unknown -- see
             // docs/can/seadoo-can.md. Better an honest count than a fabricated
             // temperature nobody can check.
-            if (g_engine.tempValid) doc["engine_temp_raw"] = g_engine.tempRaw;
+            // Engine hours ride in the normal frame. They are a confirmed decode,
+            // they change slowly, and they are the one engine number an owner
+            // actually wants between rides.
+            if (g_engine.hoursValid) doc["engine_minutes"] = g_engine.engineMinutes;
+
+            if (dbg) {
+                if (g_engine.tempValid) doc["engine_temp_raw"] = g_engine.tempRaw;
+                // Coolant is a confirmed signal but an unconfirmed scale, so it
+                // goes out raw for the same reason as above.
+                if (g_engine.coolantValid) doc["coolant_raw"] = g_engine.coolantRaw;
+                // Also a confirmed decode, so it goes out as the step number it is.
+                if (g_engine.trimValid) doc["ibr_trim"] = g_engine.trimPos;
+            }
 
             // Published so the adaptive logic can be seen working from the
             // backend rather than only from a serial cable.
-            doc["motion_threshold_mg"] = g_motionThresholdMg;
+            if (dbg) doc["motion_threshold_mg"] = g_motionThresholdMg;
             // The setting, alongside where the ladder currently sits. Both are
             // wanted: the first is what somebody chose, the second is what the
             // ski decided, and a support question about false wakes needs to
             // tell them apart.
-            doc["motion_sensitivity"] = motionSensitivityName(settings.motion_sensitivity);
+            if (dbg) doc["motion_sensitivity"] = motionSensitivityName(settings.motion_sensitivity);
             // Wakes since the last report that were rate-limited away. Published
             // because it is the one number that explains a tracker reporting
             // often, or a battery going down faster than the interval suggests,
             // and it is invisible from the reports themselves. Read before
             // updateMotionThreshold() clears it -- transmitData() runs first.
-            doc["motion_suppressed"] = s_suppressedWakes;
+            // Exception to the debug rule: a non-zero count is the only thing that
+            // explains a tracker reporting more often than its interval or a
+            // battery going down faster than it should. Sending it when it is
+            // zero is what would be noise, so it goes out only when it is not.
+            if (dbg || s_suppressedWakes > 0) doc["motion_suppressed"] = s_suppressedWakes;
 
             int csq = modem.getSignalQuality();
             int dbm = (csq == 99) ? -113 : (csq * 2) - 113;

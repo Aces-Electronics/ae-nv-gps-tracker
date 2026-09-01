@@ -18,6 +18,7 @@ const char* BLEHandler::PASS_CHAR_UUID      = "beb5483e-36e1-4688-b7f5-ea07361b2
 const char* BLEHandler::APN_CHAR_UUID       = "ae000101-1fb5-459e-8fcc-c5c9c331914b";
 const char* BLEHandler::INTERVAL_CHAR_UUID  = "beb5483e-36e1-4688-b7f5-ea07361b2050";
 const char* BLEHandler::MOTION_SENS_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b2051";
+const char* BLEHandler::DEBUG_PAYLOAD_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b2052";
 
 
 class TrackerBLECallbacks : public BLECharacteristicCallbacks {
@@ -67,6 +68,13 @@ public:
                 } else {
                     Serial.printf("[BLE] Rejected motion sensitivity %u (expected 0-2)\n", v);
                 }
+            }
+        }
+        else if (uuid == BLEHandler::DEBUG_PAYLOAD_CHAR_UUID) {
+            if (val.length() >= 1) {
+                _settings->debug_payload = (val[0] != 0);
+                Serial.printf("[BLE] Debug payload %s\n",
+                              _settings->debug_payload ? "ON (verbose)" : "OFF (essentials only)");
             }
         }
         // Handle WiFi SSID write (even if not used by SIM7080G directly yet)
@@ -169,6 +177,14 @@ void BLEHandler::begin(const String& deviceName, TrackerSettings& settings, floa
     pMotionSensChar->setCallbacks(cb);
     pMotionSensChar->setValue((uint8_t*)&_settings->motion_sensitivity, 1);
 
+
+    // Debug payload (Read | Write), one byte: 0 essentials only, non-zero verbose.
+    pDebugPayloadChar = pService->createCharacteristic(DEBUG_PAYLOAD_CHAR_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+    pDebugPayloadChar->setCallbacks(cb);
+    {
+        uint8_t dbg = _settings->debug_payload ? 1 : 0;
+        pDebugPayloadChar->setValue(&dbg, 1);
+    }
 
     pService->start();
     

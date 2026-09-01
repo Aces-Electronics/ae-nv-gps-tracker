@@ -292,17 +292,35 @@ EngineData canReadEngine(uint32_t listenMs) {
     const uint32_t t0 = millis();
     twai_message_t msg;
     uint32_t frames = 0;
+    uint32_t badChecksum = 0;
     while (millis() - t0 < listenMs) {
         if (twai_receive(&msg, pdMS_TO_TICKS(20)) != ESP_OK) continue;
         frames++;
         e.busAlive = true;
 
-        if (msg.identifier == 0x102 && msg.data_length_code >= 2) {
+        // A corrupted 0x102 would otherwise be published as a real rpm. The
+        // checksum costs seven XORs and makes that impossible. 0x342 is not
+        // checked: it does not run the scheme, so checking it would reject
+        // every frame.
+        if (msg.identifier == 0x102 && canChecksumValid(msg.data, msg.data_length_code)) {
             e.rpm = (((uint32_t)msg.data[0] << 8) | msg.data[1]) / 4;
             e.rpmValid = true;
-        } else if (msg.identifier == 0x342 && msg.data_length_code >= 5) {
+            e.coolantRaw = msg.data[3];
+            e.coolantValid = true;
+        } else if (msg.identifier == 0x102) {
+            badChecksum++;
+        } else if (msg.identifier == 0x012 && canChecksumValid(msg.data, msg.data_length_code)) {
+            // 1..9; anything else means the frame is not what we think it is.
+            if (msg.data[2] >= 1 && msg.data[2] <= 9) {
+                e.trimPos = msg.data[2];
+                e.trimValid = true;
+            }
+        } else if (msg.identifier == 0x342 && msg.data_length_code >= 8) {
             e.tempRaw = msg.data[4];
             e.tempValid = true;
+            // b6/b7 are payload on this ID, not counter+checksum.
+            e.engineMinutes = ((uint16_t)msg.data[6] << 8) | msg.data[7];
+            e.hoursValid = true;
         }
     }
 
@@ -311,13 +329,18 @@ EngineData canReadEngine(uint32_t listenMs) {
     if (!e.busAlive) {
         Serial.println("[CAN] Bus quiet - ignition off.");
     } else {
-        Serial.printf("[CAN] %u frames; rpm=%ld temp_raw=%u\n",
-                      frames, e.rpmValid ? (long)e.rpm : -1L, e.tempRaw);
+        Serial.printf("[CAN] %u frames; rpm=%ld coolant_raw=%u temp_raw=%u", frames,
+                      e.rpmValid ? (long)e.rpm : -1L, e.coolantRaw, e.tempRaw);
+        if (e.trimValid)  Serial.printf(" trim=%u/9", e.trimPos);
+        if (e.hoursValid) Serial.printf(" hours=%uh%02um",
+                                        e.engineMinutes / 60, e.engineMinutes % 60);
+        if (badChecksum) Serial.printf(" (%u 0x102 frames failed checksum)", badChecksum);
+        Serial.println();
     }
     return e;
 }
 
-void canRawCapture(uint32_t seconds) {
+void canRawCapture(uint32_t seconds, const uint32_t* ids, size_t nIds) {
     struct Entry { uint32_t ms; uint16_t id; uint8_t dlc; uint8_t data[8]; };
     const size_t cap = (size_t)seconds * 1200;   // headroom over the ~980/s seen
 
@@ -330,14 +353,30 @@ void canRawCapture(uint32_t seconds) {
         return;
     }
 
-    Serial.printf("[CAN] Raw capture: %us, room for %u frames. Buffering...\n",
+    // The window is short and it cannot be repeated without a reboot, so say
+    // out loud when it opens. The last session lost this data by capturing at a
+    // moment nobody was driving the engine.
+    Serial.printf("\n[CAN] Raw capture: %us, room for %u frames.\n",
                   (unsigned)seconds, (unsigned)cap);
+    Serial.println("[CAN] Every byte of every ID goes to CSV.");
+    Serial.println("[CAN] Do the thing you came to do, slowly, holding each position.");
+    Serial.println("[CAN] For a driver input, hold each position for ~3s: the plateaus are");
+    Serial.println("[CAN] what map a control's positions onto a byte's values. For anything");
+    Serial.println("[CAN] that has to be told apart from engine speed, add a fast transient");
+    Serial.println("[CAN] at the end -- a lead or a lag is what separates cause from effect.\n");
+    for (int i = 5; i > 0; i--) { Serial.printf("[CAN] starting in %d...\n", i); delay(1000); }
+    Serial.println("[CAN] *** GO ***");
 
     size_t n = 0;
     const uint32_t t0 = millis();
     twai_message_t msg;
     while (millis() - t0 < seconds * 1000 && n < cap) {
         if (twai_receive(&msg, pdMS_TO_TICKS(5)) != ESP_OK) continue;
+        if (nIds) {
+            bool want = false;
+            for (size_t k = 0; k < nIds; k++) if (ids[k] == msg.identifier) { want = true; break; }
+            if (!want) continue;
+        }
         buf[n].ms  = millis() - t0;
         buf[n].id  = (uint16_t)msg.identifier;
         buf[n].dlc = msg.data_length_code;
@@ -355,6 +394,13 @@ void canRawCapture(uint32_t seconds) {
     }
     Serial.println("---8<--- END CAN CSV ---8<---");
     free(buf);
+}
+
+bool canChecksumValid(const uint8_t* data, uint8_t dlc) {
+    if (!data || dlc < 8) return false;
+    uint8_t x = 0;
+    for (int i = 0; i < 7; i++) x ^= data[i];
+    return x == data[7];
 }
 
 int32_t canDecodeRpm(const CanFrameSummary& f) {
@@ -395,7 +441,11 @@ void canWatchLoop() {
 
         Serial.printf("[%7.1fs] RPM=%5ld", (millis() - t0) / 1000.0f,
                       f102 ? (long)canDecodeRpm(*f102) : -1L);
-        if (f102) Serial.printf(" (raw %02X%02X)", f102->lastData[0], f102->lastData[1]);
+        if (f102) Serial.printf(" (raw %02X%02X) | 0x102 b2-b5 %02X %02X %02X %02X %s",
+                                f102->lastData[0], f102->lastData[1],
+                                f102->lastData[2], f102->lastData[3],
+                                f102->lastData[4], f102->lastData[5],
+                                canChecksumValid(f102->lastData, f102->dlc) ? "ok" : "BAD");
         if (f122) Serial.printf(" | 0x122 %02X %02X %02X %02X %02X %02X",
                                 f122->lastData[0], f122->lastData[1], f122->lastData[2],
                                 f122->lastData[3], f122->lastData[4], f122->lastData[5]);
@@ -404,6 +454,171 @@ void canWatchLoop() {
         if (f342) Serial.printf(" | 342.b4=%02X", f342->lastData[4]);
         Serial.println();
     }
+}
+
+void canWatchChanges(uint32_t learnMs) {
+    Serial.printf("\n[CAN] === WATCH: what just changed? ===\n");
+    Serial.printf("[CAN] Learning which bytes move on their own for %.0fs.\n", learnMs / 1000.0f);
+    Serial.println("[CAN] LEAVE THE SKI ALONE until it says GO -- anything moving now");
+    Serial.println("[CAN] is treated as noise and stays hidden for the rest of the run.\n");
+
+    canResetSeen();
+    canDrain(learnMs);
+
+    // A byte that never moved while nothing was touched is a byte worth
+    // watching. Everything else is engine data, a counter or a checksum.
+    struct Base { uint32_t id; uint8_t val[8]; bool watch[8]; };
+    static Base base[CAN_MAX_IDS];
+    size_t nBase = 0, nWatched = 0;
+    for (size_t i = 0; i < canSeenCount() && nBase < CAN_MAX_IDS; i++) {
+        const CanFrameSummary* f = canSeen(i);
+        base[nBase].id = f->id;
+        for (int b = 0; b < 8; b++) {
+            base[nBase].val[b]   = f->lastData[b];
+            base[nBase].watch[b] = (f->minData[b] == f->maxData[b]);
+            if (base[nBase].watch[b]) nWatched++;
+        }
+        nBase++;
+    }
+    Serial.printf("[CAN] Watching %u stable bytes across %u IDs. *** GO ***\n",
+                  (unsigned)nWatched, (unsigned)nBase);
+    Serial.println("[CAN] Work ONE control at a time, slowly, holding each position.\n");
+
+    const uint32_t t0 = millis();
+    twai_message_t msg;
+    while (true) {
+        if (twai_receive(&msg, pdMS_TO_TICKS(10)) != ESP_OK) continue;
+        if (msg.data_length_code < 8) continue;
+        for (size_t i = 0; i < nBase; i++) {
+            if (base[i].id != msg.identifier) continue;
+            for (int b = 0; b < 8; b++) {
+                if (!base[i].watch[b] || msg.data[b] == base[i].val[b]) continue;
+                Serial.printf("[%7.1fs] 0x%03X b%d: %02X -> %02X\n",
+                              (millis() - t0) / 1000.0f, (unsigned)base[i].id, b,
+                              base[i].val[b], msg.data[b]);
+                base[i].val[b] = msg.data[b];
+            }
+            break;
+        }
+    }
+}
+
+void canProbeControl(uint32_t seconds, const uint32_t* ids, size_t nIds, uint32_t learnMs) {
+    Serial.println("\n[CAN] === PROBE: record and narrate one interaction ===");
+    Serial.printf("[CAN] Learning which bytes move on their own for %.0fs.\n", learnMs / 1000.0f);
+    Serial.println("[CAN] LEAVE THE SKI ALONE until it says GO.\n");
+
+    canResetSeen();
+    canDrain(learnMs);
+
+    struct Base {
+        uint32_t id;
+        uint8_t  val[8];
+        bool     watch[8];
+        // Narration-only dither suppression, tracked per byte.
+        uint16_t events[8];
+        uint8_t  lo[8], hi[8];
+        bool     muted[8];
+    };
+    static Base base[CAN_MAX_IDS];
+    size_t nBase = 0, nWatched = 0;
+    for (size_t i = 0; i < canSeenCount() && nBase < CAN_MAX_IDS; i++) {
+        const CanFrameSummary* f = canSeen(i);
+        base[nBase].id = f->id;
+        for (int b = 0; b < 8; b++) {
+            base[nBase].val[b]   = f->lastData[b];
+            base[nBase].watch[b] = (f->minData[b] == f->maxData[b]);
+            base[nBase].events[b] = 0;
+            base[nBase].lo[b] = base[nBase].hi[b] = f->lastData[b];
+            base[nBase].muted[b] = false;
+            if (base[nBase].watch[b]) nWatched++;
+        }
+        nBase++;
+    }
+
+    // Name the blind spot rather than leaving it implicit. Counters and
+    // checksums are expected here; anything else listed is a payload byte that
+    // will not be narrated, and is worth reading out of the CSV by hand.
+    Serial.printf("[CAN] Narrating %u stable bytes. NOT narrated (moved while learning):\n",
+                  (unsigned)nWatched);
+    for (size_t i = 0; i < nBase; i++) {
+        bool any = false;
+        for (int b = 0; b < 6; b++) if (!base[i].watch[b]) {
+            if (!any) { Serial.printf("[CAN]   0x%03X:", (unsigned)base[i].id); any = true; }
+            Serial.printf(" b%d", b);
+        }
+        if (any) Serial.println("   <- payload, hidden from narration, present in the CSV");
+    }
+
+    struct Entry { uint32_t ms; uint16_t id; uint8_t dlc; uint8_t data[8]; };
+    const size_t cap = (size_t)seconds * (nIds ? 400 : 1200);
+    Entry* buf = (Entry*)ps_malloc(cap * sizeof(Entry));
+    if (!buf) buf = (Entry*)malloc(cap * sizeof(Entry));
+    if (!buf) { Serial.println("[CAN] Could not allocate the record. Aborting."); return; }
+
+    Serial.printf("\n[CAN] Recording %us. *** GO *** -- work ONE control, holding each state.\n\n",
+                  (unsigned)seconds);
+
+    size_t n = 0;
+    const uint32_t t0 = millis();
+    twai_message_t msg;
+    while (millis() - t0 < seconds * 1000) {
+        if (twai_receive(&msg, pdMS_TO_TICKS(5)) != ESP_OK) continue;
+        if (msg.data_length_code < 8) continue;
+
+        bool want = (nIds == 0);
+        for (size_t k = 0; k < nIds && !want; k++) if (ids[k] == msg.identifier) want = true;
+        if (want && n < cap) {
+            buf[n].ms = millis() - t0;
+            buf[n].id = (uint16_t)msg.identifier;
+            buf[n].dlc = msg.data_length_code;
+            memcpy(buf[n].data, msg.data, 8);
+            n++;
+        }
+
+        for (size_t i = 0; i < nBase; i++) {
+            if (base[i].id != msg.identifier) continue;
+            for (int b = 0; b < 8; b++) {
+                if (!base[i].watch[b] || msg.data[b] == base[i].val[b]) continue;
+                const uint8_t prev = base[i].val[b];
+                base[i].val[b] = msg.data[b];
+                if (base[i].muted[b]) continue;
+
+                if (msg.data[b] < base[i].lo[b]) base[i].lo[b] = msg.data[b];
+                if (msg.data[b] > base[i].hi[b]) base[i].hi[b] = msg.data[b];
+                base[i].events[b]++;
+
+                // A byte that has flickered many times but never left a span of
+                // one count is a sensor dithering on a rounding boundary. Mute
+                // the narration for it; the CSV still has every frame. The span
+                // test is what keeps this safe -- an analog sweep walks through
+                // many values and can never be mistaken for dither.
+                if (base[i].events[b] > 15 && (base[i].hi[b] - base[i].lo[b]) <= 1) {
+                    base[i].muted[b] = true;
+                    Serial.printf("[%6.1fs] 0x%03X b%d: dithering %02X/%02X, muting "
+                                  "narration (still recorded)\n",
+                                  (millis() - t0) / 1000.0f, (unsigned)base[i].id, b,
+                                  base[i].lo[b], base[i].hi[b]);
+                    continue;
+                }
+                Serial.printf("[%6.1fs] 0x%03X b%d: %02X -> %02X\n",
+                              (millis() - t0) / 1000.0f, (unsigned)base[i].id, b,
+                              prev, msg.data[b]);
+            }
+            break;
+        }
+    }
+
+    Serial.printf("\n[CAN] Recorded %u frames. Dumping CSV.\n", (unsigned)n);
+    Serial.println("---8<--- BEGIN CAN CSV ---8<---");
+    Serial.println("ms,id,dlc,d0,d1,d2,d3,d4,d5,d6,d7");
+    for (size_t i = 0; i < n; i++) {
+        Serial.printf("%lu,%03X,%u", (unsigned long)buf[i].ms, buf[i].id, buf[i].dlc);
+        for (int b = 0; b < 8; b++) Serial.printf(",%02X", buf[i].data[b]);
+        Serial.println();
+    }
+    Serial.println("---8<--- END CAN CSV ---8<---");
+    free(buf);
 }
 
 void canSnifferLoop() {
@@ -432,8 +647,19 @@ void canSnifferLoop() {
     // what can be held against a gauge.
     canSniff(10000);
     canLogSeen();
-    canRawCapture(10);
-    canWatchLoop();
+    // NO ID filter. The flap has never been seen, so it could be on any ID, and
+    // filtering to a guess is how a session gets thrown away. The whole bus for
+    // 40 s costs a ~2.5 minute dump, which is the right trade for a signal we
+    // have never once observed.
+    canProbeControl(40);
+
+    // Stop here rather than falling into canWatchChanges(). Running the watcher
+    // after the probe reprints a learn phase and a second "*** GO ***", which
+    // reads as the tool having restarted -- and worse, invites acting on a
+    // prompt that is no longer recording. One session, one prompt, then halt.
+    Serial.println("\n[CAN] Probe complete. Reset the board to run another.");
+    canEnd();
+    while (true) delay(1000);
 }
 
 const char* canBitrateName(CanBitrate r) {
