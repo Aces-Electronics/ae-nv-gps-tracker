@@ -202,18 +202,19 @@ The firmware uses robust satellite count parsing with fallback logic:
 
 - **Active Mode**: GPS acquisition + MQTT publish
 - **BLE Window**: 90 seconds on boot for configuration
-- **Charge cutoff**: the jetski feed is cut above **4.20V** and restored below
+- **Charge cutoff**: the jetski feed is cut above **4.10V** and restored below
   **3.70V**, decided at report time against the PMU's battery reading and
   latched across sleep in RTC memory.
 
-  Wide on purpose. The BQ25176J regulates to 4.2V and terminates there by
-  itself, so a cell it is looking after never reaches the stop threshold under
-  charge and rests well above the resume one afterwards — meaning the switch
-  stays on and the charger runs its own loop. That is the intent until the
-  supply-sense divider is reworked and this can be decided on real jetski
-  voltage. What remains is a backstop: 4.20V catches a cell being pushed past
-  full by a charger that is *not* terminating, which is the one case where
-  opening the switch is the only thing that can stop it.
+  4.10V sits *below* the BQ25176J's 4.2V regulation point, so the firmware —
+  not the charger — is what ends a charge, opening the switch on the way up
+  before the cell is ever held at full. The wide gap down to 3.70V is what makes
+  that worth doing: a LiPo ages fastest sitting at full charge, so the pair
+  cycles the cell through roughly 3.7–4.1 rather than floating it at 4.2. With
+  only a sleeping tracker as a load, one traverse of that band takes a long time,
+  so it costs very few cycles to buy. Both thresholds read the AXP2101's *cell*
+  voltage — the jetski's own voltage is not available to decide on until the
+  supply-sense divider is reworked.
 - **Deep Sleep**: Cadence follows the ski, not the clock.
   - **Running** (CAN bus awake) → the configured `report_interval_mins`,
     5 minutes by default, settable over BLE. GPS-failure backoff applies

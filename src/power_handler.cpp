@@ -14,19 +14,22 @@ RTC_DATA_ATTR static bool s_supplyEnabled = true;
 // charger's own termination -- the BQ25176J handles that -- they decide whether
 // it is worth drawing from the jetski at all.
 //
-// Deliberately wide, and deliberately outside where the charger normally works:
-// the BQ25176J regulates to 4.2V and terminates there on its own, so a cell it
-// is looking after never reaches CHARGE_STOP_V under charge and rests well
-// above CHARGE_RESUME_V afterwards. The switch therefore stays on and the
-// charger runs its own loop, which is the intent until the supply-sense divider
-// is reworked and this can be decided on real jetski voltage instead.
+// 4.1V is deliberately BELOW the BQ25176J's 4.2V regulation point, which makes
+// this firmware the thing that ends a charge rather than a backstop behind the
+// charger's own termination. The switch opens on the way up, before the cell is
+// ever held at full.
 //
-// What is left is a backstop with two jobs. 4.2V catches a cell being pushed
-// past full by a charger that is not terminating -- the one case where cutting
-// the input is the only thing that can stop it. 3.7V is the re-arm, low enough
-// that reaching it means genuine discharge rather than the ordinary sag after
-// termination, so a cut once made is not undone by the cell settling.
-static const float CHARGE_STOP_V   = 4.20f;
+// The wide gap down to 3.7V is what makes that worth doing. A LiPo ages fastest
+// sitting at full charge, so the pair cycles the cell through roughly 3.7-4.1
+// instead of floating it at 4.2 -- and since the only load between reports is a
+// sleeping tracker, one traverse of that band takes a long time and costs very
+// few cycles to buy it. It also means a cut once made is not undone by the cell
+// settling back, which a narrow band would do on every wake.
+//
+// Both thresholds are read against the AXP2101's cell voltage, not the jetski's:
+// the supply-sense divider is still mis-scaled, so real input voltage is not
+// available to decide on yet.
+static const float CHARGE_STOP_V   = 4.10f;
 static const float CHARGE_RESUME_V = 3.70f;
 
 // STAT blinks to signal a fault, so a single read cannot tell a fault from a
