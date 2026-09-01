@@ -17,6 +17,7 @@ const char* BLEHandler::PASS_CHAR_UUID      = "beb5483e-36e1-4688-b7f5-ea07361b2
 // Legacy/Custom UUIDs
 const char* BLEHandler::APN_CHAR_UUID       = "ae000101-1fb5-459e-8fcc-c5c9c331914b";
 const char* BLEHandler::INTERVAL_CHAR_UUID  = "beb5483e-36e1-4688-b7f5-ea07361b2050";
+const char* BLEHandler::MOTION_SENS_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b2051";
 
 
 class TrackerBLECallbacks : public BLECharacteristicCallbacks {
@@ -51,6 +52,21 @@ public:
         else if (uuid == BLEHandler::INTERVAL_CHAR_UUID) {
             if (val.length() >= 4) {
                memcpy(&_settings->report_interval_mins, val.data(), 4);
+            }
+        }
+        else if (uuid == BLEHandler::MOTION_SENS_CHAR_UUID) {
+            // Validated rather than trusted. An out-of-range byte here would
+            // otherwise reach motionBaseFor(), whose default arm is Medium --
+            // so a typo in an app would silently look like it worked, and the
+            // setting reported back afterwards would not be what was sent.
+            if (val.length() >= 1) {
+                const uint8_t v = (uint8_t)val[0];
+                if (v <= 2) {
+                    _settings->motion_sensitivity = v;
+                    Serial.printf("[BLE] Motion sensitivity set to %u\n", v);
+                } else {
+                    Serial.printf("[BLE] Rejected motion sensitivity %u (expected 0-2)\n", v);
+                }
             }
         }
         // Handle WiFi SSID write (even if not used by SIM7080G directly yet)
@@ -147,6 +163,11 @@ void BLEHandler::begin(const String& deviceName, TrackerSettings& settings, floa
     pIntervalChar = pService->createCharacteristic(INTERVAL_CHAR_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
     pIntervalChar->setCallbacks(cb);
     pIntervalChar->setValue((uint8_t*)&_settings->report_interval_mins, 4);
+
+    // Motion sensitivity (Read | Write), one byte: 0 Low, 1 Medium, 2 High.
+    pMotionSensChar = pService->createCharacteristic(MOTION_SENS_CHAR_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+    pMotionSensChar->setCallbacks(cb);
+    pMotionSensChar->setValue((uint8_t*)&_settings->motion_sensitivity, 1);
 
 
     pService->start();
