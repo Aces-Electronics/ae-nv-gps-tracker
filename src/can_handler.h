@@ -73,6 +73,21 @@ void canLogSeen();
 // itself, but a marginal result here is not proof of a fault.
 bool canSelfTest(CanBitrate rate = CanBitrate::Rate250k);
 
+// True if a frame carries a valid checksum: b7 is the XOR of bytes 0-6.
+//
+// CONFIRMED against the capture, not assumed. It holds on 18/18 complete frames
+// across all nine IDs that carry the b6 rolling counter, and it independently
+// explains the "fixed high nibble per ID" that b7 was seen to have: with a
+// static payload XOR(b0..b5) is a constant K and b6 sweeps 0-F, so b7 covers
+// exactly K&0xF0..K|0x0F -- which is what all nine of those IDs did, nibble for
+// nibble. A brute force over every 8-bit polynomial finds only 0x01 (x^8+1),
+// whose CRC *is* a byte-wise XOR, so no real CRC8 fits either.
+//
+// Only for the counter-carrying IDs: 0x010, 0x012, 0x102, 0x103, 0x110, 0x122,
+// 0x230, 0x408, 0x410. The static config frames do not run the scheme at all --
+// their b6 is a fixed byte, not a counter -- and this returns false for them.
+bool canChecksumValid(const uint8_t* data, uint8_t dlc);
+
 // Engine RPM from a 0x102 frame, or -1 if it is not one.
 //
 // Bosch ME17.8.5, b0/b1 big-endian at a quarter rpm per bit. CONFIRMED against
@@ -86,8 +101,43 @@ struct EngineData {
     bool    busAlive = false; // any frame at all -- i.e. is the ski awake
     bool    rpmValid = false;
     int32_t rpm      = 0;
+
+    // Coolant temperature, 0x102 b3.
+    //
+    // Identified by behaviour, which is why it is trusted without a gauge: over
+    // a 65 s run it climbed 62->6E one count at a time and never once stepped
+    // back, then kept climbing after shutdown. A monotonic rise while running
+    // followed by a post-shutdown rise is heat soak, and nothing else on the
+    // bus does it. Sent raw because the *scaling* is still unconfirmed -- the
+    // standard raw-40 gives a believable 58->70 C, but 0.5 C/count fits the
+    // warm-up rate about as well, and one gauge reading would settle it.
+    bool    coolantValid = false;
+    uint8_t coolantRaw   = 0;
+
+    // 0x342 b4. Previously read as *the* engine temperature; it is not. It
+    // jitters with rpm and falls after shutdown while the coolant byte rises,
+    // so it is something with far less thermal mass -- exhaust is the guess.
+    // Kept because it is still a real signal, just not the one it was labelled.
     bool    tempValid = false;
-    uint8_t tempRaw  = 0;     // 0x342 b4; scaling still unknown, sent raw
+    uint8_t tempRaw  = 0;
+
+    // iBR up/down position, 0x012 b2. A 1..9 step count, not a percentage.
+    //
+    // CONFIRMED: over two full up-and-down cycles the 32 step changes here
+    // matched the 32 command pulses on 0x408 b0 one for one, with the position
+    // trailing the command by a mean 24 ms. It reports with the engine stopped.
+    // b2 is not multiplexed -- the slots on 0x012 never disagreed about it in
+    // 200 windows -- so it can be read from any frame of this ID.
+    bool    trimValid = false;
+    uint8_t trimPos   = 0;    // 1..9, 0 means not seen
+
+    // Engine hour meter, 0x342 b6:b7 big-endian, in MINUTES.
+    //
+    // CONFIRMED: 0x16E0 = 5856 min = 97h36m, which is exactly what the dash
+    // read at the time of the capture. This is why 0x342 carries no checksum --
+    // on the seven IDs without a rolling counter, b6/b7 are payload.
+    bool     hoursValid    = false;
+    uint16_t engineMinutes = 0;
 };
 
 // Listens for `listenMs` and pulls out what the tracker reports. Cheap enough
@@ -100,17 +150,63 @@ struct EngineData {
 // ignition is off, which is the normal state for a parked ski.
 EngineData canReadEngine(uint32_t listenMs = 1000);
 
-// Captures every frame for `seconds` into RAM and then dumps it as CSV.
+// Captures frames for `seconds` into RAM and then dumps them as CSV.
+//
+// Pass `ids`/`nIds` to record only those IDs. The dump, not the capture, is the
+// bottleneck: 30 s of the whole bus is ~29,000 frames and takes about two and a
+// half minutes to print at 115200, which is long enough that it is tempting to
+// skip the capture altogether -- and skipping it loses the one record that can
+// answer a question the change watcher can only point at. Filtering to the two
+// or three IDs under investigation keeps full fidelity and makes the dump
+// short enough that there is no reason to go without it.
 //
 // Streaming at full rate is not an option: ~980 frames/s is roughly 39 kB/s of
 // text against an 11.5 kB/s serial link, so a live dump would silently drop
 // most of the bus and look like a quiet one. Buffer first, print after.
-void canRawCapture(uint32_t seconds);
+void canRawCapture(uint32_t seconds, const uint32_t* ids = nullptr, size_t nIds = 0);
 
 // Time-series watch on the IDs carrying engine data, printed several times a
 // second. Ranges say which bytes are alive; only a series says what they mean,
 // because that is what can be held against a gauge reading.
 void canWatchLoop();
+
+// Learn, then record and narrate one interaction with the vehicle.
+//
+// This is canWatchChanges() and canRawCapture() fused, because keeping them
+// apart was a trap: whichever ran first was the one recording, and the operator
+// naturally acted on the *second* prompt, so three sessions in a row narrated a
+// control being worked while the recorder had already stopped. One learn, one
+// GO, one window that both records and narrates.
+//
+// The fusion also covers the watcher's blind spot. It hides any byte that moved
+// during learning, which permanently hides both halves of a multiplexed signal
+// -- the selector alternates every frame, so the selector and the multiplexed
+// payload byte always look like noise. On this bus that hides 0x012 b1 and b4,
+// which is exactly where a signal the watcher cannot see would live. The raw
+// record has no such blind spot, so the narration is a convenience and the CSV
+// is the evidence.
+//
+// Prints the excluded bytes up front. A blind spot you can see is a lead.
+void canProbeControl(uint32_t seconds, const uint32_t* ids = nullptr,
+                     size_t nIds = 0, uint32_t learnMs = 8000);
+
+// Watches for bytes that were stable and then move, and prints only those.
+//
+// The instrument for "I am going to operate a control, tell me what changed."
+// Hunting a rider input by eye does not work: the bus is 16 IDs x 8 bytes at
+// ~980 frames/s, and a control that was never touched during a capture is
+// perfectly static, which is indistinguishable from a configuration byte.
+//
+// So it learns first. For `learnMs` it watches every byte with the vehicle
+// left alone and marks any that moves as noise -- engine signals, counters,
+// checksums, all of it, with no hardcoded list to go stale. After that it
+// reports only the bytes that held still through learning and then changed,
+// as `0xID bN: XX -> YY`. Operate one control at a time and the output is a
+// short list naming that control's bytes.
+//
+// Learning is the whole trick, so leave the machine genuinely undisturbed for
+// those seconds. Anything moving then is invisible for the rest of the run.
+void canWatchChanges(uint32_t learnMs = 8000);
 
 // Boots straight into detect-then-sniff and never returns. This is what the
 // can-sniffer build runs instead of the tracker's normal cycle.

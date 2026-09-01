@@ -19,6 +19,16 @@ struct TrackerSettings {
     // MOTION_SENS_* constants in main.cpp for the values and their margins
     // against the measured noise floor.
     uint8_t motion_sensitivity = 1;
+
+    // Verbose telemetry. Off by default: the normal frame is the bare essentials
+    // for tracking a ski, and everything else -- the CAN decodes, the IMU vector,
+    // the charger and motion internals -- rides along only when this is set.
+    //
+    // Worth knowing before turning it off and forgetting: a lean frame cannot be
+    // investigated after the fact. Whatever happened while this was false is not
+    // recoverable, because it was never sent. Leave it on while decode work is
+    // still in progress.
+    bool debug_payload = false;
 };
 
 struct TrackerStatus {
@@ -68,7 +78,8 @@ public:
     // A single byte rather than the threshold in mg, because the levels are the
     // contract: the milligram values behind them are a tuning decision that has
     // already changed twice, and an app that wrote raw thresholds would pin them.
-    static const char* MOTION_SENS_CHAR_UUID;  // beb5483e-36e1-4688-b7f5-ea07361b2051
+    static const char* MOTION_SENS_CHAR_UUID;
+    static const char* DEBUG_PAYLOAD_CHAR_UUID; // beb5483e-36e1-4688-b7f5-ea07361b2052
 
 private:
     BLEServer* pServer;
@@ -85,6 +96,7 @@ private:
     BLECharacteristic* pPassChar;
     BLECharacteristic* pIntervalChar;
     BLECharacteristic* pMotionSensChar;
+    BLECharacteristic* pDebugPayloadChar;
     
     TrackerSettings* _settings;
     std::function<void(const TrackerSettings&)> _settingsCallback;
