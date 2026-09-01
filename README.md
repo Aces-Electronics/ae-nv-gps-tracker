@@ -61,6 +61,7 @@ The tracker publishes the following data via MQTT:
   "engine_temp_raw": 140,      // 0x342 b4, raw count — scaling unknown
   "motion_sensitivity": "Medium", // Low | Medium | High -- the selected floor
   "motion_threshold_mg": 176,  // Where the adaptive ladder currently sits
+  "motion_suppressed": 0,      // Motion wakes rate-limited away since last report
   "interval": 1440
 }
 ```
@@ -266,21 +267,45 @@ The firmware uses robust satellite count parsing with fallback logic:
   8 counts — so none truncate. Worth checking when retuning: 56mg, for example,
   is not representable and would silently become 48mg, only 2× the noise floor.
 
-  **TODO — expose this to the customer.** The setting is stored in NVS
-  (`mot_sens`), carried in `TrackerSettings.motion_sensitivity`, and published
-  as `motion_sensitivity`, but **nothing writes it yet**. It still needs a BLE
-  characteristic in [`ble_handler.cpp`](src/ble_handler.cpp) alongside the
-  existing settings, and a control in the web UI. Until then it can only be
-  changed by reflashing.
+  Settable over BLE on characteristic `beb5483e-36e1-4688-b7f5-ea07361b2051`
+  (read/write, one byte: `0` Low, `1` Medium, `2` High). A write out of that
+  range is rejected rather than clamped — clamping would silently land on
+  Medium and the value read back afterwards would not be the one sent. The
+  change takes effect **immediately**, re-arming the accelerometer rather than
+  waiting for the next boot, which for a parked ski would be a day away.
 
-- **Adaptive threshold**: After a motion wake, GPS decides whether it was real.
-  A good fix showing under 2 km/h counts as unexplained; three consecutive
-  unexplained wakes raise the threshold one step (176mg steps, 1408mg ceiling)
-  from the selected floor. Genuine travel resets it to the floor immediately. A
-  wake with *no* fix changes nothing — a garage roof is not a false positive. The
-  current value is persisted in NVS and published as `motion_threshold_mg`, next
-  to `motion_sensitivity` so a false-wake report can tell what was chosen from
-  what the ski decided.
+  **TODO — web UI control.** The setting is stored in NVS (`mot_sens`), carried
+  in `TrackerSettings.motion_sensitivity`, published as `motion_sensitivity`,
+  and writable over BLE — but the web app has no control for it yet.
+
+- **Adaptive threshold**, which moves in *both* directions:
+
+  **Up.** After a motion wake, GPS arbitrates: a good fix showing under 2 km/h
+  counts as unexplained, and three consecutive unexplained wakes raise the
+  threshold one step (176mg steps, 1408mg ceiling) from the selected floor. A
+  wake with *no* fix changes nothing — a garage roof is not a false positive.
+
+  **Up, faster, on rate alone.** Motion wakes inside the 120s report limit are
+  counted rather than discarded. Ten of them between two reports raises the
+  threshold immediately, without waiting for GPS — the rate *is* the evidence,
+  and those wakes are precisely the ones that never got a fix to be judged by.
+  Previously they were invisible to this logic, which left a hole exactly where
+  it was most needed: a hull working against a mooring produces mostly
+  suppressed wakes.
+
+  **Down.** Genuine travel resets straight to the floor — that is proof the
+  tracker should be at its most sensitive, and it contradicts whatever evidence
+  built the climb. Failing that, three consecutive reports with *no* motion
+  activity at all (no wake, none suppressed) ease it down one step. Without
+  this the ladder is a ratchet, and a ski moved to a calmer berth stays deaf
+  forever — the worst failure available here, because it is self-sustaining:
+  the deafer it gets, the less likely anything crosses the threshold to say
+  otherwise, including a theft.
+
+  The current value is persisted in NVS and published as `motion_threshold_mg`,
+  next to `motion_sensitivity` so a false-wake report can tell what was chosen
+  from what the ski decided, and `motion_suppressed` so the wake rate is visible
+  at all.
 
   Changing the floor — by firmware retune or by the setting — discards a stored
   threshold derived from a different one, so a change actually reaches a unit

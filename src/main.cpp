@@ -256,6 +256,36 @@ static const float STATIONARY_SPEED_KMH = 2.0f;
 
 RTC_DATA_ATTR static int s_falseWakeCount = 0;
 
+// Motion wakes that were rate-limited away before they could report.
+//
+// These used to be invisible to the ladder, which left a hole exactly where it
+// was most needed: a hull working against a mooring wakes the board over and
+// over, and every wake inside MOTION_MIN_REPORT_S bails out before
+// updateMotionThreshold() ever runs. The threshold could only climb on the
+// occasional wake that happened to fall outside the window, while the cheap
+// ones -- the actual evidence that the threshold is too low -- were discarded.
+//
+// They are cheap, not free: each is a boot, an IMU bring-up and a sleep.
+RTC_DATA_ATTR static int s_suppressedWakes = 0;
+
+// Reports in a row with no motion activity at all. Drives the climb back down.
+RTC_DATA_ATTR static int s_quietReports = 0;
+
+// A rate this high is the environment talking, not a one-off. At best a
+// suppressed wake costs a couple of hundred milliseconds, so ten of them between
+// reports is a tracker being triggered continuously -- which is evidence about
+// the threshold no GPS fix is needed to interpret.
+static const int SUPPRESSED_WAKES_BEFORE_RAISE = 10;
+
+// Quiet reports before the threshold steps back down.
+//
+// Without this the ladder is a ratchet: it only ever descends on confirmed
+// travel, so a ski moved to a calmer berth, or one whose conditions simply
+// settle, keeps a raised threshold indefinitely. That is the worst failure this
+// logic can have, because it is self-sustaining -- the deafer it gets, the less
+// likely anything crosses the threshold to tell it otherwise, including a theft.
+static const int QUIET_REPORTS_BEFORE_LOWER = 3;
+
 // Counts passes of the deep-sleep wake test so it can alternate the pad holds
 // across sleeps instead of needing two builds.
 RTC_DATA_ATTR static int s_sleepTestPass = 0;
@@ -296,6 +326,35 @@ static uint16_t loadMotionThreshold() {
     return v;
 }
 
+// Applies a sensitivity change made while the tracker is already running.
+//
+// The BLE window opens well after loadMotionThreshold() has chosen a floor and
+// imuEnableMotionWake() has armed the part, so without this a change would sit
+// in NVS doing nothing until the next boot -- and the next boot, for a parked
+// ski, is a day away. Somebody who has just turned the sensitivity up expects
+// the next nudge to wake it, not tomorrow's.
+//
+// Resets the ladder to the new floor rather than carrying the old position
+// across: the climb is evidence gathered against the previous floor, and it
+// does not transfer to a different one.
+static void applyMotionSensitivity(uint8_t sens) {
+    const uint16_t base = motionBaseFor(sens);
+    if (base == g_motionBaseMg) return;
+
+    Serial.printf("[Motion] Sensitivity now %s: floor %u -> %umg, re-arming.\n",
+                  motionSensitivityName(sens), g_motionBaseMg, base);
+    g_motionBaseMg = base;
+    g_motionThresholdMg = base;
+    s_falseWakeCount = 0;
+
+    prefs.begin("tracker", false);
+    prefs.putUShort("mot_thr", g_motionThresholdMg);
+    prefs.putUShort("mot_base", g_motionBaseMg);
+    prefs.end();
+
+    imuEnableMotionWake(g_motionThresholdMg);
+}
+
 static void saveMotionThreshold(uint16_t mg) {
     prefs.begin("tracker", false);
     prefs.putUShort("mot_thr", mg);
@@ -318,8 +377,76 @@ static const char* wakeReasonName() {
 // Run once per wake, after the GPS attempt, and only for wakes that came from
 // the accelerometer. GPS is the arbiter: a good fix showing no speed means the
 // interrupt was not a ski going anywhere.
+// Steps the threshold one rung, in either direction, and re-arms the part.
+// Returns false when it is already at the end of the ladder.
+static bool stepMotionThreshold(bool up) {
+    uint16_t next;
+    if (up) {
+        if (g_motionThresholdMg >= MOTION_THRESHOLD_MAX_MG) {
+            Serial.printf("[Motion] Already at the %umg ceiling; not going deafer than this.\n",
+                          MOTION_THRESHOLD_MAX_MG);
+            return false;
+        }
+        next = g_motionThresholdMg + MOTION_THRESHOLD_STEP_MG;
+        if (next > MOTION_THRESHOLD_MAX_MG) next = MOTION_THRESHOLD_MAX_MG;
+    } else {
+        if (g_motionThresholdMg <= g_motionBaseMg) return false;
+        next = (g_motionThresholdMg > g_motionBaseMg + MOTION_THRESHOLD_STEP_MG)
+                 ? (uint16_t)(g_motionThresholdMg - MOTION_THRESHOLD_STEP_MG)
+                 : g_motionBaseMg;
+    }
+
+    Serial.printf("[Motion] Threshold %s: %u -> %umg\n",
+                  up ? "raised" : "lowered", g_motionThresholdMg, next);
+    g_motionThresholdMg = next;
+    saveMotionThreshold(g_motionThresholdMg);
+    // Re-arm now: the level in the part is whatever was set at boot, and the new
+    // one has to be in place before the next sleep.
+    imuEnableMotionWake(g_motionThresholdMg);
+    return true;
+}
+
 static void updateMotionThreshold(bool gotFix, float speedKmh) {
-    if (!wokeOnMotion()) return;
+    const int suppressed = s_suppressedWakes;
+    s_suppressedWakes = 0;
+
+    if (!wokeOnMotion()) {
+        // A scheduled report. If nothing has tripped the accelerometer since the
+        // last one -- neither a wake that reported nor one that was rate-limited
+        // away -- then whatever raised the threshold has stopped happening, and
+        // holding a raised one costs sensitivity for no reason.
+        if (suppressed > 0) {
+            s_quietReports = 0;
+            Serial.printf("[Motion] %d suppressed wake(s) since the last report; not a quiet period.\n",
+                          suppressed);
+            return;
+        }
+        if (g_motionThresholdMg <= g_motionBaseMg) return;
+
+        if (++s_quietReports < QUIET_REPORTS_BEFORE_LOWER) {
+            Serial.printf("[Motion] Quiet report %d/%d at %umg.\n",
+                          s_quietReports, QUIET_REPORTS_BEFORE_LOWER, g_motionThresholdMg);
+            return;
+        }
+        s_quietReports = 0;
+        Serial.println("[Motion] Quiet for a while -- easing back toward the floor.");
+        stepMotionThreshold(false);
+        return;
+    }
+
+    s_quietReports = 0;
+
+    // The rate is its own evidence, and it does not need GPS to interpret: this
+    // many wakes between two reports means something is tripping the threshold
+    // continuously. Checked before the fix test on purpose, because the wakes it
+    // counts are exactly the ones that never got a fix to be judged by.
+    if (suppressed >= SUPPRESSED_WAKES_BEFORE_RAISE) {
+        Serial.printf("[Motion] %d suppressed wakes since the last report -- threshold is too low.\n",
+                      suppressed);
+        s_falseWakeCount = 0;
+        stepMotionThreshold(true);
+        return;
+    }
 
     if (!gotFix) {
         // No fix is not evidence. Raising the threshold on a wake that could not
@@ -332,6 +459,9 @@ static void updateMotionThreshold(bool gotFix, float speedKmh) {
     if (speedKmh >= STATIONARY_SPEED_KMH) {
         s_falseWakeCount = 0;
         if (g_motionThresholdMg != g_motionBaseMg) {
+            // All the way down, not one rung: travel is proof the tracker should
+            // be at its most sensitive, and the climb was built on evidence that
+            // has just been contradicted outright.
             Serial.printf("[Motion] Real travel at %.1f km/h -> threshold back to %umg\n",
                           speedKmh, g_motionBaseMg);
             g_motionThresholdMg = g_motionBaseMg;
@@ -347,21 +477,7 @@ static void updateMotionThreshold(bool gotFix, float speedKmh) {
 
     if (s_falseWakeCount < FALSE_WAKES_BEFORE_RAISE) return;
     s_falseWakeCount = 0;
-
-    if (g_motionThresholdMg >= MOTION_THRESHOLD_MAX_MG) {
-        Serial.printf("[Motion] Already at the %umg ceiling; not going deafer than this.\n",
-                      MOTION_THRESHOLD_MAX_MG);
-        return;
-    }
-
-    uint16_t next = g_motionThresholdMg + MOTION_THRESHOLD_STEP_MG;
-    if (next > MOTION_THRESHOLD_MAX_MG) next = MOTION_THRESHOLD_MAX_MG;
-    g_motionThresholdMg = next;
-    saveMotionThreshold(g_motionThresholdMg);
-    // Re-arm now: the level in the part is whatever was set at boot, and the
-    // new one has to be in place before the next sleep.
-    imuEnableMotionWake(g_motionThresholdMg);
-    Serial.printf("[Motion] Threshold raised to %umg\n", g_motionThresholdMg);
+    stepMotionThreshold(true);
 }
 
 // Arms the wake sources and goes. Shared by the end-of-cycle path and by the
@@ -607,6 +723,9 @@ void runBLEWindow(unsigned long duration_ms) {
     ble.setSettingsCallback([](const TrackerSettings& s) {
         settings = s;
         saveSettings();
+        // Takes effect now rather than at the next boot, which for a parked ski
+        // would be a day away.
+        applyMotionSensitivity(settings.motion_sensitivity);
         Serial.println("[BLE] Settings Updated!");
     });
     
@@ -899,6 +1018,12 @@ void transmitData(bool has_fix, float lat, float lon, float speed, float alt, in
             // ski decided, and a support question about false wakes needs to
             // tell them apart.
             doc["motion_sensitivity"] = motionSensitivityName(settings.motion_sensitivity);
+            // Wakes since the last report that were rate-limited away. Published
+            // because it is the one number that explains a tracker reporting
+            // often, or a battery going down faster than the interval suggests,
+            // and it is invisible from the reports themselves. Read before
+            // updateMotionThreshold() clears it -- transmitData() runs first.
+            doc["motion_suppressed"] = s_suppressedWakes;
 
             int csq = modem.getSignalQuality();
             int dbm = (csq == 99) ? -113 : (csq * 2) - 113;
@@ -1357,8 +1482,12 @@ void setup() {
     if (wokeOnMotion()) {
         time_t since = time(NULL) - s_lastReportTime;
         if (since < MOTION_MIN_REPORT_S) {
-            Serial.printf("[Motion] Wake %llds after last report (min %llds) - back to sleep.\n",
-                          (long long)since, (long long)MOTION_MIN_REPORT_S);
+            // Counted before sleeping, because this wake is evidence even though
+            // it is not worth a report: the ladder needs to know how often the
+            // threshold is being tripped, not just how often it reports.
+            s_suppressedWakes++;
+            Serial.printf("[Motion] Wake %llds after last report (min %llds) - back to sleep. (%d suppressed)\n",
+                          (long long)since, (long long)MOTION_MIN_REPORT_S, s_suppressedWakes);
             enterDeepSleep(settings.report_interval_mins);
         }
         Serial.printf("[Motion] Wake %llds after last report - reporting.\n", (long long)since);

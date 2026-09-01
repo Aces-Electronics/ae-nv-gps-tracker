@@ -64,6 +64,12 @@ public:
     static const char* APN_CHAR_UUID;          // ae000101...
     static const char* INTERVAL_CHAR_UUID;     // beb5483e-36e1-4688-b7f5-ea07361b2050
 
+    // Wake-on-motion sensitivity, one byte: 0 = Low, 1 = Medium, 2 = High.
+    // A single byte rather than the threshold in mg, because the levels are the
+    // contract: the milligram values behind them are a tuning decision that has
+    // already changed twice, and an app that wrote raw thresholds would pin them.
+    static const char* MOTION_SENS_CHAR_UUID;  // beb5483e-36e1-4688-b7f5-ea07361b2051
+
 private:
     BLEServer* pServer;
     BLEService* pService;
@@ -78,6 +84,7 @@ private:
     BLECharacteristic* pUserChar;
     BLECharacteristic* pPassChar;
     BLECharacteristic* pIntervalChar;
+    BLECharacteristic* pMotionSensChar;
     
     TrackerSettings* _settings;
     std::function<void(const TrackerSettings&)> _settingsCallback;
