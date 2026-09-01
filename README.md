@@ -60,7 +60,7 @@ The tracker publishes the following data via MQTT:
   "rpm": 1455,                 // Omitted unless engine_bus
   "engine_temp_raw": 140,      // 0x342 b4, raw count — scaling unknown
   "motion_sensitivity": "Medium", // Low | Medium | High -- the selected floor
-  "motion_threshold_mg": 112,  // Where the adaptive ladder currently sits
+  "motion_threshold_mg": 176,  // Where the adaptive ladder currently sits
   "interval": 1440
 }
 ```
@@ -258,14 +258,13 @@ The firmware uses robust satellite count parsing with fallback logic:
 
   | Level | Floor | Margin | For |
   |---|---|---|---|
-  | Low | 352mg | ~15× noise | Takes a deliberate shove; a ski somewhere lively |
-  | **Medium** | **112mg** | ~4.7× noise | **Default.** Registers ordinary handling |
+  | Low | 704mg | ~29× noise | A real knock; a ski somewhere lively, where less would report the weather |
+  | **Medium** | **176mg** | ~7.3× noise | **Default.** Registers ordinary handling |
   | High | 64mg | ~2.7× noise | A quiet mooring, where a nudge should count |
 
-  High is 64mg rather than the ~56mg it sits near because `INT1_THS` has a 16mg
-  step at ±2g: 56 is not on that grid and would truncate to 48mg, only 2× the
-  noise floor and closer to chasing the filter's own residue than detecting
-  anything.
+  All three sit exactly on the `INT1_THS` grid (16mg steps at ±2g) — 44, 11 and
+  4 counts — so none truncate. Worth checking when retuning: 56mg, for example,
+  is not representable and would silently become 48mg, only 2× the noise floor.
 
   **TODO — expose this to the customer.** The setting is stored in NVS
   (`mot_sens`), carried in `TrackerSettings.motion_sensitivity`, and published
