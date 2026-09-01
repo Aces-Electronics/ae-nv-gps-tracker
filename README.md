@@ -258,12 +258,12 @@ The firmware uses robust satellite count parsing with fallback logic:
 
   | Level | Floor | Margin | For |
   |---|---|---|---|
-  | Low | 704mg | ~29× noise | A real knock; a ski somewhere lively, where less would report the weather |
+  | Low | 352mg | ~15× noise | A deliberate shove; a ski somewhere lively, where less would report the weather |
   | **Medium** | **176mg** | ~7.3× noise | **Default.** Registers ordinary handling |
-  | High | 64mg | ~2.7× noise | A quiet mooring, where a nudge should count |
+  | High | 128mg | ~5.3× noise | A quiet mooring, where a nudge should count |
 
-  All three sit exactly on the `INT1_THS` grid (16mg steps at ±2g) — 44, 11 and
-  4 counts — so none truncate. Worth checking when retuning: 56mg, for example,
+  All three sit exactly on the `INT1_THS` grid (16mg steps at ±2g) — 22, 11 and
+  8 counts — so none truncate. Worth checking when retuning: 56mg, for example,
   is not representable and would silently become 48mg, only 2× the noise floor.
 
   **TODO — expose this to the customer.** The setting is stored in NVS

@@ -78,19 +78,19 @@ const char* firmwareVersion() {
 // starts. Chosen against a measured noise floor of 24mg (high-pass filter
 // settled, board at rest), so the margins are known rather than guessed:
 //
-//   Low    704mg  ~29x noise  -- a real knock. For a ski somewhere lively, where
-//                               anything less would report the weather.
+//   Low    352mg  ~15x noise  -- takes a deliberate shove. For a ski somewhere
+//                               lively, where less would report the weather.
 //   Medium 176mg  ~7.3x noise -- the default. Registers ordinary handling.
-//   High    64mg  ~2.7x noise -- for a quiet mooring where a nudge should count.
+//   High   128mg  ~5.3x noise -- for a quiet mooring where a nudge should count.
 //
-// All three sit exactly on the INT1_THS grid (16mg steps at +/-2g): 44, 11 and 4
+// All three sit exactly on the INT1_THS grid (16mg steps at +/-2g): 22, 11 and 8
 // counts, so none of them truncate. That is worth checking when retuning -- 56mg,
 // for instance, is not representable and would silently become 48mg, only 2x the
 // noise floor and closer to chasing the filter's own residue than detecting
 // anything.
-static const uint16_t MOTION_SENS_LOW_MG    = 704;
+static const uint16_t MOTION_SENS_LOW_MG    = 352;
 static const uint16_t MOTION_SENS_MEDIUM_MG = 176;
-static const uint16_t MOTION_SENS_HIGH_MG   = 64;
+static const uint16_t MOTION_SENS_HIGH_MG   = 128;
 
 enum MotionSensitivity : uint8_t {
     MOTION_SENS_LOW = 0,
