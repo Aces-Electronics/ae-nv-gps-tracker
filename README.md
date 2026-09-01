@@ -59,7 +59,8 @@ The tracker publishes the following data via MQTT:
   "ski_running": true,         // Drives the reporting cadence
   "rpm": 1455,                 // Omitted unless engine_bus
   "engine_temp_raw": 140,      // 0x342 b4, raw count — scaling unknown
-  "motion_threshold_mg": 352,  // Current adaptive wake threshold
+  "motion_sensitivity": "Medium", // Low | Medium | High -- the selected floor
+  "motion_threshold_mg": 112,  // Where the adaptive ladder currently sits
   "interval": 1440
 }
 ```
@@ -249,12 +250,53 @@ The firmware uses robust satellite count parsing with fallback logic:
   missed wake otherwise only raises. (It should always survive: the daughter
   board's 3V3 is J4.1 = AXP2101 DCDC1, the same rail that keeps the ESP32's own
   RTC domain alive. Nothing in this firmware touches DCDC1.)
+- **Motion sensitivity**: three selectable levels, each setting the **floor** of
+  the adaptive ladder rather than a fixed threshold — the ski still finds its own
+  level from wherever it starts. Values are chosen against a *measured* noise
+  floor of 24mg (high-pass filter settled, board at rest), so the margins are
+  known rather than guessed:
+
+  | Level | Floor | Margin | For |
+  |---|---|---|---|
+  | Low | 352mg | ~15× noise | Takes a deliberate shove; a ski somewhere lively |
+  | **Medium** | **112mg** | ~4.7× noise | **Default.** Registers ordinary handling |
+  | High | 64mg | ~2.7× noise | A quiet mooring, where a nudge should count |
+
+  High is 64mg rather than the ~56mg it sits near because `INT1_THS` has a 16mg
+  step at ±2g: 56 is not on that grid and would truncate to 48mg, only 2× the
+  noise floor and closer to chasing the filter's own residue than detecting
+  anything.
+
+  **TODO — expose this to the customer.** The setting is stored in NVS
+  (`mot_sens`), carried in `TrackerSettings.motion_sensitivity`, and published
+  as `motion_sensitivity`, but **nothing writes it yet**. It still needs a BLE
+  characteristic in [`ble_handler.cpp`](src/ble_handler.cpp) alongside the
+  existing settings, and a control in the web UI. Until then it can only be
+  changed by reflashing.
+
 - **Adaptive threshold**: After a motion wake, GPS decides whether it was real.
   A good fix showing under 2 km/h counts as unexplained; three consecutive
-  unexplained wakes raise the threshold one step (352mg base, 176mg steps,
-  1408mg ceiling). Genuine travel resets it to the floor immediately. A wake
-  with *no* fix changes nothing — a garage roof is not a false positive. The
-  current value is persisted in NVS and published as `motion_threshold_mg`.
+  unexplained wakes raise the threshold one step (176mg steps, 1408mg ceiling)
+  from the selected floor. Genuine travel resets it to the floor immediately. A
+  wake with *no* fix changes nothing — a garage roof is not a false positive. The
+  current value is persisted in NVS and published as `motion_threshold_mg`, next
+  to `motion_sensitivity` so a false-wake report can tell what was chosen from
+  what the ski decided.
+
+  Changing the floor — by firmware retune or by the setting — discards a stored
+  threshold derived from a different one, so a change actually reaches a unit
+  that already has a value saved.
+
+- **Wake LED**: the AXP2101 charge LED is lit while awake and switched off
+  immediately before every deep sleep, so a dark unit is a sleeping one. A
+  **4Hz blink instead of steady means the wake came from the accelerometer**,
+  which is the only way to tell a motion wake from a timer wake on battery,
+  where there is no serial port. Note this takes the LED away from the charger's
+  own control; charge state is reported over MQTT instead.
+
+  (`NEOPIXEL_PIN` in [`utilities.h`](src/utilities.h) is inherited from other S3
+  boards and drives nothing — this board has no addressable RGB LED. The
+  remaining `strip` calls in `main.cpp` are dead code.)
 
 No migration is needed for already-provisioned trackers: a stored 5-minute
 interval now describes the *running* case, which is what it was always for.

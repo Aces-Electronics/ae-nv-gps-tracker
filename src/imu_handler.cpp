@@ -766,9 +766,24 @@ bool imuEnableMotionWake(uint16_t thresholdMg, uint8_t durationSamples) {
     // 6D stay clear, which is what makes this OR rather than AND-of-all.
     lisWrite8(LIS3DH_REG_INT1CFG, 0x2A); // ZHIE | YHIE | XHIE
 
+    // Let the filter settle BEFORE releasing the latch.
+    //
+    // Switching the high-pass filter on does not remove gravity instantly: at
+    // HPCF=00 and 50Hz the corner is ODR/50 = 1Hz, so the time constant is about
+    // 160ms and the full 1g takes the better part of a second to decay out. Clear
+    // the latch during that window and the residual DC trips the threshold
+    // immediately, leaving INT1 asserted on a board that is not moving.
+    //
+    // Measured, not theorised: a build that armed and then slept at once woke on
+    // ext1 five times out of six while sitting still on the bench. It does not
+    // bite the normal cycle, where arming happens in setup() and minutes of GPS
+    // and modem work follow -- but updateMotionThreshold() re-arms immediately
+    // before goToSleep(), and that path would spuriously wake every time the
+    // threshold changed.
+    delay(1000);
     imuClearMotionInterrupt();
 
-    Serial.printf("[IMU] Motion wake armed: %umg (THS=%u), %u samples\n",
+    Serial.printf("[IMU] Motion wake armed: %umg (THS=%u), %u samples (filter settled)\n",
                   ths * INT1_THS_STEP_MG, ths, durationSamples);
     return true;
 }

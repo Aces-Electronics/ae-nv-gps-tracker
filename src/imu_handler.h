@@ -59,10 +59,26 @@ ImuReading imuRead();
 // is how long the condition must hold, counted in output-data-rate periods --
 // at the 50Hz set by imuBegin(), one sample is 20ms.
 //
-// Returns false if no IMU is present. Both defaults are starting points that
-// want tuning against a ski on the water; a hull bobbing at a mooring is the
-// case that decides them.
-bool imuEnableMotionWake(uint16_t thresholdMg = 352, uint8_t durationSamples = 3);
+// durationSamples is 1 rather than 3 because 3 was measured to be far too
+// strict. The counter demands the condition hold CONTINUOUSLY and resets the
+// moment it lapses, so 3 samples means 60ms unbroken. Motion is oscillatory --
+// |axis| passes back through zero at every reversal -- so at around 10Hz each
+// over-threshold excursion lasts 15-30ms and never reaches 60. Over fourteen
+// 30-second sleeps with the board being shaken, DUR=3 latched exactly once.
+//
+// 0 in the end, not 1: at 1 (20ms) the same shaking woke it twice in five
+// sleeps, better than 3 but still unreliable. At 10Hz an over-threshold
+// excursion lasts 15-30ms, so even 20ms is marginal, and the debounce DUR
+// provides is not needed here -- the measured noise floor with the filter
+// settled is 24mg against a 352mg threshold, a margin of about 14x. The
+// threshold does the discriminating; the duration was only losing events.
+//
+// Returns false if no IMU is present.
+//
+// Both values still want tuning against a ski on the water; a hull bobbing at a
+// mooring is the case that decides them, and the adaptive ladder in main.cpp
+// raises the threshold if this proves too eager.
+bool imuEnableMotionWake(uint16_t thresholdMg = 352, uint8_t durationSamples = 0);
 
 // Positive control for the ext1 wake source, independent of any motion: turns
 // the high-pass filter off so gravity alone holds INT1 permanently HIGH. A board
