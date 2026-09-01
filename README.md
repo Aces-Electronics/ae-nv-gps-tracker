@@ -38,7 +38,8 @@ The tracker publishes the following data via MQTT:
 {
   "mac": "860016043157614",
   "model": "ae-sim7080g-tracker",
-  "lat": -28.02575,
+  "fix": true,               // Did this wake get a GPS fix at all
+  "lat": -28.02575,          // lat/lon/alt/speed/sats/hdop are omitted if !fix
   "lon": 153.3879,
   "alt": -11.981,
   "speed": 0,
@@ -58,7 +59,8 @@ The tracker publishes the following data via MQTT:
   "ski_running": true,         // Drives the reporting cadence
   "rpm": 1455,                 // Omitted unless engine_bus
   "engine_temp_raw": 140,      // 0x342 b4, raw count — scaling unknown
-  "motion_threshold_mg": 352,  // Current adaptive wake threshold
+  "motion_sensitivity": "Medium", // Low | Medium | High -- the selected floor
+  "motion_threshold_mg": 176,  // Where the adaptive ladder currently sits
   "interval": 1440
 }
 ```
@@ -201,6 +203,19 @@ The firmware uses robust satellite count parsing with fallback logic:
 
 - **Active Mode**: GPS acquisition + MQTT publish
 - **BLE Window**: 90 seconds on boot for configuration
+- **Charge cutoff**: the jetski feed is cut above **4.10V** and restored below
+  **3.70V**, decided at report time against the PMU's battery reading and
+  latched across sleep in RTC memory.
+
+  4.10V sits *below* the BQ25176J's 4.2V regulation point, so the firmware —
+  not the charger — is what ends a charge, opening the switch on the way up
+  before the cell is ever held at full. The wide gap down to 3.70V is what makes
+  that worth doing: a LiPo ages fastest sitting at full charge, so the pair
+  cycles the cell through roughly 3.7–4.1 rather than floating it at 4.2. With
+  only a sleeping tracker as a load, one traverse of that band takes a long time,
+  so it costs very few cycles to buy. Both thresholds read the AXP2101's *cell*
+  voltage — the jetski's own voltage is not available to decide on until the
+  supply-sense divider is reworked.
 - **Deep Sleep**: Cadence follows the ski, not the clock.
   - **Running** (CAN bus awake) → the configured `report_interval_mins`,
     5 minutes by default, settable over BLE. GPS-failure backoff applies
@@ -216,12 +231,71 @@ The firmware uses robust satellite count parsing with fallback logic:
 - **Wake on motion**: The LIS3DH interrupt is an `ext1` deep-sleep wake source.
   Motion reports are rate-limited to one per 120s, checked before the modem is
   powered, so a suppressed wake costs ~200ms rather than a GPS acquisition.
+
+  **Tapping the board will not wake it, and that is the design.** `INT1_DURATION`
+  is counted in ODR periods, so the default three samples at 50Hz require 60ms
+  of *continuous* over-threshold motion, and normal mode band-limits to roughly
+  ODR/2 = 25Hz before the comparator sees anything. A finger tap is a few
+  milliseconds of mostly high-frequency energy — filtered down, and over long
+  before the duration counter arrives. Shake the board instead.
+
+  To check the path live rather than by waiting out a sleep cycle, the
+  `db-bench` build watches INT1 for 15 seconds on startup and prints every
+  latched event with the axes that caused it.
+
+  On every wake from sleep the firmware reads the LIS3DH's interrupt block back
+  *before* re-arming it and says whether it survived. Those registers are
+  volatile, so retained values prove the part held its 3.3V rail through the
+  sleep and reset defaults prove it did not — which settles the question a
+  missed wake otherwise only raises. (It should always survive: the daughter
+  board's 3V3 is J4.1 = AXP2101 DCDC1, the same rail that keeps the ESP32's own
+  RTC domain alive. Nothing in this firmware touches DCDC1.)
+- **Motion sensitivity**: three selectable levels, each setting the **floor** of
+  the adaptive ladder rather than a fixed threshold — the ski still finds its own
+  level from wherever it starts. Values are chosen against a *measured* noise
+  floor of 24mg (high-pass filter settled, board at rest), so the margins are
+  known rather than guessed:
+
+  | Level | Floor | Margin | For |
+  |---|---|---|---|
+  | Low | 352mg | ~15× noise | A deliberate shove; a ski somewhere lively, where less would report the weather |
+  | **Medium** | **176mg** | ~7.3× noise | **Default.** Registers ordinary handling |
+  | High | 128mg | ~5.3× noise | A quiet mooring, where a nudge should count |
+
+  All three sit exactly on the `INT1_THS` grid (16mg steps at ±2g) — 22, 11 and
+  8 counts — so none truncate. Worth checking when retuning: 56mg, for example,
+  is not representable and would silently become 48mg, only 2× the noise floor.
+
+  **TODO — expose this to the customer.** The setting is stored in NVS
+  (`mot_sens`), carried in `TrackerSettings.motion_sensitivity`, and published
+  as `motion_sensitivity`, but **nothing writes it yet**. It still needs a BLE
+  characteristic in [`ble_handler.cpp`](src/ble_handler.cpp) alongside the
+  existing settings, and a control in the web UI. Until then it can only be
+  changed by reflashing.
+
 - **Adaptive threshold**: After a motion wake, GPS decides whether it was real.
   A good fix showing under 2 km/h counts as unexplained; three consecutive
-  unexplained wakes raise the threshold one step (352mg base, 176mg steps,
-  1408mg ceiling). Genuine travel resets it to the floor immediately. A wake
-  with *no* fix changes nothing — a garage roof is not a false positive. The
-  current value is persisted in NVS and published as `motion_threshold_mg`.
+  unexplained wakes raise the threshold one step (176mg steps, 1408mg ceiling)
+  from the selected floor. Genuine travel resets it to the floor immediately. A
+  wake with *no* fix changes nothing — a garage roof is not a false positive. The
+  current value is persisted in NVS and published as `motion_threshold_mg`, next
+  to `motion_sensitivity` so a false-wake report can tell what was chosen from
+  what the ski decided.
+
+  Changing the floor — by firmware retune or by the setting — discards a stored
+  threshold derived from a different one, so a change actually reaches a unit
+  that already has a value saved.
+
+- **Wake LED**: the AXP2101 charge LED is lit while awake and switched off
+  immediately before every deep sleep, so a dark unit is a sleeping one. A
+  **4Hz blink instead of steady means the wake came from the accelerometer**,
+  which is the only way to tell a motion wake from a timer wake on battery,
+  where there is no serial port. Note this takes the LED away from the charger's
+  own control; charge state is reported over MQTT instead.
+
+  (`NEOPIXEL_PIN` in [`utilities.h`](src/utilities.h) is inherited from other S3
+  boards and drives nothing — this board has no addressable RGB LED. The
+  remaining `strip` calls in `main.cpp` are dead code.)
 
 No migration is needed for already-provisioned trackers: a stored 5-minute
 interval now describes the *running* case, which is what it was always for.

@@ -4,6 +4,8 @@
 #include <Adafruit_LIS3DH.h>
 #include <Adafruit_Sensor.h>
 #include "driver/gpio.h"
+#include "driver/rtc_io.h"
+#include "esp_sleep.h"
 
 // The AXP2101 owns Wire (I2C_SDA/I2C_SCL). The daughter board lands the LIS3DH
 // on a different pin pair entirely -- see the J4 map in utilities.h -- so this
@@ -12,6 +14,16 @@ static Adafruit_LIS3DH lis(&Wire1);
 
 static bool    s_present = false;
 static uint8_t s_addr    = 0;
+
+// Captured by reportRetainedConfig() on a wake, before anything in this file
+// writes to the interrupt block. 0xFF means "not captured this boot".
+//
+// These exist because the evidence is destroyed almost immediately: imuBegin()
+// runs imuEnableMotionWake(), which calls imuClearMotionInterrupt(), and reading
+// INT1_SRC is exactly what releases the latch. By the time any caller thinks to
+// ask, the answer is gone. So it is taken once, early, and kept.
+static uint8_t s_wakeSrc = 0xFF;
+static uint8_t s_wakeCfg = 0xFF;
 
 // Gravity is 1g, so 0.7g is a 45-degree cone around each pole. Outside both
 // cones the board is closer to edge-on than to either face.
@@ -56,6 +68,8 @@ static const int SAMPLE_DELAY_MS = 20;
 // So a single silent attempt is not evidence of absence. Retry before
 // concluding anything.
 static bool i2cAck(uint8_t addr);
+static uint8_t lisRead8(uint8_t reg);
+static void reportRetainedConfig();
 static bool i2cAckRetry(uint8_t addr, int attempts = 4) {
     for (int i = 0; i < attempts; i++) {
         if (i2cAck(addr)) return true;
@@ -279,8 +293,18 @@ bool imuBegin() {
         return false;
     }
 
+    // Before lis.begin(), because Adafruit's begin() writes CTRL1, CTRL3 and
+    // CTRL4 on its way past -- and CTRL3 is one of the registers that carries
+    // the answer. s_addr is set early only so lisRead8() has an address; the
+    // real assignment still happens below, once the part has identified itself.
+    s_addr = found;
+    if (esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_UNDEFINED) {
+        reportRetainedConfig();
+    }
+
     if (!lis.begin(found)) {
         Serial.printf("[IMU] 0x%02X ACKed but is not a LIS3DH (WHO_AM_I mismatch)\n", found);
+        s_addr = 0; // imuAddress() promises 0 when nothing was found
         return false;
     }
 
@@ -302,6 +326,9 @@ bool imuPresent() {
 uint8_t imuAddress() {
     return s_addr;
 }
+
+uint8_t imuWakeSrc() { return s_wakeSrc; }
+uint8_t imuWakeCfg() { return s_wakeCfg; }
 
 ImuReading imuRead() {
     ImuReading r;
@@ -374,6 +401,349 @@ static uint8_t lisRead8(uint8_t reg) {
 // At +/-2g the INT1_THS step is 16mg.
 static const uint16_t INT1_THS_STEP_MG = 16;
 
+// Did the LIS3DH keep its power through deep sleep?
+//
+// The argument says it must: the daughter board's 3.3V arrives on J4.1, which
+// is the LilyGo header's 3V3 = AXP2101 DCDC1 -- the same rail that keeps the
+// S3's own RTC domain alive while it sleeps. Nothing in this firmware touches
+// DCDC1; modemPowerOff() disables DC3 and BLDO2 only. A rail the ESP32 needs to
+// wake up at all cannot be off while it is asleep.
+//
+// But that is an argument, and "the accelerometer must have been unpowered" is
+// a cheap conclusion to reach when a wake does not happen. These registers
+// settle it as a measurement. They are volatile and they are not battery
+// backed, so a part that lost its rail answers with reset defaults (all zero),
+// and a part that did not answers with exactly what imuEnableMotionWake() wrote
+// before the sleep. There is no third reading that means "powered but idle".
+//
+// Only meaningful on a wake from sleep. On a cold boot the defaults are the
+// truthful answer and say nothing about the rail, which is why the caller
+// checks the wake cause first.
+static void reportRetainedConfig() {
+    // After an ext1 wake the pad is still routed to the RTC IO mux, so the
+    // digital GPIO the Arduino API reads is not what the pin is actually doing.
+    // Handing it back first is what makes the level below a real measurement.
+    rtc_gpio_deinit((gpio_num_t)DB_IMU_INT1);
+    pinMode(DB_IMU_INT1, INPUT);
+
+    const uint8_t c2  = lisRead8(LIS3DH_REG_CTRL2);
+    const uint8_t c3  = lisRead8(LIS3DH_REG_CTRL3);
+    const uint8_t c5  = lisRead8(LIS3DH_REG_CTRL5);
+    const uint8_t cfg = lisRead8(LIS3DH_REG_INT1CFG);
+    const uint8_t ths = lisRead8(LIS3DH_REG_INT1THS);
+    const uint8_t dur = lisRead8(LIS3DH_REG_INT1DUR);
+    const int     pin = digitalRead(DB_IMU_INT1);
+
+    // Read last on purpose: reading INT1_SRC is what releases the latch, so
+    // taking it earlier would clear the evidence the line above is reporting.
+    const uint8_t src = lisRead8(LIS3DH_REG_INT1SRC);
+
+    s_wakeSrc = src;
+    s_wakeCfg = cfg;
+
+    Serial.printf("[IMU] Retained: CTRL2=0x%02X CTRL3=0x%02X CTRL5=0x%02X INT1_CFG=0x%02X "
+                  "THS=%u DUR=%u SRC=0x%02X  INT1 pin=%s\n",
+                  c2, c3, c5, cfg, ths, dur, src, pin ? "HIGH" : "low");
+
+    const bool armed = (cfg == 0x2A && c3 == 0x40 && c5 == 0x08);
+    const bool blank = (cfg == 0x00 && c3 == 0x00 && c5 == 0x00 && ths == 0x00);
+
+    if (armed) {
+        Serial.printf("[IMU]   -> config survived the sleep, so the part held its 3.3V rail. "
+                      "It was armed at %umg over %u samples (%ums).\n",
+                      ths * INT1_THS_STEP_MG, dur, dur * 20);
+        // IA is the interrupt-active flag; the low six bits say which axis and
+        // direction. Set means this part did fire, whether or not that is what
+        // ended the sleep.
+        if (src & 0x40) Serial.printf("[IMU]   -> IA set: it latched a motion event (axes 0x%02X).\n", src & 0x3F);
+        else            Serial.println("[IMU]   -> IA clear: it never saw motion past the threshold.");
+    } else if (blank) {
+        Serial.println("[IMU]   -> reset defaults: the part power-cycled during sleep, so nothing was armed.");
+        Serial.println("[IMU]      That would be a real rail fault -- 3V3 on J4.1 should not drop while the S3 sleeps.");
+    } else {
+        Serial.println("[IMU]   -> neither armed nor blank: something else has written the interrupt block.");
+    }
+}
+
+// One configuration, applied and then asked whether it fires, with the part
+// left exactly as it is. Returns the IA flag; pinHigh reports what INT1 was
+// doing at the same moment.
+//
+// The pin is sampled BEFORE INT1_SRC, because reading INT1_SRC is what releases
+// the latch -- taking it first would drop the pin and then report it low.
+static bool interruptFiresNow(uint8_t ctrl2, uint8_t thsCounts, uint8_t dur,
+                              const char* what, bool& pinHigh) {
+    lisWrite8(LIS3DH_REG_INT1CFG, 0x00);   // disabled while being reconfigured
+    lisWrite8(LIS3DH_REG_CTRL2, ctrl2);
+    (void)lisRead8(LIS3DH_REG_REFERENCE);  // HPM=00: reading this resets the filter
+    lisWrite8(LIS3DH_REG_CTRL3, 0x40);     // IA1 -> INT1 pin
+    lisWrite8(LIS3DH_REG_CTRL5, 0x08);     // latch
+    lisWrite8(LIS3DH_REG_INT1THS, thsCounts);
+    lisWrite8(LIS3DH_REG_INT1DUR, dur);
+    // High events only. Enabling all six was a mistake worth recording: on this
+    // part the LOW event is |axis| < THS -- that is what free-fall detection is
+    // built from -- so once the filter correctly removes gravity, all three low
+    // events become trivially TRUE and the interrupt fires for the very reason
+    // it should be silent. The first run of this read a working filter as a
+    // broken one on exactly that basis.
+    lisWrite8(LIS3DH_REG_INT1CFG, 0x2A);   // ZHIE | YHIE | XHIE, OR'd
+    // The filter has to settle BEFORE the latch is armed, not after. At
+    // HPCF=00 and 50Hz the corner is ODR/50 = 1Hz, so the time constant is
+    // about 160ms and gravity takes the better part of a second to decay out
+    // of the filter. Clearing the latch first and then waiting 250ms measured
+    // exactly that transient and called it a filter fault.
+    delay(1000);                           // ~6 time constants
+    (void)lisRead8(LIS3DH_REG_INT1SRC);    // arm only once settled
+    delay(250);                            // >10 ODR periods at 50Hz
+
+    pinHigh = (digitalRead(DB_IMU_INT1) == HIGH);
+    const uint8_t src = lisRead8(LIS3DH_REG_INT1SRC);
+    const bool ia = (src & 0x40) != 0;
+    Serial.printf("[IMU]   %-30s CTRL2=0x%02X THS=%2u DUR=%u -> SRC=0x%02X IA=%d pin=%s\n",
+                  what, ctrl2, thsCounts, dur, src, ia ? 1 : 0, pinHigh ? "HIGH" : "low");
+    return ia;
+}
+
+// Deterministic proof of the interrupt generator, needing nothing from whoever
+// is at the bench.
+//
+// Gravity is the stimulus. A part at rest still measures 1g along SOME
+// direction, so with the high-pass filter OFF and all six direction events
+// enabled, any threshold below 577mg -- the worst case for a 1g vector split
+// evenly across three axes -- MUST be exceeded by at least one of them. That
+// makes the first test a positive control that cannot legitimately fail, which
+// is exactly what a shake test can never be: a shake that produces nothing is
+// always ambiguous between a broken part and a feeble shake.
+//
+// The second test then switches the filter back on and asks the opposite
+// question. At rest the high-pass filter should remove gravity entirely, so the
+// same threshold must now NOT fire. Together the two bracket the filter: one
+// says the generator works, the other says the filter is doing its job.
+void imuInterruptSelfTest() {
+    if (!s_present) {
+        Serial.println("[IMU] No IMU - cannot self-test.");
+        return;
+    }
+    rtc_gpio_deinit((gpio_num_t)DB_IMU_INT1);
+    pinMode(DB_IMU_INT1, INPUT);
+
+    Serial.println("\n[IMU] === interrupt self-test (static, no shaking needed) ===");
+
+    bool pinA = false, pinB = false;
+    const bool firesNoHpf = interruptFiresNow(0x00, 25, 0, "gravity, HPF off (MUST fire)", pinA);
+    const bool firesHpf   = interruptFiresNow(0x01, 25, 0, "at rest, HPF on (must NOT)", pinB);
+
+    if (!firesNoHpf) {
+        Serial.println("[IMU] SELF-TEST FAIL: 1g of gravity did not trip a 400mg threshold.");
+        Serial.println("[IMU]   The interrupt generator is not working at all. Nothing downstream");
+        Serial.println("[IMU]   of it -- filter, duration, wake source -- can be diagnosed until it is.");
+    } else if (!pinA) {
+        Serial.println("[IMU] SELF-TEST: generator fires, but INT1 never reached GPIO12.");
+        Serial.println("[IMU]   That is a wiring fault at J4.12, and no firmware change reaches past it.");
+    } else if (firesHpf) {
+        Serial.println("[IMU] SELF-TEST: generator and pin are good, but the HPF is NOT removing gravity");
+        Serial.println("[IMU]   -- a high event still trips at rest, so the wake threshold is being");
+        Serial.println("[IMU]   compared against a DC bias rather than against motion.");
+    } else {
+        Serial.println("[IMU] SELF-TEST PASS: generator fires on gravity, INT1 reaches GPIO12, and the");
+        Serial.println("[IMU]   HPF removes gravity at rest. Generator, filter and wire are all good,");
+        Serial.println("[IMU]   so a shake that does not wake it is the DURATION or the threshold.");
+    }
+}
+
+// What does the interrupt generator actually see?
+//
+// Everything above infers the filtered signal from whether a comparator tripped,
+// which is a one-bit answer to a question that deserves numbers. FDS routes the
+// high-pass filter into the OUTPUT registers as well, so with it set the ordinary
+// data path reports precisely the signal the interrupt path is working on.
+//
+// The shipping configuration deliberately leaves FDS clear, because imuRead()
+// needs the gravity vector for orientation. That is the right default and the
+// wrong thing for a diagnostic, so this sets it, measures, and puts it back.
+//
+// At rest every axis should read near zero: that IS the filter removing gravity.
+// Anything near +/-1000mg means it is not, and the wake threshold is being
+// compared against a DC bias rather than against motion.
+void imuDumpFilteredData(uint32_t ms) {
+    if (!s_present) {
+        Serial.println("[IMU] No IMU - cannot dump filtered data.");
+        return;
+    }
+
+    lisWrite8(LIS3DH_REG_INT1CFG, 0x00);   // nothing should latch during this
+    lisWrite8(LIS3DH_REG_CTRL2, 0x09);     // FDS | HPIS1: filter the outputs too
+    (void)lisRead8(LIS3DH_REG_REFERENCE);  // HPM=00: resets the filter
+
+    Serial.println("\n[IMU] === filtered output (what the comparator compares) ===");
+    Serial.println("[IMU] Settling the filter for 1s, then sampling. At rest this should be ~0/0/0.");
+    delay(1000);
+
+    float peak = 0;
+    const uint32_t t0 = millis();
+    uint32_t lastPrint = 0;
+    while (millis() - t0 < ms) {
+        sensors_event_t e;
+        if (lis.getEvent(&e)) {
+            const float fx = e.acceleration.x / SENSORS_GRAVITY_STANDARD * 1000.0f;
+            const float fy = e.acceleration.y / SENSORS_GRAVITY_STANDARD * 1000.0f;
+            const float fz = e.acceleration.z / SENSORS_GRAVITY_STANDARD * 1000.0f;
+            const float mx = fmaxf(fabsf(fx), fmaxf(fabsf(fy), fabsf(fz)));
+            if (mx > peak) peak = mx;
+            const uint32_t el = millis() - t0;
+            if (el - lastPrint >= 500) {
+                lastPrint = el;
+                Serial.printf("[IMU]   +%4lums  filtered x=%+6.0f y=%+6.0f z=%+6.0f mg   (peak |axis| %.0fmg)\n",
+                              (unsigned long)el, fx, fy, fz, peak);
+            }
+        }
+        delay(20);
+    }
+
+    Serial.printf("[IMU] Largest single-axis filtered value seen: %.0fmg\n", peak);
+    Serial.println("[IMU]   Near zero at rest = the HPF is doing its job.");
+    Serial.println("[IMU]   Near 1000mg at rest = it is not, and gravity is sitting on the wake path.");
+
+    lisWrite8(LIS3DH_REG_CTRL2, 0x01);     // FDS back off; imuRead() needs gravity
+    (void)lisRead8(LIS3DH_REG_REFERENCE);
+}
+
+// Live proof of the interrupt path, without waiting on a sleep cycle.
+//
+// Worth having because the shipping configuration deliberately rejects the
+// obvious bench test. INT1_DURATION is counted in ODR periods, so the default
+// three samples at 50Hz demand 60ms of continuous over-threshold motion, and
+// normal mode band-limits to about ODR/2 = 25Hz before the comparator ever sees
+// the signal. A finger tap is a few milliseconds of mostly high-frequency
+// energy: it is filtered down and it is over long before the duration counter
+// gets there.
+//
+// The reason this watches the PIN and the chip's own latch separately is that
+// they fail independently, and a test that only watches one cannot tell which
+// happened. LIR_INT1 is set, so a latched event is a LEVEL and not a pulse --
+// once IA sets, INT1 stays high until INT1_SRC is read. That is what makes a
+// slow poll sufficient and what makes the two readings decisive together:
+//
+//   pin went high              -> chip fired and the wire carried it. Path good.
+//   pin low but IA latched     -> chip fired, GPIO12 never saw it. Wiring fault.
+//   nothing, motion under THS  -> the test was too gentle to prove anything.
+//   nothing, motion over THS   -> the interrupt block is not behaving as armed.
+//
+// INT1_SRC is read once, at the end, for exactly this reason: reading it is what
+// releases the latch, so polling it during the watch would erase the evidence
+// the pin is being watched for.
+MotionWatchResult imuWatchMotionInterrupt(uint32_t ms) {
+    MotionWatchResult result;
+    if (!s_present) {
+        Serial.println("[IMU] No IMU - nothing to watch.");
+        return result;
+    }
+
+    // After an ext1 wake the pad is still routed to the RTC IO mux, so the
+    // digital GPIO the Arduino API reads is not what the pin is actually doing.
+    rtc_gpio_deinit((gpio_num_t)DB_IMU_INT1);
+    pinMode(DB_IMU_INT1, INPUT);
+
+    const uint8_t c1  = lisRead8(LIS3DH_REG_CTRL1);
+    const uint8_t c2  = lisRead8(LIS3DH_REG_CTRL2);
+    const uint8_t c3  = lisRead8(LIS3DH_REG_CTRL3);
+    const uint8_t c5  = lisRead8(LIS3DH_REG_CTRL5);
+    const uint8_t c6  = lisRead8(0x25); // CTRL_REG6, for INT polarity
+    const uint8_t cfg = lisRead8(LIS3DH_REG_INT1CFG);
+    const uint8_t ths = lisRead8(LIS3DH_REG_INT1THS);
+    const uint8_t dur = lisRead8(LIS3DH_REG_INT1DUR);
+    const uint16_t thsMg = ths * INT1_THS_STEP_MG;
+
+    Serial.printf("[IMU] Armed: CTRL1=0x%02X CTRL2=0x%02X CTRL3=0x%02X CTRL5=0x%02X CTRL6=0x%02X\n",
+                  c1, c2, c3, c5, c6);
+    Serial.printf("[IMU]        INT1_CFG=0x%02X THS=%u (%umg) DUR=%u (%ums at 50Hz)\n",
+                  cfg, ths, thsMg, dur, dur * 20);
+
+    // Every one of these is a way for the arm to be silently wrong, and each
+    // says which register to look at rather than just that something is off.
+    if (c3 != 0x40) Serial.println("[IMU]   !! CTRL3 is not 0x40: IA1 is not routed to the INT1 pin.");
+    if (cfg == 0x00) Serial.println("[IMU]   !! INT1_CFG is 0x00: no axis is enabled, so nothing can ever fire.");
+    if (ths == 0x00) Serial.println("[IMU]   !! INT1_THS is 0: the threshold is degenerate.");
+    if (c6 & 0x02)  Serial.println("[IMU]   !! CTRL6 INT_POLARITY set: INT1 is ACTIVE LOW, but ext1 waits for HIGH.");
+    if ((c1 & 0xF0) == 0) Serial.println("[IMU]   !! CTRL1 ODR bits clear: the part is powered down and samples nothing.");
+
+    imuClearMotionInterrupt();
+    delay(5);
+    Serial.printf("[IMU] INT1 pin after clearing the latch: %s\n",
+                  digitalRead(DB_IMU_INT1) == HIGH ? "HIGH  <-- stuck; it should fall when the latch is released"
+                                                   : "low (correct)");
+
+    Serial.printf("\n[IMU] Shake the board hard for %lus -- a tap is too short to count.\n",
+                  (unsigned long)(ms / 1000));
+
+    bool  pinEverHigh  = false;
+    float peakDevMg    = 0;
+    float windowPeakMg = 0;
+    uint32_t lastReport = 0;
+    const uint32_t t0 = millis();
+    while (millis() - t0 < ms) {
+        if (!pinEverHigh && digitalRead(DB_IMU_INT1) == HIGH) {
+            pinEverHigh = true;
+            Serial.printf("[IMU]   +%.1fs  *** INT1 went HIGH ***\n", (millis() - t0) / 1000.0f);
+        }
+        // Deviation of the whole vector from 1g. The comparator actually works
+        // per-axis on the high-passed signal, so this is a proxy rather than the
+        // same number -- but it is measured from the same part through the same
+        // bus, and it is enough to separate "too gentle" from "not working".
+        sensors_event_t e;
+        if (lis.getEvent(&e)) {
+            const float gx = e.acceleration.x / SENSORS_GRAVITY_STANDARD;
+            const float gy = e.acceleration.y / SENSORS_GRAVITY_STANDARD;
+            const float gz = e.acceleration.z / SENSORS_GRAVITY_STANDARD;
+            const float dev = fabsf(sqrtf(gx * gx + gy * gy + gz * gz) - 1.0f) * 1000.0f;
+            if (dev > peakDevMg)    peakDevMg = dev;
+            if (dev > windowPeakMg) windowPeakMg = dev;
+        }
+
+        // Live feedback, because the first run of this failed for the dullest
+        // possible reason: the window opened and closed while nobody was
+        // shaking, and 33mg of bench noise is indistinguishable in the summary
+        // from a real attempt that was simply too gentle. Reporting as it goes
+        // turns "shake harder" from advice into a number to aim at.
+        const uint32_t elapsed = millis() - t0;
+        if (elapsed - lastReport >= 2000) {
+            lastReport = elapsed;
+            Serial.printf("[IMU]   +%2lus  peak %4.0fmg  %s\n",
+                          (unsigned long)(elapsed / 1000), windowPeakMg,
+                          windowPeakMg >= thsMg ? "<-- OVER THRESHOLD" : "(need more)");
+            windowPeakMg = 0;
+        }
+        delay(10);
+    }
+
+    const uint8_t src = lisRead8(LIS3DH_REG_INT1SRC); // reading it releases the latch
+    result.latched     = (src & 0x40) != 0;
+    result.pinHigh     = pinEverHigh;
+    result.peakMg      = peakDevMg;
+    result.thresholdMg = thsMg;
+
+    Serial.printf("\n[IMU] Peak ||a|-1g| during the watch: %.0fmg (threshold %umg)\n", peakDevMg, thsMg);
+    Serial.printf("[IMU] INT1_SRC=0x%02X  IA=%d  pin ever high: %s\n",
+                  src, (src >> 6) & 1, pinEverHigh ? "YES" : "no");
+
+    if (pinEverHigh) {
+        Serial.println("[IMU] VERDICT: path works end to end -- the part fired and GPIO12 saw it.");
+        Serial.println("[IMU]   A deep-sleep ext1 wake on this pin should work.");
+    } else if (src & 0x40) {
+        Serial.println("[IMU] VERDICT: the LIS3DH DID latch an event and GPIO12 never saw it.");
+        Serial.println("[IMU]   The fault is between U2.11 and the ESP32 -- J4.12 open, or the pin held");
+        Serial.println("[IMU]   by something else. No firmware change can make ext1 wake work through that.");
+    } else if (peakDevMg < thsMg) {
+        Serial.println("[IMU] VERDICT: nothing fired, but the motion never reached the threshold either.");
+        Serial.println("[IMU]   Inconclusive -- shake harder and re-run before drawing any conclusion.");
+    } else {
+        Serial.println("[IMU] VERDICT: motion exceeded the threshold and nothing latched at all.");
+        Serial.println("[IMU]   The interrupt block is not behaving as its registers claim; suspect config,");
+        Serial.println("[IMU]   not wiring, and start from the CTRL values printed above.");
+    }
+    return result;
+}
+
 bool imuEnableMotionWake(uint16_t thresholdMg, uint8_t durationSamples) {
     if (!s_present) return false;
 
@@ -396,11 +766,71 @@ bool imuEnableMotionWake(uint16_t thresholdMg, uint8_t durationSamples) {
     // 6D stay clear, which is what makes this OR rather than AND-of-all.
     lisWrite8(LIS3DH_REG_INT1CFG, 0x2A); // ZHIE | YHIE | XHIE
 
+    // Let the filter settle BEFORE releasing the latch.
+    //
+    // Switching the high-pass filter on does not remove gravity instantly: at
+    // HPCF=00 and 50Hz the corner is ODR/50 = 1Hz, so the time constant is about
+    // 160ms and the full 1g takes the better part of a second to decay out. Clear
+    // the latch during that window and the residual DC trips the threshold
+    // immediately, leaving INT1 asserted on a board that is not moving.
+    //
+    // Measured, not theorised: a build that armed and then slept at once woke on
+    // ext1 five times out of six while sitting still on the bench. It does not
+    // bite the normal cycle, where arming happens in setup() and minutes of GPS
+    // and modem work follow -- but updateMotionThreshold() re-arms immediately
+    // before goToSleep(), and that path would spuriously wake every time the
+    // threshold changed.
+    delay(1000);
     imuClearMotionInterrupt();
 
-    Serial.printf("[IMU] Motion wake armed: %umg (THS=%u), %u samples\n",
+    Serial.printf("[IMU] Motion wake armed: %umg (THS=%u), %u samples (filter settled)\n",
                   ths * INT1_THS_STEP_MG, ths, durationSamples);
     return true;
+}
+
+// Positive control for ext1 itself, needing no motion and nobody present.
+//
+// Switching the high-pass filter OFF puts the raw 1g gravity vector back on the
+// interrupt path, and a threshold below 577mg is then exceeded by at least one
+// axis no matter how the board is lying. With the latch enabled, INT1 goes HIGH
+// and STAYS high -- so the board enters deep sleep with its ext1 source already
+// asserted, and ESP_EXT1_WAKEUP_ANY_HIGH is a level trigger.
+//
+// That makes the outcome binary and free of the sensor entirely: the board must
+// wake immediately. If it instead sleeps out its full timer with INT1 held high
+// the whole while, ext1 on this pin does not work, and no amount of tuning the
+// accelerometer will ever matter.
+//
+// Returns the INT1 pin level actually achieved, so a control that failed to set
+// itself up is not mistaken for a wake-source fault.
+bool imuForceInterruptHigh() {
+    if (!s_present) return false;
+
+    rtc_gpio_deinit((gpio_num_t)DB_IMU_INT1);
+    pinMode(DB_IMU_INT1, INPUT);
+
+    lisWrite8(LIS3DH_REG_INT1CFG, 0x00);   // disabled while reconfiguring
+    lisWrite8(LIS3DH_REG_CTRL2, 0x00);     // HPF OFF: gravity back on the path
+    lisWrite8(LIS3DH_REG_CTRL3, 0x40);     // IA1 -> INT1
+    lisWrite8(LIS3DH_REG_CTRL5, 0x08);     // latch
+    lisWrite8(LIS3DH_REG_INT1THS, 25);     // 400mg, under the 577mg worst case
+    lisWrite8(LIS3DH_REG_INT1DUR, 0);
+    lisWrite8(LIS3DH_REG_INT1CFG, 0x2A);   // high events only
+    (void)lisRead8(LIS3DH_REG_INT1SRC);    // release; gravity re-latches at once
+    delay(100);
+
+    const bool high = (digitalRead(DB_IMU_INT1) == HIGH);
+    const uint8_t src = lisRead8(LIS3DH_REG_INT1SRC);
+    // Reading INT1_SRC just released the latch, so re-latch before sleeping.
+    delay(50);
+    const bool stillHigh = (digitalRead(DB_IMU_INT1) == HIGH);
+
+    Serial.printf("[IMU] ext1 control: INT1=%s (SRC=0x%02X), after re-latch=%s\n",
+                  high ? "HIGH" : "low", src, stillHigh ? "HIGH" : "low");
+    if (!stillHigh) {
+        Serial.println("[IMU]   Control did NOT hold INT1 high -- the control itself failed, ignore the wake.");
+    }
+    return stillHigh;
 }
 
 void imuClearMotionInterrupt() {

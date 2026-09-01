@@ -115,6 +115,34 @@ at `18` at WOT. Behaves more like manifold pressure than anything RPM-derived.
 **Speed.** On a trailer it reads zero for the whole session, which is
 indistinguishable from a constant. This one needs the ski on water.
 
+Published sources put SeaDoo speed on `0x208` (2008 Siemens ECU) or `0x268`
+(2021 Spark, Bosch ME17.8.5), the latter with speed as a big-endian pair in
+bytes 4-5 divided by 100.
+
+**Neither ID exists on this bus.** The complete inventory is the sixteen IDs
+above; the sniffer records up to 64 distinct IDs and never truncated, so that
+list is not a sample. The same sources correctly identify `0x102` as carrying
+RPM, which we confirmed independently, so they are not worthless — but the
+speed mapping does not transfer to this ski, most likely a model-year
+difference.
+
+Two things about the `0x268` claim also look shaky on their own terms: a `/100`
+scaling implies 0.01 km/h resolution on a jetski speedometer, and the `0x208`
+description ("byte 0 for speeds above 25 km/h, byte 1 for below") is not a
+scheme any ECU would plausibly use.
+
+So speed has to be found the way RPM was found: by correlation against a known
+reference. `pio run -e speed-survey` logs GPS speed alongside every byte of
+every ID as CSV for exactly that.
+
+```bash
+pio run -e speed-survey -t upload && pio device monitor -b 115200 | tee survey.csv
+```
+
+Ride at several steady speeds, holding each for ~15 s, then correlate each byte
+against the `gps_kmh` column. Bytes 6 and 7 can be ignored — they are the
+counter and checksum.
+
 ## Reproducing
 
 ```bash

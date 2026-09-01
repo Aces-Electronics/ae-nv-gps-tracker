@@ -13,8 +13,24 @@ RTC_DATA_ATTR static bool s_supplyEnabled = true;
 // A 1S LiPo is full at 4.2V. These thresholds are not a substitute for the
 // charger's own termination -- the BQ25176J handles that -- they decide whether
 // it is worth drawing from the jetski at all.
+//
+// 4.1V is deliberately BELOW the BQ25176J's 4.2V regulation point, which makes
+// this firmware the thing that ends a charge rather than a backstop behind the
+// charger's own termination. The switch opens on the way up, before the cell is
+// ever held at full.
+//
+// The wide gap down to 3.7V is what makes that worth doing. A LiPo ages fastest
+// sitting at full charge, so the pair cycles the cell through roughly 3.7-4.1
+// instead of floating it at 4.2 -- and since the only load between reports is a
+// sleeping tracker, one traverse of that band takes a long time and costs very
+// few cycles to buy it. It also means a cut once made is not undone by the cell
+// settling back, which a narrow band would do on every wake.
+//
+// Both thresholds are read against the AXP2101's cell voltage, not the jetski's:
+// the supply-sense divider is still mis-scaled, so real input voltage is not
+// available to decide on yet.
 static const float CHARGE_STOP_V   = 4.10f;
-static const float CHARGE_RESUME_V = 3.90f;
+static const float CHARGE_RESUME_V = 3.70f;
 
 // STAT blinks to signal a fault, so a single read cannot tell a fault from a
 // steady state. This window is long enough to catch an edge of a ~1Hz blink.

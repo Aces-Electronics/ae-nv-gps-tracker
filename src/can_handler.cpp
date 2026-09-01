@@ -156,6 +156,14 @@ size_t canSniff(uint32_t durationMs) {
     return s_seenCount;
 }
 
+void canDrain(uint32_t ms) {
+    const uint32_t t0 = millis();
+    twai_message_t msg;
+    while (millis() - t0 < ms) {
+        if (twai_receive(&msg, pdMS_TO_TICKS(2)) == ESP_OK) recordFrame(msg);
+    }
+}
+
 void canResetSeen() {
     s_seenCount = 0;
     s_tableFullLogged = false;

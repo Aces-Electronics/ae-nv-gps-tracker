@@ -12,6 +12,13 @@ struct TrackerSettings {
     String mqtt_user = "";
     String mqtt_pass = "";
     uint32_t report_interval_mins = 60;
+
+    // Wake-on-motion sensitivity: 0 = Low, 1 = Medium, 2 = High. It selects the
+    // FLOOR of the adaptive threshold ladder, not a fixed threshold -- the ski
+    // still finds its own level from whichever floor is chosen. See the
+    // MOTION_SENS_* constants in main.cpp for the values and their margins
+    // against the measured noise floor.
+    uint8_t motion_sensitivity = 1;
 };
 
 struct TrackerStatus {

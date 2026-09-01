@@ -73,6 +73,52 @@ const char* firmwareVersion() {
     return FIRMWARE_VERSION;
 }
 
+// Three selectable sensitivities, each the FLOOR of the adaptive ladder rather
+// than a fixed threshold: the ski still finds its own level from wherever it
+// starts. Chosen against a measured noise floor of 24mg (high-pass filter
+// settled, board at rest), so the margins are known rather than guessed:
+//
+//   Low    352mg  ~15x noise  -- takes a deliberate shove. For a ski somewhere
+//                               lively, where less would report the weather.
+//   Medium 176mg  ~7.3x noise -- the default. Registers ordinary handling.
+//   High   128mg  ~5.3x noise -- for a quiet mooring where a nudge should count.
+//
+// All three sit exactly on the INT1_THS grid (16mg steps at +/-2g): 22, 11 and 8
+// counts, so none of them truncate. That is worth checking when retuning -- 56mg,
+// for instance, is not representable and would silently become 48mg, only 2x the
+// noise floor and closer to chasing the filter's own residue than detecting
+// anything.
+static const uint16_t MOTION_SENS_LOW_MG    = 352;
+static const uint16_t MOTION_SENS_MEDIUM_MG = 176;
+static const uint16_t MOTION_SENS_HIGH_MG   = 128;
+
+enum MotionSensitivity : uint8_t {
+    MOTION_SENS_LOW = 0,
+    MOTION_SENS_MEDIUM = 1,
+    MOTION_SENS_HIGH = 2,
+};
+
+static uint16_t motionBaseFor(uint8_t sens) {
+    switch (sens) {
+        case MOTION_SENS_LOW:  return MOTION_SENS_LOW_MG;
+        case MOTION_SENS_HIGH: return MOTION_SENS_HIGH_MG;
+        default:               return MOTION_SENS_MEDIUM_MG;
+    }
+}
+
+const char* motionSensitivityName(uint8_t sens) {
+    switch (sens) {
+        case MOTION_SENS_LOW:  return "Low";
+        case MOTION_SENS_HIGH: return "High";
+        default:               return "Medium";
+    }
+}
+
+// The floor the ladder resets to, for whichever sensitivity is selected. Set by
+// loadMotionThreshold() before anything arms the IMU.
+uint16_t g_motionBaseMg = MOTION_SENS_MEDIUM_MG;
+
+
 void loadSettings() {
     prefs.begin("tracker", false);
     settings.name = prefs.getString("name", "");
@@ -82,6 +128,14 @@ void loadSettings() {
     settings.mqtt_pass = prefs.getString("pass", "AERemoteAccess2024!");
     settings.report_interval_mins = prefs.getUInt("interval", HEARTBEAT_DEFAULT_MINS);
     if (settings.report_interval_mins < 5) settings.report_interval_mins = 5;
+
+    // Read again here purely so the value is in settings for BLE and telemetry;
+    // loadMotionThreshold() has already used it, because arming the IMU happens
+    // long before this runs.
+    settings.motion_sensitivity = prefs.getUChar("mot_sens", MOTION_SENS_MEDIUM);
+    if (settings.motion_sensitivity > MOTION_SENS_HIGH) {
+        settings.motion_sensitivity = MOTION_SENS_MEDIUM;
+    }
 
     // getString()'s default only covers a *missing* key. A stored zero-length
     // value comes back as "", and an empty host fails DNS resolution instantly --
@@ -102,6 +156,9 @@ void loadSettings() {
     Serial.printf("[Settings] Broker: %s\n", settings.mqtt_broker.c_str());
     Serial.printf("[Settings] Name: %s\n", settings.name.c_str());
     Serial.printf("[Settings] Interval: %d mins\n", settings.report_interval_mins);
+    Serial.printf("[Settings] Motion sensitivity: %s (%umg floor)\n",
+                  motionSensitivityName(settings.motion_sensitivity),
+                  motionBaseFor(settings.motion_sensitivity));
     prefs.end();
 }
 
@@ -113,6 +170,7 @@ void saveSettings() {
     prefs.putString("user", settings.mqtt_user);
     prefs.putString("pass", settings.mqtt_pass);
     prefs.putUInt("interval", settings.report_interval_mins);
+    prefs.putUChar("mot_sens", settings.motion_sensitivity);
     prefs.end();
     Serial.println("Settings Saved to NVS.");
 }
@@ -185,7 +243,6 @@ static const time_t MOTION_MIN_REPORT_S = 120;
 // wash from a passing boat, wind, someone leaning on the hull. Every step up
 // costs sensitivity to real theft, so the ladder is short and it drops straight
 // back to the floor the moment genuine travel is seen.
-static const uint16_t MOTION_THRESHOLD_BASE_MG = 352;
 static const uint16_t MOTION_THRESHOLD_STEP_MG = 176;
 static const uint16_t MOTION_THRESHOLD_MAX_MG  = 1408;
 
@@ -199,15 +256,43 @@ static const float STATIONARY_SPEED_KMH = 2.0f;
 
 RTC_DATA_ATTR static int s_falseWakeCount = 0;
 
-uint16_t g_motionThresholdMg = MOTION_THRESHOLD_BASE_MG;
+// Counts passes of the deep-sleep wake test so it can alternate the pad holds
+// across sleeps instead of needing two builds.
+RTC_DATA_ATTR static int s_sleepTestPass = 0;
+
+uint16_t g_motionThresholdMg = MOTION_SENS_MEDIUM_MG;
 EngineData g_engine;
 
 static uint16_t loadMotionThreshold() {
-    prefs.begin("tracker", true);
-    uint16_t v = prefs.getUShort("mot_thr", MOTION_THRESHOLD_BASE_MG);
+    prefs.begin("tracker", false);
+
+    // Read straight from NVS rather than from settings: this runs before
+    // loadSettings(), because the IMU has to be armed before the BLE window and
+    // the GPS acquisition, and neither is worth reordering for one byte.
+    const uint8_t sens = (uint8_t)prefs.getUChar("mot_sens", MOTION_SENS_MEDIUM);
+    g_motionBaseMg = motionBaseFor(sens);
+
+    uint16_t v = prefs.getUShort("mot_thr", g_motionBaseMg);
+
+    // A stored value outlives both a retune and a sensitivity change, and the
+    // clamp below only ever raises -- so lowering the floor would otherwise
+    // change nothing on a unit that already had a value saved. Recording which
+    // floor a value was derived from is what lets either actually reach the
+    // field: a value from a different floor is discarded rather than kept.
+    const uint16_t storedBase = prefs.getUShort("mot_base", 0);
+    if (storedBase != g_motionBaseMg) {
+        Serial.printf("[Motion] Floor changed %u -> %umg (%s); resetting stored %umg.\n",
+                      storedBase, g_motionBaseMg, motionSensitivityName(sens), v);
+        v = g_motionBaseMg;
+        prefs.putUShort("mot_thr", v);
+        prefs.putUShort("mot_base", g_motionBaseMg);
+    }
     prefs.end();
-    if (v < MOTION_THRESHOLD_BASE_MG) v = MOTION_THRESHOLD_BASE_MG;
+
+    if (v < g_motionBaseMg)           v = g_motionBaseMg;
     if (v > MOTION_THRESHOLD_MAX_MG)  v = MOTION_THRESHOLD_MAX_MG;
+    Serial.printf("[Motion] Sensitivity %s: floor %umg, current threshold %umg\n",
+                  motionSensitivityName(sens), g_motionBaseMg, v);
     return v;
 }
 
@@ -246,10 +331,10 @@ static void updateMotionThreshold(bool gotFix, float speedKmh) {
 
     if (speedKmh >= STATIONARY_SPEED_KMH) {
         s_falseWakeCount = 0;
-        if (g_motionThresholdMg != MOTION_THRESHOLD_BASE_MG) {
+        if (g_motionThresholdMg != g_motionBaseMg) {
             Serial.printf("[Motion] Real travel at %.1f km/h -> threshold back to %umg\n",
-                          speedKmh, MOTION_THRESHOLD_BASE_MG);
-            g_motionThresholdMg = MOTION_THRESHOLD_BASE_MG;
+                          speedKmh, g_motionBaseMg);
+            g_motionThresholdMg = g_motionBaseMg;
             saveMotionThreshold(g_motionThresholdMg);
             imuEnableMotionWake(g_motionThresholdMg);
         }
@@ -291,16 +376,27 @@ static void enterDeepSleep(int minutes) {
     // battery by morning.
     const bool motionArmed = imuPresent();
     if (motionArmed) {
-        // The interrupt latches, so a source left uncleared holds INT1 high and
-        // the next sleep would end the instant it started.
-        imuClearMotionInterrupt();
         esp_sleep_enable_ext1_wakeup(1ULL << DB_IMU_INT1, ESP_EXT1_WAKEUP_ANY_HIGH);
     }
 
     powerPrepareForSleep();
+
+    // Dark from here until the next wake. Paired with the switch-on in setup(),
+    // this makes the LED a direct read-out of the awake/asleep cycle.
+    PMU.setChargingLedMode(XPOWERS_CHG_LED_OFF);
+
     Serial.printf("Entering Deep Sleep for %d minutes%s...\n",
                   minutes, motionArmed ? " (or on motion)" : "");
     Serial.flush();
+
+    // Clearing the latch is the last thing that happens. The interrupt latches,
+    // so a source left uncleared holds INT1 high and the sleep ends the instant
+    // it starts -- and every millisecond between the clear and the sleep is a
+    // window where a knock can re-latch it and do exactly that. Doing this after
+    // the logging and the flush shrinks that window from a serial write to an
+    // I2C read, which is the smallest it can be made from here.
+    if (motionArmed) imuClearMotionInterrupt();
+
     esp_deep_sleep_start();
 }
 
@@ -640,7 +736,7 @@ void onDownlink(char* topic, uint8_t* payload, unsigned int length) {
     }
 }
 
-void transmitData(float lat, float lon, float speed, float alt, int sats, float hdop) {
+void transmitData(bool has_fix, float lat, float lon, float speed, float alt, int sats, float hdop) {
     Serial.println("[Lifecycle] Preparing Transmission...");
 
     // Sampled here rather than in setup() so the reported orientation is the one
@@ -734,17 +830,38 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
             }
             doc["model"] = "AE Tracker - " + suffix;
             
-            doc["lat"] = lat;
-            doc["lon"] = lon;
-            doc["alt"] = alt;
-            doc["speed"] = speed;
-            doc["sats"] = sats;
-            doc["hdop"] = hdop;
+            // Absent rather than zero, on the same reasoning that keeps rpm
+            // out of a parked ski's report. lat/lon default to 0,0 when the
+            // acquisition times out, and 0,0 is not a null -- it is a real
+            // coordinate in the Gulf of Guinea that a map will plot without
+            // complaint, several thousand kilometres from anything this device
+            // will ever see. A report with no position should say so and let
+            // the backend keep the last known one, rather than assert a
+            // position that is wrong.
+            //
+            // The flag goes out either way, so "no fix this wake" is a fact the
+            // report carries rather than something inferred from missing keys.
+            doc["fix"] = has_fix;
+            if (has_fix) {
+                doc["lat"] = lat;
+                doc["lon"] = lon;
+                doc["alt"] = alt;
+                doc["speed"] = speed;
+                doc["sats"] = sats;
+                doc["hdop"] = hdop;
+            }
             
             doc["voltage"] = PMU.getVbusVoltage() / 1000.0F; 
             doc["device_voltage"] = PMU.getBattVoltage() / 1000.0F; 
             doc["battery_voltage"] = PMU.getBattVoltage() / 1000.0F; 
-            doc["soc"] = PMU.getBatteryPercent();
+            // The AXP2101 keeps a fuel gauge and this reads it, but it answers
+            // -1 when isBatteryConnect() is false rather than failing. Publishing
+            // that verbatim put "-1%" on the dashboard, which reads as a
+            // measurement rather than as an absent battery -- and a tracker
+            // running from USB with no cell fitted is exactly the bench case
+            // where it happens.
+            const int socPct = PMU.getBatteryPercent();
+            if (socPct >= 0) doc["soc"] = socPct;
 
             // Always emitted, "Unknown" included: the field has been in the
             // documented payload all along, and a key that appears only on
@@ -777,6 +894,11 @@ void transmitData(float lat, float lon, float speed, float alt, int sats, float 
             // Published so the adaptive logic can be seen working from the
             // backend rather than only from a serial cable.
             doc["motion_threshold_mg"] = g_motionThresholdMg;
+            // The setting, alongside where the ladder currently sits. Both are
+            // wanted: the first is what somebody chose, the second is what the
+            // ski decided, and a support question about false wakes needs to
+            // tell them apart.
+            doc["motion_sensitivity"] = motionSensitivityName(settings.motion_sensitivity);
 
             int csq = modem.getSignalQuality();
             int dbm = (csq == 99) ? -113 : (csq * 2) - 113;
@@ -874,6 +996,22 @@ void setup() {
     if (!PMU.begin(Wire, AXP2101_SLAVE_ADDRESS, I2C_SDA, I2C_SCL)) {
         Serial.println("PMU FAIL");
     }
+    // Awake indicator. The AXP2101's charge LED is the only one this board
+    // actually has -- NEOPIXEL_PIN is a guess inherited from other S3 boards and
+    // drives nothing here -- and it is the only way to see the unit's state on
+    // battery, where USB (and therefore the serial log) is not available.
+    //
+    // Lit means awake. It is switched off immediately before every deep sleep,
+    // so a dark unit is a sleeping one, and default charger control of the LED
+    // is given up deliberately: charge state is already reported over MQTT,
+    // whereas "is it awake right now" has no other channel at all.
+    // Steady ON means awake; 4Hz blink means this wake came from the
+    // accelerometer. Plain "on whenever awake" turned out to be useless for
+    // telling whether motion wake works -- it lights identically for the timer,
+    // so a unit waking on schedule looks exactly like one waking on a shake.
+    PMU.setChargingLedMode(wokeOnMotion() ? XPOWERS_CHG_LED_BLINK_4HZ
+                                          : XPOWERS_CHG_LED_ON);
+
     PMU.disableTSPinMeasure();
     PMU.enableBattVoltageMeasure();
     PMU.enableBattDetection();
@@ -898,6 +1036,69 @@ void setup() {
     // re-enumeration.
     Serial.println("\n=== DAUGHTER BOARD BENCH: continuous log ===");
     Serial.println("Columns: elapsed | battery | PG | STAT | charge state | supply switch\n");
+    // First, before anything else has touched a pin. powerSweepPullups() walks
+    // GPIO12 among the rest and leaves an internal pull-up on it, and INT1 is
+    // the one signal here that must be measured exactly as the LIS3DH drives it.
+    //
+    // The static self-test runs ahead of the shake watch because it needs nobody
+    // present and it cannot come back ambiguous -- and if it fails, the shake
+    // test that follows has nothing left to tell anyone. It leaves the interrupt
+    // block reconfigured, so the shipping arm has to be put back before the
+    // watch, or the watch would be measuring the self-test's settings.
+    imuDumpFilteredData(6000);
+    imuInterruptSelfTest();
+
+    // Duration sweep. Everything else has now been measured and works -- the
+    // filter removes gravity to 24mg, the generator trips on gravity, and INT1
+    // reaches GPIO12 -- which leaves INT1_DURATION as the only thing between a
+    // 700mg shake and a wake that never came. It is counted in ODR periods, so
+    // the shipping 3 demands 60ms of CONTINUOUS over-threshold motion, and the
+    // counter resets the moment the condition lapses. Shaking is oscillatory:
+    // |axis| passes back through zero at every reversal, so 60ms unbroken is a
+    // far stronger demand than it looks. Running 0 against 3 over the same
+    // gesture is what turns that from an argument into a measurement.
+    // Each setting is retried until a window is actually shaken hard enough to
+    // mean something. Two runs of this were wasted on fixed 15s windows that
+    // opened and closed while nobody was at the bench, and a window nobody
+    // shook produces the same silence as a configuration that does not work.
+    // Waiting for the gesture instead of for the clock is what removes that
+    // ambiguity -- and it lets whoever is holding the board take their time.
+    const uint8_t DURATIONS[] = { 0, 3 };
+    MotionWatchResult results[2];
+    for (int i = 0; i < 2; i++) {
+        const uint8_t d = DURATIONS[i];
+        Serial.printf("\n[IMU] ===== duration sweep: INT1_DURATION=%u (%ums at 50Hz) =====\n",
+                      d, d * 20);
+        for (int attempt = 1; attempt <= 6; attempt++) {
+            imuEnableMotionWake(g_motionThresholdMg, d);
+            results[i] = imuWatchMotionInterrupt(10000);
+            if (results[i].conclusive()) break;
+            Serial.printf("[IMU] Window %d peaked at only %.0fmg -- not a real test. Shake during the next one.\n",
+                          attempt, results[i].peakMg);
+        }
+    }
+
+    Serial.println("\n[IMU] ===== duration sweep result =====");
+    for (int i = 0; i < 2; i++) {
+        Serial.printf("[IMU]   DUR=%u (%2ums): peak %4.0fmg  latched=%-3s  pin=%s\n",
+                      DURATIONS[i], DURATIONS[i] * 20, results[i].peakMg,
+                      results[i].latched ? "YES" : "no",
+                      results[i].pinHigh ? "HIGH" : "low");
+    }
+    if (results[0].latched && !results[1].latched) {
+        Serial.println("[IMU]   -> DUR is the blocker: the same shake wakes it at 0 and not at 3.");
+        Serial.println("[IMU]      60ms of CONTINUOUS over-threshold motion is more than shaking sustains.");
+    } else if (results[0].latched && results[1].latched) {
+        Serial.println("[IMU]   -> Both fired, so DUR=3 is not what stopped the earlier attempts.");
+    } else if (!results[0].latched && results[0].conclusive()) {
+        Serial.println("[IMU]   -> Even DUR=0 did not fire on real motion. The threshold or the axis");
+        Serial.println("[IMU]      enables are wrong, not the duration.");
+    } else {
+        Serial.println("[IMU]   -> Never shaken hard enough to conclude anything. Re-run.");
+    }
+
+    imuEnableMotionWake(g_motionThresholdMg);
+
     powerSweepPullups();
     // canSelfTest() is deliberately NOT called here. It uses TWAI_MODE_NO_ACK,
     // which transmits -- and this build gets flashed onto a tracker that may be
@@ -948,6 +1149,196 @@ void setup() {
     }
 #endif
 
+#ifdef SLEEP_TEST_MODE
+    // Isolates ONE variable: whether powerPrepareForSleep()'s pad holds are what
+    // stop an ext1 wake on GPIO12.
+    //
+    // Everything else has been measured on this board and works. The LIS3DH
+    // latches on a real shake at the shipping 352mg over 60ms, INT1 reaches
+    // GPIO12, and the high-pass filter removes gravity to 24mg at rest. So a
+    // tracker that still does not wake is failing between esp_sleep_enable_
+    // ext1_wakeup() and the pad, and the only thing this firmware does in
+    // between is gpio_hold_en() on two other RTC pads plus a blanket
+    // gpio_deep_sleep_hold_en().
+    //
+    // Suspicion, and the reason this is worth a build of its own: the holds are
+    // applied BEFORE esp_deep_sleep_start(), and it is inside that call that IDF
+    // runs ext1_wakeup_prepare() and re-points GPIO12 at the RTC IO mux. An
+    // autohold already in force is a plausible way for that configuration to be
+    // frozen out -- and it would look exactly like this, with everything working
+    // awake and nothing waking asleep.
+    //
+    // Alternating in RTC memory rather than by rebuilding means both cases run
+    // against the same board, the same arm, and the same person shaking it.
+    {
+        // The log lives in NVS, not RTC memory, and that is the whole point.
+        //
+        // Opening the USB CDC port RESETS this board -- the S3's native USB
+        // implements the auto-programming reset on the CDC control lines -- so
+        // attaching to watch a wake destroys the evidence of it: RTC memory is
+        // wiped and esp_sleep_get_wakeup_cause() reports UNDEFINED. Every boot
+        // banner this session has claimed "Cold Boot" for exactly that reason.
+        // Flash survives the reset, so the wake cause is written down at the
+        // moment it is still true and read back later, when attaching no longer
+        // costs anything.
+        //
+        // The procedure this build is built for: flash it, LEAVE THE PORT ALONE
+        // for several cycles, shake it during some of the sleeps, and only then
+        // attach to read the history back.
+        Serial.println("\n=== DEEP SLEEP WAKE TEST ===");
+
+        prefs.begin("sleeptest", false);
+        String log = prefs.getString("log", "");
+        const int pass = prefs.getUInt("pass", 0);
+
+        // Recorded before anything else can disturb it.
+        const esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+        const char* causeStr = (cause == ESP_SLEEP_WAKEUP_EXT1)  ? "MOTION"
+                             : (cause == ESP_SLEEP_WAKEUP_TIMER) ? "timer"
+                             : (cause == ESP_SLEEP_WAKEUP_UNDEFINED) ? "reset/cold"
+                             : "other";
+        // pass is the count of sleeps ALREADY taken, so the one being reported
+        // here is pass-1, and its holds setting follows the same alternation.
+        // Every pass is now the exact shipping arm. The control has served its
+        // purpose: seven of seven control sleeps woke on ext1, so the wake
+        // source, GPIO12 and the deep-sleep path are all proven good and there
+        // is nothing left to compare against. What is unresolved is narrower --
+        // whether the LIS3DH fires at all on real motion while the ESP32 sleeps
+        // -- and IA answers exactly that.
+        const bool prevWasControl = false;
+
+        if (pass > 0) {
+            // IA is the whole question now. ext1 did not wake this board with
+            // holds on OR off, while the same part latches reliably on a shake
+            // when awake. Those two facts only reconcile one of two ways, and
+            // the latch tells them apart: LIR_INT1 holds INT1 high until
+            // INT1_SRC is read, so a fire during sleep is still recorded at the
+            // next wake, whatever ended it.
+            //
+            //   IA=1 on a timer wake -> the LIS3DH fired and ext1 ignored it.
+            //   IA=0 on a timer wake -> the part never fired while asleep at all,
+            //                           despite firing on the same gesture awake.
+            const uint8_t wsrc = imuWakeSrc();
+            const uint8_t wcfg = imuWakeCfg();
+            char entry[96];
+            snprintf(entry, sizeof(entry), "%d:%s:%s:IA%s:cfg%02X ", pass, causeStr,
+                     prevWasControl ? "CONTROL" : "motion",
+                     (wsrc == 0xFF) ? "?" : ((wsrc & 0x40) ? "1" : "0"),
+                     wcfg);
+            log += entry;
+            if (log.length() > 400) log = log.substring(log.length() - 400);
+            prefs.putString("log", log);
+        }
+
+        Serial.printf("[SleepTest] History (pass:wokeby:mode:IA:cfg): %s\n",
+                      log.length() ? log.c_str() : "(none yet)");
+        // ext1 is already proven good, so every reading here is about the sensor.
+        if (log.indexOf("MOTION:motion:IA1") >= 0) {
+            Serial.println("[SleepTest] >>> WORKS: the part fired on real motion while asleep and ext1 woke it.");
+        } else if (log.indexOf("timer:motion:IA1") >= 0) {
+            Serial.println("[SleepTest] >>> The part DID fire while asleep but the board slept on --");
+            Serial.println("[SleepTest]     which contradicts the control, so look at the arm, not the wiring.");
+        } else if (log.indexOf("timer:motion:IA0") >= 0) {
+            Serial.println("[SleepTest] >>> So far every sleep ended on the timer with nothing latched:");
+            Serial.println("[SleepTest]     the LIS3DH is not detecting the motion at 352mg/60ms while asleep.");
+        }
+
+        const bool runControl = (pass % 2) == 0;
+        prefs.putUInt("pass", pass + 1);
+        prefs.end();
+
+        // Attaching a terminal to this board resets it -- the S3's USB-Serial-JTAG
+        // controller issues a chip reset when the host drives DTR/RTS, and macOS
+        // does that on open. Fighting that turned out to be the wrong approach:
+        // NVS survives a reset, so the reset is harmless as long as the board is
+        // still awake afterwards to be read from and flashed.
+        //
+        // So a reset buys a grace window and a real sleep wake does not. Every
+        // attach lands in this branch (a reset reports UNDEFINED), which is what
+        // makes the port reliably catchable instead of a 2-second lottery -- and
+        // it is why this stopped needing a BOOT+RST between every flash.
+        if (cause == ESP_SLEEP_WAKEUP_UNDEFINED) {
+            Serial.println("[SleepTest] Reset detected -- holding awake 20s so this can be read and reflashed.");
+            for (int i = 0; i < 4; i++) {
+                delay(5000);
+                Serial.printf("[SleepTest] (awake %ds) History: %s\n", (i + 1) * 5, log.c_str());
+            }
+        }
+
+        (void)runControl;
+        Serial.printf("[SleepTest] Mode: shipping arm (%umg, DUR=3, HPF on, settled).\n",
+                      g_motionThresholdMg);
+        imuEnableMotionWake(g_motionThresholdMg);   // settles the filter itself now
+
+        // If this is not low, the arm left INT1 asserted and the sleep will end
+        // instantly for reasons that have nothing to do with being shaken --
+        // which is precisely the artifact that made the last run unreadable.
+        const bool int1Low = (digitalRead(DB_IMU_INT1) == LOW);
+        Serial.printf("[SleepTest] Sleeping 30s. INT1 reads %s going in%s\n",
+                      int1Low ? "low (correct)" : "HIGH",
+                      int1Low ? "." : " -- expect an immediate, meaningless wake.");
+        Serial.println("[SleepTest] Run this on BATTERY -- with USB attached every wake is reported");
+        Serial.println("[SleepTest]   as a cold boot and the result is meaningless.");
+        Serial.flush();
+
+        PMU.setChargingLedMode(XPOWERS_CHG_LED_OFF);
+
+        esp_sleep_enable_timer_wakeup(30ULL * 1000000ULL);
+        esp_sleep_enable_ext1_wakeup(1ULL << DB_IMU_INT1, ESP_EXT1_WAKEUP_ANY_HIGH);
+        esp_deep_sleep_start();
+    }
+#endif
+
+#ifdef SPEED_SURVEY_MODE
+    // Finding the speed signal needs CAN bytes and a speed reference in the
+    // same log. GPS is that reference: independent of the bus, already aboard,
+    // and honest about its own quality via sats and HDOP. No MQTT, no sleep --
+    // ride, then read the CSV back and correlate offline exactly as RPM was
+    // correlated against the tacho.
+    //
+    // Published sources put SeaDoo speed on 0x208 or 0x268. Neither ID exists
+    // on this bus (see docs/can/seadoo-can.md), so it has to be found rather
+    // than looked up, and this emits every byte of every ID rather than
+    // guessing which to watch.
+    modemPowerOn();
+    initGNSS();
+    if (!canBeginListenOnly(CanBitrate::Rate500k)) {
+        Serial.println("[SURVEY] Could not open the CAN bus. Halting.");
+        while (true) delay(1000);
+    }
+    canResetSeen();
+
+    Serial.println("\n=== SPEED SURVEY ===");
+    Serial.println("Ride at a few steady speeds and hold each for ~15s.");
+    Serial.println("---8<--- BEGIN SURVEY CSV ---8<---");
+    Serial.println("t_ms,gps_kmh,sats,hdop,id,d0,d1,d2,d3,d4,d5,d6,d7");
+
+    const uint32_t t0 = millis();
+    float gpsKmh = -1; int gpsSats = 0; float gpsHdop = 99;
+    while (true) {
+        canDrain(400);
+
+        modem.sendAT("+CGNSINF");
+        if (modem.waitResponse(800L, "+CGNSINF: ") == 1) {
+            String res = modem.stream.readStringUntil('\n');
+            res.trim();
+            float la, lo, sp, al, hd; int st;
+            if (parseCGNSINF(res, &la, &lo, &sp, &al, &st, &hd)) {
+                gpsKmh = sp; gpsSats = st; gpsHdop = hd;
+            }
+        }
+
+        const uint32_t ms = millis() - t0;
+        for (size_t i = 0; i < canSeenCount(); i++) {
+            const CanFrameSummary* f = canSeen(i);
+            if (!f) continue;
+            Serial.printf("%lu,%.2f,%d,%.2f,%03X", (unsigned long)ms, gpsKmh, gpsSats, gpsHdop, f->id);
+            for (int b = 0; b < 8; b++) Serial.printf(",%02X", f->lastData[b]);
+            Serial.println();
+        }
+    }
+#endif
+
 #ifdef CAN_SNIFFER_MODE
     // Bring-up build: never returns. Deliberately after powerBegin() so the
     // transceiver starts from a defined state, and before anything touches the
@@ -992,7 +1383,7 @@ void setup() {
     // which is the normal state for a parked ski.
     g_engine = canReadEngine(1000);
 
-    transmitData(lat, lon, speed, alt, sats, hdop);
+    transmitData(has_fix, lat, lon, speed, alt, sats, hdop);
 
     // After the report, so a threshold change is decided on the same fix that
     // was just published and re-arms before this wake ends.
