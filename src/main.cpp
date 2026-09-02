@@ -522,7 +522,7 @@ static void enterDeepSleep(int minutes) {
     esp_deep_sleep_start();
 }
 
-void goToSleep(bool got_fix) {
+void goToSleep(bool got_fix, bool published) {
     modemPowerOff();
 
     // CAN traffic is the signal that the ski is running: the bus only wakes
@@ -566,6 +566,34 @@ void goToSleep(bool got_fix) {
             actual_interval = settings.report_interval_mins;
         }
         Serial.printf("[Backoff] Applying Backoff Sleep: %d minutes\n", actual_interval);
+    }
+
+    // A parked heartbeat that never reached the broker has to be retried sooner
+    // than a day, or one bad modem session becomes 48 hours of silence -- and
+    // silence is indistinguishable from a stolen ski, a flat battery, or a dead
+    // tracker. This is the opposite case to the backoff above: that one refuses
+    // to stretch the interval, this one refuses to leave it long.
+    //
+    // Escalating rather than fixed, because the common cause is no coverage, and
+    // retrying hourly forever in a dead zone spends the battery that the daily
+    // cadence exists to protect. After the ladder runs out it falls back to the
+    // normal heartbeat and tries again then.
+    if (!skiRunning && !published) {
+        unsigned int pubFails = prefs.getUInt("pub_fail", 0) + 1;
+        prefs.putUInt("pub_fail", pubFails);
+        int retry;
+        if (pubFails == 1)      retry = 60;
+        else if (pubFails == 2) retry = 180;
+        else if (pubFails == 3) retry = 360;
+        else                    retry = PARKED_INTERVAL_MINS;
+        if (retry < actual_interval) {
+            Serial.printf("[Uplink] Parked heartbeat did not publish (%u in a row) -> retrying in %d minutes\n",
+                          pubFails, retry);
+            actual_interval = retry;
+        }
+    } else if (published && prefs.getUInt("pub_fail", 0) > 0) {
+        Serial.println("[Uplink] Published again; clearing the retry ladder.");
+        prefs.putUInt("pub_fail", 0);
     }
     prefs.end();
 
@@ -901,7 +929,11 @@ void onDownlink(char* topic, uint8_t* payload, unsigned int length) {
     }
 }
 
-void transmitData(bool has_fix, float lat, float lon, float speed, float alt, int sats, float hdop) {
+// Returns whether the telemetry actually reached the broker. The caller needs
+// to know: a parked ski sleeps for a day between reports, so a failure that is
+// not noticed here is 48 hours of silence, not one missed report.
+bool transmitData(bool has_fix, float lat, float lon, float speed, float alt, int sats, float hdop) {
+    bool published = false;
     Serial.println("[Lifecycle] Preparing Transmission...");
 
     // Sampled here rather than in setup() so the reported orientation is the one
@@ -942,7 +974,7 @@ void transmitData(bool has_fix, float lat, float lon, float speed, float alt, in
     Serial.print("[Lifecycle] Waiting for Network...");
     if (!modem.waitForNetwork(180000L)) {
         Serial.println("Fail: Network Timeout");
-        return;
+        return published;
     }
     Serial.println(" OK");
     
@@ -1145,6 +1177,7 @@ void transmitData(bool has_fix, float lat, float lon, float speed, float alt, in
             }
             if (mqtt.publish(mqtt_topic_up.c_str(), payload.c_str())) {
                 Serial.println("[MQTT] Publish Successful");
+                published = true;
                 // Only a delivered report starts the motion rate limit. A failed
                 // publish leaves the previous timestamp standing, so the next
                 // movement is still allowed to try.
@@ -1190,6 +1223,7 @@ void transmitData(bool has_fix, float lat, float lon, float speed, float alt, in
     } else {
         Serial.println(" GPRS FAILED");
     }
+    return published;
 }
 
 void setup() {
@@ -1604,13 +1638,13 @@ void setup() {
     // which is the normal state for a parked ski.
     g_engine = canReadEngine(1000);
 
-    transmitData(has_fix, lat, lon, speed, alt, sats, hdop);
+    const bool published = transmitData(has_fix, lat, lon, speed, alt, sats, hdop);
 
     // After the report, so a threshold change is decided on the same fix that
     // was just published and re-arms before this wake ends.
     updateMotionThreshold(has_fix, speed);
 
-    goToSleep(has_fix);
+    goToSleep(has_fix, published);
 }
 
 void loop() {

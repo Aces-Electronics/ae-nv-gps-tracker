@@ -248,9 +248,22 @@ The firmware uses robust satellite count parsing with fallback logic:
   - **Running** (CAN bus awake) → the configured `report_interval_mins`,
     5 minutes by default, settable over BLE. GPS-failure backoff applies
     (5/15/30/60/180 min).
-  - **Parked** → a **1440-minute (daily) heartbeat**. Backoff is not applied;
-    stretching a day further on one missed fix trades away the only thing a
-    heartbeat is for.
+  - **Parked** → a **1440-minute (daily) heartbeat**. GPS-failure backoff is not
+    applied; stretching a day further on one missed fix trades away the only
+    thing a heartbeat is for.
+
+    **A parked heartbeat that fails to publish is retried sooner**, at 60 → 180
+    → 360 minutes before falling back to the daily cadence. Without this, one
+    bad modem session meant 48 hours of silence — and silence is
+    indistinguishable from a stolen ski, a flat battery, or a dead tracker.
+    Escalating rather than fixed because the usual cause is no coverage, and
+    retrying hourly forever in a dead zone spends exactly the battery the daily
+    cadence exists to protect.
+
+    Note the daily timer is clocked by the ESP32's **internal RC oscillator**,
+    not a crystal, so a 1440-minute sleep can legitimately land up to roughly an
+    hour either side. A heartbeat that is late by tens of minutes is normal; one
+    that is hours late is not.
 
   CAN traffic is the running signal because the ski's bus only wakes with the
   ignition. Supply voltage above ~13V would be the better test — it survives a
