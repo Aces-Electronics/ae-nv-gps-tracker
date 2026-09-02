@@ -61,7 +61,14 @@ static const uint16_t MQTT_BUFFER_SIZE = 768;
 // interval is correct as it stands: that value now describes the running case,
 // which is what it was always meant for.
 static const uint32_t HEARTBEAT_DEFAULT_MINS = 5;
-static const uint32_t PARKED_INTERVAL_MINS   = 1440;
+// A day is right in the field and useless on a bench: one change takes a day to
+// evaluate, and a heartbeat that fails leaves nothing to look at for another.
+// Overridable at compile time so the shipping default cannot be shortened by
+// accident -- see the heartbeat-test environment in platformio.ini.
+#ifndef PARKED_INTERVAL_MINS_OVERRIDE
+#define PARKED_INTERVAL_MINS_OVERRIDE 1440
+#endif
+static const uint32_t PARKED_INTERVAL_MINS   = PARKED_INTERVAL_MINS_OVERRIDE;
 
 OtaCommand g_otaCmd;
 bool g_otaPending = false;
@@ -537,8 +544,9 @@ void goToSleep(bool got_fix, bool published) {
     int actual_interval = skiRunning ? (int)settings.report_interval_mins
                                      : (int)PARKED_INTERVAL_MINS;
     if (actual_interval == 0) actual_interval = 5;
-    Serial.printf("[Lifecycle] Ski %s -> %d minute interval\n",
-                  skiRunning ? "RUNNING" : "parked", actual_interval);
+    Serial.printf("[Lifecycle] Ski %s -> %d minute interval%s\n",
+                  skiRunning ? "RUNNING" : "parked", actual_interval,
+                  PARKED_INTERVAL_MINS == 1440 ? "" : "  [SHORTENED TEST BUILD]");
 
     if (got_fix) {
         if (fails > 0) {
