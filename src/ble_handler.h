@@ -18,7 +18,7 @@ struct TrackerSettings {
     // still finds its own level from whichever floor is chosen. See the
     // MOTION_SENS_* constants in main.cpp for the values and their margins
     // against the measured noise floor.
-    uint8_t motion_sensitivity = 1;
+    uint8_t motion_sensitivity = 1;   // 1 = Medium, the shipped default
 
     // Verbose telemetry. Off by default: the normal frame is the bare essentials
     // for tracking a ski, and everything else -- the CAN decodes, the IMU vector,

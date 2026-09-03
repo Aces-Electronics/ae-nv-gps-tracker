@@ -90,19 +90,25 @@ const char* firmwareVersion() {
 // starts. Chosen against a measured noise floor of 24mg (high-pass filter
 // settled, board at rest), so the margins are known rather than guessed:
 //
-//   Low    352mg  ~15x noise  -- takes a deliberate shove. For a ski somewhere
+//   Low    704mg  ~29x noise  -- takes a deliberate shove. For a ski somewhere
 //                               lively, where less would report the weather.
-//   Medium 176mg  ~7.3x noise -- the default. Registers ordinary handling.
-//   High   128mg  ~5.3x noise -- for a quiet mooring where a nudge should count.
+//   Medium 352mg  ~15x noise  -- the shipped default. Registers ordinary handling.
+//   High   256mg  ~11x noise  -- for a quiet mooring where a nudge should count.
 //
-// All three sit exactly on the INT1_THS grid (16mg steps at +/-2g): 22, 11 and 8
+// Doubled from the original 352/176/128 after the first real deployment: a unit
+// on Medium riding in a car woke nine times in 65 minutes, and the ladder spent
+// the whole hour climbing away from a floor that was simply too low to start
+// from. The old Medium is the new Low, which is the honest description of what
+// 176mg turned out to be worth.
+//
+// All three sit exactly on the INT1_THS grid (16mg steps at +/-2g): 44, 22 and 16
 // counts, so none of them truncate. That is worth checking when retuning -- 56mg,
 // for instance, is not representable and would silently become 48mg, only 2x the
 // noise floor and closer to chasing the filter's own residue than detecting
 // anything.
-static const uint16_t MOTION_SENS_LOW_MG    = 352;
-static const uint16_t MOTION_SENS_MEDIUM_MG = 176;
-static const uint16_t MOTION_SENS_HIGH_MG   = 128;
+static const uint16_t MOTION_SENS_LOW_MG    = 704;
+static const uint16_t MOTION_SENS_MEDIUM_MG = 352;
+static const uint16_t MOTION_SENS_HIGH_MG   = 256;
 
 enum MotionSensitivity : uint8_t {
     MOTION_SENS_LOW = 0,
@@ -299,9 +305,18 @@ static const time_t MOTION_MIN_REPORT_S = 120;
 // costs sensitivity to real theft, so the ladder is short and it drops straight
 // back to the floor the moment genuine travel is seen.
 // The ladder's reach, as a multiple of whichever floor the sensitivity setting
-// chose. Eight because that is what Medium has been running (176 -> 1408); this
-// generalises the existing behaviour rather than retuning it.
-static const uint16_t MOTION_CEILING_MULTIPLE = 8;
+// chose. Four, for two reasons that agree: it puts Medium's ceiling on 1408mg,
+// which is where the ceiling has been all along, and it is the largest multiple
+// that still fits inside the part.
+//
+// That second reason is not incidental. INT1_THS tops out at 2032mg (7 bits,
+// 16mg steps at +/-2g), and once the floors doubled an eightfold reach ran every
+// setting into that cap: High, Medium and Low would all have ceilinged at 2032,
+// giving reaches of 7.9x, 5.8x and 2.9x. That is the same inversion this scaling
+// exists to remove -- the MOST sensitive setting getting the MOST room to deafen
+// itself -- reintroduced through the back door by a clamp rather than by a
+// constant. Four fits, and the reach comes out even.
+static const uint16_t MOTION_CEILING_MULTIPLE = 4;
 
 // Step and ceiling both scale with the selected sensitivity. They used to be
 // flat 176 and 1408 -- which are Medium's numbers -- and that made the setting
