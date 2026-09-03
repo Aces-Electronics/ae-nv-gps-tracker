@@ -307,7 +307,45 @@ bool otaDownloadAndApply(TinyGsm& modem, const OtaCommand& cmd) {
     // The md5 from the MQTT command is what makes the image trustworthy, which
     // is why otaParseCommand() refuses a command without one.
     TinyGsmClient* net = otaClient(modem, u.https);
-    net->setTimeout(10000);
+    // Raise the UART BEFORE the socket is opened.
+    //
+    // Doing it after the connection was streaming hung the device outright: the
+    // modem already had data queued (+CAURC: buffer full arrives while the HTTP
+    // headers are still being parsed), and changing the rate mid-stream corrupts
+    // the framing. TinyGSM's modemRead() then waits up to setTimeout() PER BYTE
+    // -- ten seconds each, a thousand bytes a chunk -- so the transfer never
+    // returns and the stall check below never gets to run. Observed as seven
+    // minutes of complete silence after the switch.
+    //
+    // Nothing is in flight here, so the switch is safe.
+    const bool fastBaud = otaSetBaud(modem, OTA_FAST_BAUD);
+
+    // Scope guard rather than a restore at the end.
+    //
+    // There are five early returns between here and the end of this function --
+    // connect failure, header failure, a bad content length, an Update.begin()
+    // failure -- and every one of them would otherwise leave the modem fast
+    // while the next boot opens Serial1 at 115200. modemPowerOn() can recover
+    // from that, but only after a reboot, and relying on remembering five exit
+    // paths is how the sixth one gets missed.
+    struct BaudGuard {
+        TinyGsm& modem;
+        bool     active;
+        ~BaudGuard() { if (active) otaSetBaud(modem, OTA_BASE_BAUD); }
+    } baudGuard{modem, fastBaud};
+
+    // 2s, not 10. TinyGSM's modemRead() waits this long PER BYTE, so the socket
+    // timeout multiplies by the chunk size when a stream goes bad: at 10s and a
+    // 1024-byte chunk that is nearly three hours inside a single read() call,
+    // which is why the mid-stream baud switch presented as a total hang rather
+    // than as the stall the loop below is meant to catch. The stall and overall
+    // timeouts are only checked between chunks, so they cannot rescue a read
+    // that never returns.
+    //
+    // 2s is still ~180x the 11ms a 1024-byte chunk takes at 921600, so it is not
+    // tight for a slow link -- it just stops one bad chunk costing hours. The
+    // real fix is not corrupting the stream in the first place, above.
+    net->setTimeout(2000);
 
     if (!net->connect(u.host.c_str(), u.port, OTA_CONNECT_TIMEOUT_S)) {
         Serial.println("[OTA] Connect failed.");
@@ -379,9 +417,6 @@ bool otaDownloadAndApply(TinyGsm& modem, const OtaCommand& cmd) {
     // first is silently discarded and the image is written unverified.
     Update.setMD5(cmd.md5.c_str());
 
-    // Raised for the transfer only, and restored on every exit path below.
-    const bool fastBaud = otaSetBaud(modem, OTA_FAST_BAUD);
-
     uint8_t  buf[OTA_CHUNK];
     size_t   written  = 0;
     uint32_t started  = millis();
@@ -441,9 +476,8 @@ bool otaDownloadAndApply(TinyGsm& modem, const OtaCommand& cmd) {
 
     net->stop();
 
-    // Always back to the base rate: AT+IPR is not persisted, so the next boot
-    // brings Serial1 up at 115200 and a modem left fast would be unreachable.
-    if (fastBaud) otaSetBaud(modem, OTA_BASE_BAUD);
+    // The base rate is restored by baudGuard's destructor on every path out of
+    // this function, including the early returns above.
 
     {
         const uint32_t ms = millis() - started;
