@@ -401,6 +401,12 @@ static const int SUPPRESSED_WAKES_BEFORE_RAISE = 10;
 // likely anything crosses the threshold to tell it otherwise, including a theft.
 static const int QUIET_REPORTS_BEFORE_LOWER = 3;
 
+// Survival cadence when the LiPo is nearly flat, and the flag that selects it.
+// Not RTC_DATA_ATTR: it is re-measured from the PMU on every wake, so a stale
+// copy could only ever disagree with the battery in front of it.
+static const uint32_t LOW_BATTERY_INTERVAL_MINS = 1440;
+static bool g_lowBattery = false;
+
 // Counts passes of the deep-sleep wake test so it can alternate the pad holds
 // across sleeps instead of needing two builds.
 RTC_DATA_ATTR static int s_sleepTestPass = 0;
@@ -692,6 +698,12 @@ static void enterDeepSleep(int minutes) {
 // Pure: the NVS side effects (the gps_fail counter, the pub_fail ladder) stay in
 // goToSleep(). Callers pass the fail count they expect to be acting on.
 static int sleepIntervalMins(bool skiRunning, bool gotFix, int consecutiveFails) {
+    // Ahead of everything else, including the running case. A ski whose tracker
+    // battery is nearly flat is worth one report a day and nothing more: at this
+    // point reporting is what is draining it, and a tracker that flattens itself
+    // reporting hourly has traded every future report for a few more today.
+    if (g_lowBattery) return (int)LOW_BATTERY_INTERVAL_MINS;
+
     int mins = skiRunning ? (int)settings.report_interval_mins
                           : (int)PARKED_INTERVAL_MINS;
     if (mins == 0) mins = 5;
@@ -843,11 +855,26 @@ bool parseCGNSINF(String raw, float* lat, float* lon, float* speed, float* alt, 
 void checkPowerConfig() {
     float batt_volts = PMU.getBattVoltage() / 1000.0F;
     Serial.printf("[Lifecycle] Battery: %.2fV\n", batt_volts);
-    
+
     // Survival Mode: < 3.4V (approx 10-15%)
-    if (batt_volts < 3.40) {
-        Serial.println("[Lifecycle] LOW BATTERY! Forcing 24h Interval.");
-        settings.report_interval_mins = 1440; // 24 Hours
+    //
+    // A flag rather than an edit to settings.report_interval_mins, which is what
+    // this used to do and which was wrong twice over.
+    //
+    // It did not work. report_interval_mins is the RUNNING interval; a parked
+    // ski takes PARKED_INTERVAL_MINS and never reads it. So the one protection
+    // against a flat battery did nothing in the state it exists for -- parked,
+    // unattended, nobody watching.
+    //
+    // And it did not stay put. saveSettings() persists report_interval_mins to
+    // NVS, and the BLE window can call it later in the same boot, so a single
+    // low-battery wake could write 1440 permanently. The battery recovers; the
+    // interval does not. That is a tracker quietly demoted to one report a day
+    // for the rest of its life by a moment of low charge.
+    g_lowBattery = (batt_volts < 3.40f);
+    if (g_lowBattery) {
+        Serial.printf("[Lifecycle] LOW BATTERY (%.2fV)! Holding off at %u minute reports.\n",
+                      batt_volts, (unsigned)LOW_BATTERY_INTERVAL_MINS);
     } else {
         Serial.printf("[Lifecycle] Power OK. Interval: %d mins\n", settings.report_interval_mins);
     }
