@@ -681,6 +681,39 @@ static void enterDeepSleep(int minutes) {
     esp_deep_sleep_start();
 }
 
+// How long this wake will sleep for, from the inputs that decide it.
+//
+// Extracted because goToSleep() settles this *after* transmitData() has already
+// built and sent the report, so the frame could never say when its own successor
+// was due. Nothing else in the payload distinguishes a tracker on a 1440 minute
+// interval from one that has stopped working, and telling those two apart cost
+// an hour the first time it mattered.
+//
+// Pure: the NVS side effects (the gps_fail counter, the pub_fail ladder) stay in
+// goToSleep(). Callers pass the fail count they expect to be acting on.
+static int sleepIntervalMins(bool skiRunning, bool gotFix, int consecutiveFails) {
+    int mins = skiRunning ? (int)settings.report_interval_mins
+                          : (int)PARKED_INTERVAL_MINS;
+    if (mins == 0) mins = 5;
+    if (gotFix) return mins;
+
+    if      (consecutiveFails >= 5) mins = 180;  // 3 hours
+    else if (consecutiveFails == 4) mins = 60;
+    else if (consecutiveFails == 3) mins = 30;
+    else if (consecutiveFails == 2) mins = 15;
+    else if (consecutiveFails == 1) mins = 5;
+
+    // Backoff only means anything while the ski is running. Parked, the interval
+    // is already long and stretching it further on a missed fix would trade away
+    // the one thing a heartbeat is for.
+    if (!skiRunning) {
+        mins = PARKED_INTERVAL_MINS;
+    } else if (mins < (int)settings.report_interval_mins) {
+        mins = settings.report_interval_mins;
+    }
+    return mins;
+}
+
 void goToSleep(bool got_fix, bool published) {
     modemPowerOff();
 
@@ -693,38 +726,24 @@ void goToSleep(bool got_fix, bool published) {
 
     prefs.begin("tracker", false);
     int fails = prefs.getUInt("gps_fail", 0);
-    int actual_interval = skiRunning ? (int)settings.report_interval_mins
-                                     : (int)PARKED_INTERVAL_MINS;
-    if (actual_interval == 0) actual_interval = 5;
-    Serial.printf("[Lifecycle] Ski %s -> %d minute interval%s\n",
-                  skiRunning ? "RUNNING" : "parked", actual_interval,
-                  PARKED_INTERVAL_MINS == 1440 ? "" : "  [SHORTENED TEST BUILD]");
 
     if (got_fix) {
         if (fails > 0) {
             Serial.printf("[Backoff] Fix obtained! Resetting fail count (was %d)\n", fails);
             prefs.putUInt("gps_fail", 0);
         }
+        fails = 0;
     } else {
         fails++;
         prefs.putUInt("gps_fail", fails);
         Serial.printf("[Backoff] No Fix this session. Consecutive Fails: %d\n", fails);
-        
-        // Backoff Strategy (Exponential-ish if failing)
-        if (fails >= 5) actual_interval = 180;      // 3 hours
-        else if (fails == 4) actual_interval = 60;  // 1 hour
-        else if (fails == 3) actual_interval = 30;  // 30 mins
-        else if (fails == 2) actual_interval = 15;  // 15 mins
-        else if (fails == 1) actual_interval = 5;   // 5 mins
-        
-        // Backoff only means anything while the ski is running. Parked, the
-        // interval is already a day and stretching it further on a missed fix
-        // would trade away the one thing a heartbeat is for.
-        if (!skiRunning) {
-            actual_interval = PARKED_INTERVAL_MINS;
-        } else if (actual_interval < (int)settings.report_interval_mins) {
-            actual_interval = settings.report_interval_mins;
-        }
+    }
+
+    int actual_interval = sleepIntervalMins(skiRunning, got_fix, fails);
+    Serial.printf("[Lifecycle] Ski %s -> %d minute interval%s\n",
+                  skiRunning ? "RUNNING" : "parked", actual_interval,
+                  PARKED_INTERVAL_MINS == 1440 ? "" : "  [SHORTENED TEST BUILD]");
+    if (!got_fix) {
         Serial.printf("[Backoff] Applying Backoff Sleep: %d minutes\n", actual_interval);
     }
 
@@ -1369,13 +1388,16 @@ bool transmitData(bool has_fix, float lat, float lon, float speed, float alt, in
             }
 
             // Published so the adaptive logic can be seen working from the
-            // backend rather than only from a serial cable.
-            if (dbg) doc["motion_threshold_mg"] = g_motionThresholdMg;
+            // backend rather than only from a serial cable -- which is what the
+            // dbg gate that used to be here prevented, defeating the sentence
+            // above it. This board sat at 528mg on a 176mg floor for an hour and
+            // nothing in the cloud said so.
+            doc["motion_threshold_mg"] = g_motionThresholdMg;
             // The setting, alongside where the ladder currently sits. Both are
             // wanted: the first is what somebody chose, the second is what the
             // ski decided, and a support question about false wakes needs to
             // tell them apart.
-            if (dbg) doc["motion_sensitivity"] = motionSensitivityName(settings.motion_sensitivity);
+            doc["motion_sensitivity"] = motionSensitivityName(settings.motion_sensitivity);
             // Wakes since the last report that were rate-limited away. Published
             // because it is the one number that explains a tracker reporting
             // often, or a battery going down faster than the interval suggests,
@@ -1413,6 +1435,19 @@ bool transmitData(bool has_fix, float lat, float lon, float speed, float alt, in
             doc["rssi"] = dbm;
             
             doc["interval"] = settings.report_interval_mins;
+
+            // When the next frame is actually due -- the running interval above
+            // is only half the answer, and it is the half that misleads: a
+            // parked ski ignores it entirely. Recomputed from the same inputs
+            // goToSleep() will use rather than guessed.
+            //
+            // The failed-publish retry ladder in goToSleep() can shorten this,
+            // but only when the publish failed -- and then no frame arrives to
+            // carry the number, so what is delivered is always right.
+            prefs.begin("tracker", true);
+            const int gpsFails = has_fix ? 0 : ((int)prefs.getUInt("gps_fail", 0) + 1);
+            prefs.end();
+            doc["next_wake_mins"] = sleepIntervalMins(g_engine.busAlive, has_fix, gpsFails);
             
             String payload;
             serializeJson(doc, payload);
