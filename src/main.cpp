@@ -298,8 +298,31 @@ static const time_t MOTION_MIN_REPORT_S = 120;
 // wash from a passing boat, wind, someone leaning on the hull. Every step up
 // costs sensitivity to real theft, so the ladder is short and it drops straight
 // back to the floor the moment genuine travel is seen.
-static const uint16_t MOTION_THRESHOLD_STEP_MG = 176;
-static const uint16_t MOTION_THRESHOLD_MAX_MG  = 1408;
+// The ladder's reach, as a multiple of whichever floor the sensitivity setting
+// chose. Eight because that is what Medium has been running (176 -> 1408); this
+// generalises the existing behaviour rather than retuning it.
+static const uint16_t MOTION_CEILING_MULTIPLE = 8;
+
+// Step and ceiling both scale with the selected sensitivity. They used to be
+// flat 176 and 1408 -- which are Medium's numbers -- and that made the setting
+// a floor and nothing else: a unit on High (128mg floor) could still be walked
+// to 1408mg, eleven times what its owner asked for, and a unit on Medium could
+// pass 352mg and end up deafer than the LOW setting ever offers. Observed in
+// the field at 528mg on Medium, which is what prompted this.
+//
+//   High    128mg floor ->  1024mg ceiling
+//   Medium  176mg floor ->  1408mg ceiling   (unchanged from before)
+//   Low     352mg floor ->  2816mg, clamped to 2032mg by the register
+//
+// Scaling the step too keeps the number of rungs the same at every setting, so
+// "three unexplained wakes" costs the same fraction of the range wherever the
+// owner put the floor.
+static uint16_t motionStepMg() { return g_motionBaseMg; }
+static uint16_t motionCeilingMg() {
+    uint32_t c = (uint32_t)g_motionBaseMg * MOTION_CEILING_MULTIPLE;
+    if (c > IMU_MAX_THRESHOLD_MG) c = IMU_MAX_THRESHOLD_MG;
+    return (uint16_t)c;
+}
 
 // Consecutive unexplained motion wakes before the threshold goes up. Three,
 // because one is noise and two is a coincidence.
@@ -401,7 +424,7 @@ static uint16_t loadMotionThreshold() {
     prefs.end();
 
     if (v < g_motionBaseMg)           v = g_motionBaseMg;
-    if (v > MOTION_THRESHOLD_MAX_MG)  v = MOTION_THRESHOLD_MAX_MG;
+    if (v > motionCeilingMg())        v = motionCeilingMg();
     Serial.printf("[Motion] Sensitivity %s: floor %umg, current threshold %umg\n",
                   motionSensitivityName(sens), g_motionBaseMg, v);
     return v;
@@ -463,17 +486,17 @@ static const char* wakeReasonName() {
 static bool stepMotionThreshold(bool up) {
     uint16_t next;
     if (up) {
-        if (g_motionThresholdMg >= MOTION_THRESHOLD_MAX_MG) {
-            Serial.printf("[Motion] Already at the %umg ceiling; not going deafer than this.\n",
-                          MOTION_THRESHOLD_MAX_MG);
+        if (g_motionThresholdMg >= motionCeilingMg()) {
+            Serial.printf("[Motion] Already at the %umg ceiling for this sensitivity; not going deafer.\n",
+                          motionCeilingMg());
             return false;
         }
-        next = g_motionThresholdMg + MOTION_THRESHOLD_STEP_MG;
-        if (next > MOTION_THRESHOLD_MAX_MG) next = MOTION_THRESHOLD_MAX_MG;
+        next = g_motionThresholdMg + motionStepMg();
+        if (next > motionCeilingMg()) next = motionCeilingMg();
     } else {
         if (g_motionThresholdMg <= g_motionBaseMg) return false;
-        next = (g_motionThresholdMg > g_motionBaseMg + MOTION_THRESHOLD_STEP_MG)
-                 ? (uint16_t)(g_motionThresholdMg - MOTION_THRESHOLD_STEP_MG)
+        next = (g_motionThresholdMg > g_motionBaseMg + motionStepMg())
+                 ? (uint16_t)(g_motionThresholdMg - motionStepMg())
                  : g_motionBaseMg;
     }
 
@@ -983,7 +1006,14 @@ bool getPreciseLocation(float* lat, float* lon, float* speed, float* alt, int* s
                 Serial.printf("[GPS] Valid! Lat=%.4f Lon=%.4f Sats=%d HDOP=%.2f PDOP=%.2f\n", f_lat, f_lon, f_sats, f_acc, f_pdop);
                 *lat = f_lat; *lon = f_lon; *speed = f_speed; *alt = f_alt; *sats = f_sats; *hdop = f_acc; *pdop = f_pdop;
 
-                if (f_acc < 1.5 || (f_acc < 2.5 && f_sats >= 4)) {
+                // A DOP of 0 is the field being absent, not a perfect fix.
+                // It parses to 0.0 and sails through every "< 1.5" test here,
+                // so an unqualifiable fix used to lock instantly and then be
+                // published as the best kind there is. Unknown quality cannot
+                // clear a quality bar. The cost of refusing it is that such a
+                // fix keeps the acquisition loop running to its timeout and is
+                // then reported as no fix, which is the honest answer.
+                if (f_acc > 0.0f && (f_acc < 1.5f || (f_acc < 2.5f && f_sats >= 4))) {
                     locked = true;
                     break; 
                 }
