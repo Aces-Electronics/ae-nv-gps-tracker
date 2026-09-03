@@ -410,6 +410,34 @@ optimistic — a flat jetski battery reads around 9V rather than as flat.
 Note `charge_state: "Fault"` with **no LiPo attached** is expected: the
 BQ25176J blinks STAT when it has nothing to charge.
 
+### OTA downloads
+
+Downloads used to die part-way with `+CAURC: buffer full` followed by
+`Socket closed early` — 397468 of 680816 bytes on the observed failure.
+
+The cause is arithmetic, not a bug. TinyGSM drains a socket **one byte at a
+time** over the modem UART, and at 115200 baud that is ~11.5 KB/s. LTE Cat-M1
+delivers up to ~37 KB/s, so the network fills the modem's socket buffer about
+three times faster than it can be emptied — which is precisely what
+`+CAURC: buffer full` reports. A 680 KB image also needs ≥59s of pure UART time
+at 115200 before any AT overhead.
+
+Three changes:
+
+- **The modem UART is raised to 921600 for the transfer** (~92 KB/s), so the
+  UART stops being the constraint rather than merely keeping pace. Restored to
+  115200 afterwards: `AT+IPR` is not persisted without `AT&W`, so a modem left
+  fast would be unreachable on the next boot when `Serial1` opens at 115200.
+  The switch verifies the link at the new rate and reverts on failure — the only
+  remote repair path for a fielded tracker is the OTA itself, so a half-applied
+  baud change would be unrecoverable. Both 460800 and 921600 were confirmed on
+  hardware with the `baud-test` environment.
+- **`TINY_GSM_DEBUG` is no longer in the release build.** It prints a line per
+  data URC — ~660 of them per OTA — onto the same serial port the download is
+  competing with. Use the `modem-debug` environment when AT tracing is wanted.
+- **The empty-poll delay is 2ms rather than 20ms**, and throughput is logged in
+  KB/s, so a future failure can be read rather than guessed at.
+
 ## Known Issues
 
 1. **BLE Connection**: Some devices experience connection stability issues (see agent prompt)

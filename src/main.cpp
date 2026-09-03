@@ -1467,6 +1467,53 @@ void setup() {
     }
 #endif
 
+#ifdef BAUD_TEST_MODE
+    // Proves the OTA's baud switch on real hardware before it is trusted.
+    //
+    // Raising the modem UART is the fix for a download that cannot keep up, but
+    // it is also the one change here that could strand a fielded unit: if the
+    // modem takes +IPR and the host loses sync, the only remote repair path is
+    // the OTA being repaired. So the switch, the link check and the restore all
+    // get exercised here, where a failure costs a USB cable.
+    {
+        // setup() opens Serial1 well below this point, so without it here the
+        // test talks to a UART that was never started -- which looks exactly
+        // like a modem that will not answer.
+        Serial1.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
+        modemPowerOn();
+        Serial.println("\n=== MODEM BAUD SWITCH TEST ===");
+        if (!modem.testAT(5000)) {
+            Serial.println("[BaudTest] Modem not responding at 115200; nothing to test.");
+        } else {
+            Serial.println("[BaudTest] OK at 115200.");
+            for (uint32_t rate : { 460800UL, 921600UL }) {
+                Serial.printf("\n[BaudTest] --- trying %lu ---\n", (unsigned long)rate);
+                modem.sendAT(GF("+IPR="), rate);
+                const int resp = modem.waitResponse(2000L);
+                Serial.printf("[BaudTest] +IPR reply: %d\n", resp);
+                delay(100);
+                Serial1.updateBaudRate(rate);
+                delay(150);
+                const bool ok = modem.testAT(2000);
+                Serial.printf("[BaudTest] link at %lu: %s\n",
+                              (unsigned long)rate, ok ? "OK" : "DEAD");
+
+                // Restore, and prove the restore works too -- an untested
+                // restore is the half that actually strands a device.
+                modem.sendAT(GF("+IPR="), 115200);
+                modem.waitResponse(2000L);
+                delay(100);
+                Serial1.updateBaudRate(115200);
+                delay(150);
+                Serial.printf("[BaudTest] back at 115200: %s\n",
+                              modem.testAT(2000) ? "OK" : "DEAD");
+            }
+        }
+        Serial.println("\n[BaudTest] done; halting.");
+        while (true) delay(1000);
+    }
+#endif
+
 #ifdef SUPPLY_CAL_MODE
     // Two-point calibration for the supply divider.
     //
