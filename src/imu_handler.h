@@ -96,6 +96,19 @@ void imuClearMotionInterrupt();
 // numbers. Restores CTRL2 on the way out; still call imuEnableMotionWake() after.
 void imuDumpFilteredData(uint32_t ms);
 
+// Reads the LIS3DH's auxiliary ADC1 (U2.16), which the daughter board wires to
+// the supply-sense divider. Returns the raw signed 16-bit register pair; the
+// part is 10-bit and left-justified, so the meaningful value is (raw >> 6).
+//
+// Deliberately RAW. ST does not document whether the code is inverted, and the
+// divider's real ratio depends on resistor tolerance and on an input impedance
+// ST does not specify -- so a formula derived from the schematic would be a
+// guess wearing a unit. Two known voltages turn this into volts; until then the
+// raw count is the honest thing to publish.
+//
+// Returns false if no IMU answered.
+bool imuReadAdc1(int16_t& raw);
+
 // Bench diagnostic: static proof of the interrupt generator, using gravity as
 // the stimulus so it needs nobody to shake anything. Leaves the interrupt block
 // reconfigured -- call imuEnableMotionWake() afterwards to re-arm.

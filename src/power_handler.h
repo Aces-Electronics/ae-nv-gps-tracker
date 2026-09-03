@@ -29,6 +29,19 @@ PowerStatus powerRead();
 // match, updating `status` with the outcome.
 void powerApplyChargePolicy(float battVolts, PowerStatus& status);
 
+// Reads the ski's supply through the daughter board's divider.
+//
+// The divider taps SUPPLY, which is AFTER the TPS1H000 switch, so it reads zero
+// whenever the charge policy has cut the feed -- which is most of the time, by
+// design. Measuring therefore means briefly closing the switch, letting the node
+// settle, taking the sample, and putting the switch back exactly as it was.
+//
+// Returns false if there is no IMU to read the ADC with. The value is a RAW
+// count, not volts: see imuReadAdc1() for why a formula from the schematic would
+// be a guess. supplyEnabledBefore reports the state that was restored, so a
+// caller can tell a genuine zero from a reading taken with the feed cut.
+bool powerReadSupplyRaw(int16_t& raw, bool& supplyEnabledBefore);
+
 // Latches SUPPLY_EN and the transceiver standby pin so they survive deep sleep.
 // Call immediately before esp_deep_sleep_start().
 void powerPrepareForSleep();

@@ -3,6 +3,7 @@
 #include "driver/gpio.h"
 #include "esp_adc_cal.h"
 #include <Wire.h>
+#include "imu_handler.h"
 
 // Kept in RTC memory so the hysteresis band below has a previous decision to
 // hold onto across a sleep. A cold boot initialises it to true, which matches
@@ -129,6 +130,45 @@ void powerApplyChargePolicy(float battVolts, PowerStatus& status) {
         driveSupply(enable);
     }
     status.supplyEnabled = s_supplyEnabled;
+}
+
+// How long to let the divider settle once the switch closes.
+//
+// Source impedance is 1.8M || 200k = 180k. With C3 at 10nF that is a 1.8ms time
+// constant; if C3 has been changed to 100nF it is 18ms. 200ms covers six time
+// constants of the slower case and the TPS1H000's own turn-on, so it is correct
+// for either board without needing to know which is fitted. The cost is 200ms of
+// jetski supply per report, which is nothing against a report that runs the
+// modem for a minute.
+static const uint32_t SUPPLY_SETTLE_MS = 200;
+
+bool powerReadSupplyRaw(int16_t& raw, bool& supplyEnabledBefore) {
+    supplyEnabledBefore = s_supplyEnabled;
+    if (!imuPresent()) return false;
+
+    const bool needToClose = !s_supplyEnabled;
+    if (needToClose) {
+        Serial.println("[Power] Closing the switch briefly to read supply voltage.");
+        driveSupply(true);
+        delay(SUPPLY_SETTLE_MS);
+    }
+
+    const bool ok = imuReadAdc1(raw);
+
+    // Back exactly as it was, including the case where the policy had it on.
+    // Leaving the feed closed because a measurement happened would quietly undo
+    // the charge cutoff, which is the one thing that stops the jetski battery
+    // being drained by a parked tracker.
+    if (needToClose) driveSupply(false);
+
+    if (ok) {
+        Serial.printf("[Power] Supply ADC raw=%d (switch was %s, %s to read)\n",
+                      raw, supplyEnabledBefore ? "on" : "cut",
+                      needToClose ? "closed briefly" : "already on");
+    } else {
+        Serial.println("[Power] Supply ADC read failed.");
+    }
+    return ok;
 }
 
 void powerPrepareForSleep() {

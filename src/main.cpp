@@ -1,6 +1,7 @@
 #define TINY_GSM_DEBUG Serial
 #include <Arduino.h>
 #include "utilities.h"
+#include "esp_private/esp_clk.h"
 #include <TinyGsmClient.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -302,6 +303,10 @@ static const int QUIET_REPORTS_BEFORE_LOWER = 3;
 // Counts passes of the deep-sleep wake test so it can alternate the pad holds
 // across sleeps instead of needing two builds.
 RTC_DATA_ATTR static int s_sleepTestPass = 0;
+
+// Survives deep sleep but not a reset, which is the point: if this keeps
+// reading 0 the board is resetting rather than waking.
+RTC_DATA_ATTR static int s_minimalBootCount = 0;
 
 uint16_t g_motionThresholdMg = MOTION_SENS_MEDIUM_MG;
 EngineData g_engine;
@@ -940,6 +945,31 @@ void onDownlink(char* topic, uint8_t* payload, unsigned int length) {
 // Returns whether the telemetry actually reached the broker. The caller needs
 // to know: a parked ski sleeps for a day between reports, so a failure that is
 // not noticed here is 48 hours of silence, not one missed report.
+// Two-point calibration for the supply divider, held in NVS.
+//
+// A linear fit through two measured points rather than a formula from the
+// schematic, because that absorbs everything unknown at once: whether the ADC
+// code is inverted, the actual full-scale, the loading error against an input
+// impedance ST does not specify, and resistor tolerance. Take one reading at a
+// known low voltage and one at a known high voltage -- 12.00V and 14.40V span
+// the useful range -- and store both.
+//
+// Returns false until both points exist, so supply_voltage simply does not
+// appear rather than appearing wrong.
+static bool supplyRawToVolts(int16_t raw, float& volts) {
+    prefs.begin("tracker", true);
+    const int32_t rawLo  = prefs.getInt("sup_raw_lo", 0);
+    const int32_t rawHi  = prefs.getInt("sup_raw_hi", 0);
+    const float   voltLo = prefs.getFloat("sup_v_lo", 0.0f);
+    const float   voltHi = prefs.getFloat("sup_v_hi", 0.0f);
+    prefs.end();
+
+    if (rawLo == rawHi || voltLo == voltHi) return false;   // not calibrated
+
+    volts = voltLo + (float)(raw - rawLo) * (voltHi - voltLo) / (float)(rawHi - rawLo);
+    return true;
+}
+
 bool transmitData(bool has_fix, float lat, float lon, float speed, float alt, int sats, float hdop) {
     bool published = false;
     Serial.println("[Lifecycle] Preparing Transmission...");
@@ -953,6 +983,16 @@ bool transmitData(bool has_fix, float lat, float lon, float speed, float alt, in
     // applied here too, so a decision to cut or restore the jetski feed is made
     // against the battery voltage that is about to be published alongside it.
     PowerStatus power = powerRead();
+
+    // Read the ski's supply BEFORE the charge policy runs. The divider taps
+    // downstream of the switch, so this has to close the switch briefly -- doing
+    // it first keeps that momentary closure clearly separate from the policy's
+    // own decision, and leaves the policy with the last word on what state the
+    // switch is left in for the sleep.
+    int16_t supplyRaw = 0;
+    bool supplyWasEnabled = false;
+    const bool haveSupply = powerReadSupplyRaw(supplyRaw, supplyWasEnabled);
+
     powerApplyChargePolicy(PMU.getBattVoltage() / 1000.0F, power);
 
     imei = getIMEIWithRetry();
@@ -1156,6 +1196,25 @@ bool transmitData(bool has_fix, float lat, float lon, float speed, float alt, in
             // battery going down faster than it should. Sending it when it is
             // zero is what would be noise, so it goes out only when it is not.
             if (dbg || s_suppressedWakes > 0) doc["motion_suppressed"] = s_suppressedWakes;
+
+            // Ski supply, read through the daughter board's divider by the
+            // LIS3DH aux ADC. Published RAW, not as volts: ST does not document
+            // whether the ADC code is inverted, and the real ratio depends on
+            // resistor tolerance and on an input impedance ST does not specify,
+            // so a figure derived from the schematic would be a guess wearing a
+            // unit. Two bench readings at known voltages turn it into volts --
+            // supplyRawToVolts() emits supply_voltage only once they exist.
+            //
+            // Always sent when it could be read, including on a debug-off frame:
+            // this is the field that the divider rework exists to produce, and a
+            // raw count nobody can see is not worth taking.
+            if (haveSupply) {
+                doc["supply_adc_raw"] = supplyRaw;
+                float supplyVolts;
+                if (supplyRawToVolts(supplyRaw, supplyVolts)) {
+                    doc["supply_voltage"] = supplyVolts;
+                }
+            }
 
             int csq = modem.getSignalQuality();
             int dbm = (csq == 99) ? -113 : (csq * 2) - 113;
@@ -1405,6 +1464,165 @@ void setup() {
         if (imuPresent() && (n % 8 == 0)) imuRead();
 
         delay(200);
+    }
+#endif
+
+#ifdef SUPPLY_CAL_MODE
+    // Two-point calibration for the supply divider.
+    //
+    // A linear fit through two measured points, not a formula from the
+    // schematic: that absorbs whether the ADC code is inverted, the real
+    // full-scale, the loading error against an input impedance ST does not
+    // specify, and resistor tolerance -- all at once, and without needing to
+    // know which of them is responsible for what.
+    {
+        Serial.println("\n=== SUPPLY DIVIDER CALIBRATION ===");
+        Serial.println("Apply a known voltage to SUPPLY_IN, let the reading settle, then type:");
+        Serial.println("  L <volts>   store as the LOW point    e.g.  L 12.00");
+        Serial.println("  H <volts>   store as the HIGH point   e.g.  H 14.40");
+        Serial.println("  S           show what is stored");
+        Serial.println("  C           clear both points");
+        Serial.println("Readings are an average of 16 samples, once a second.\n");
+
+        String line;
+        uint32_t lastRead = 0;
+        int16_t lastRaw = 0;
+        bool haveRaw = false;
+
+        for (;;) {
+            if (millis() - lastRead > 1000) {
+                lastRead = millis();
+                // Averaged: a single sample of a 10-bit ADC on a 180k source is
+                // noisy enough that two calibration points taken from single
+                // reads would bake that noise into the fit.
+                int32_t sum = 0; int n = 0;
+                for (int i = 0; i < 16; i++) {
+                    int16_t r; bool was;
+                    if (powerReadSupplyRaw(r, was)) { sum += r; n++; }
+                    delay(5);
+                }
+                if (n) {
+                    lastRaw = (int16_t)(sum / n);
+                    haveRaw = true;
+                    Serial.printf("[Cal] raw = %6d   (10-bit: %4d)\n", lastRaw, lastRaw >> 6);
+                } else {
+                    Serial.println("[Cal] ADC read failed -- is the daughter board fitted?");
+                }
+            }
+
+            while (Serial.available()) {
+                char c = (char)Serial.read();
+                if (c == '\n' || c == '\r') {
+                    line.trim();
+                    if (line.length()) {
+                        const char k = toupper(line[0]);
+                        prefs.begin("tracker", false);
+                        if ((k == 'L' || k == 'H') && haveRaw) {
+                            const float v = line.substring(1).toFloat();
+                            if (v <= 0) {
+                                Serial.println("[Cal] Need a voltage, e.g. L 12.00");
+                            } else {
+                                prefs.putInt(k == 'L' ? "sup_raw_lo" : "sup_raw_hi", lastRaw);
+                                prefs.putFloat(k == 'L' ? "sup_v_lo" : "sup_v_hi", v);
+                                Serial.printf("[Cal] Stored %s point: raw %d = %.2fV\n",
+                                              k == 'L' ? "LOW" : "HIGH", lastRaw, v);
+                            }
+                        } else if (k == 'S') {
+                            Serial.printf("[Cal] LOW  raw %d = %.2fV\n",
+                                          prefs.getInt("sup_raw_lo", 0), prefs.getFloat("sup_v_lo", 0.0f));
+                            Serial.printf("[Cal] HIGH raw %d = %.2fV\n",
+                                          prefs.getInt("sup_raw_hi", 0), prefs.getFloat("sup_v_hi", 0.0f));
+                        } else if (k == 'C') {
+                            prefs.remove("sup_raw_lo"); prefs.remove("sup_v_lo");
+                            prefs.remove("sup_raw_hi"); prefs.remove("sup_v_hi");
+                            Serial.println("[Cal] Cleared.");
+                        } else {
+                            Serial.println("[Cal] Commands: L <v>, H <v>, S, C");
+                        }
+                        prefs.end();
+                    }
+                    line = "";
+                } else {
+                    line += c;
+                }
+            }
+            delay(5);
+        }
+    }
+#endif
+
+#ifdef OUR_SLEEP_TEST
+    // Our own sleep path, timed, without the cycle in front of it.
+    //
+    // The vendor example sleeps its configured time to the second on this board,
+    // so the hardware is not at fault. This calls the tracker's real
+    // enterDeepSleep() -- powerPrepareForSleep(), the pad holds, the PMU state
+    // this firmware leaves behind, all of it -- but at one minute and with no
+    // BLE window, GPS acquisition or modem session ahead of it, so a result
+    // takes a minute instead of eight.
+    //
+    // It is deliberately placed after powerBegin() and imuBegin() so the pins and
+    // the PMU are in exactly the state the real cycle would leave them.
+    {
+        Serial.printf("\n=== OUR SLEEP PATH TEST === woke by: %s\n", wakeReasonName());
+        Serial.println("[OurSleep] calling the tracker's own enterDeepSleep(1)");
+        Serial.flush();
+        enterDeepSleep(1);
+    }
+#endif
+
+#ifdef MINIMAL_SLEEP_TEST
+    // Does the RTC timer wake this board at all?
+    //
+    // Modelled on LilyGo's MinimalDeepSleepExample: modem off, every unused PMU
+    // rail and measurement disabled, one timer wake source, nothing else. No
+    // ext1, no GPS, no modem session, no pad holds -- so if this wakes on time
+    // the timer is fine and the fault is something the tracker cycle does, and
+    // if it does not the fault is under all of that.
+    //
+    // 60 seconds, because a test you have to wait an hour for is not a test.
+    {
+        Serial.printf("\n=== MINIMAL SLEEP TEST === boot #%d, woke by: %s\n",
+                      ++s_minimalBootCount, wakeReasonName());
+
+        // What the sleep timer is actually counting.
+        //
+        // esp_sleep_enable_timer_wakeup() converts microseconds into RTC ticks
+        // using this calibration, so if the calibrated period does not match the
+        // clock that is really running, every sleep is wrong by that ratio -- and
+        // wrong in a way nothing in the sleep code itself would reveal.
+        //
+        // The value is the RTC slow clock period in microseconds, Q13.19 fixed
+        // point. RC_SLOW is nominally ~136kHz; RC_FAST/256 is 31.25kHz and an
+        // external 32k crystal is 32.768kHz. A period implying ~32kHz while the
+        // code assumes ~136kHz is a 4.3x overshoot, which is the ratio the
+        // 5-minute heartbeat actually showed.
+        {
+            const uint32_t cal = esp_clk_slowclk_cal_get();
+            const double period_us = (double)cal / (1 << 19);
+            const double hz = period_us > 0 ? 1e6 / period_us : 0;
+            Serial.printf("[RTC] slow clock cal=%u -> period %.3f us -> %.0f Hz\n",
+                          (unsigned)cal, period_us, hz);
+            Serial.printf("[RTC] a 60s sleep therefore counts %.0f ticks\n",
+                          60e6 / (period_us > 0 ? period_us : 1));
+        }
+
+        // Everything the LilyGo example turns off. DCDC1 is deliberately absent:
+        // it is the 3.3V rail the ESP32 itself runs on, and the daughter board
+        // with it.
+        PMU.disableDC2(); PMU.disableDC3(); PMU.disableDC4(); PMU.disableDC5();
+        PMU.disableALDO1(); PMU.disableALDO2(); PMU.disableALDO3(); PMU.disableALDO4();
+        PMU.disableBLDO1(); PMU.disableBLDO2();
+        PMU.disableCPUSLDO(); PMU.disableDLDO1(); PMU.disableDLDO2();
+        PMU.disableVbusVoltageMeasure();
+        PMU.disableBattVoltageMeasure();
+        PMU.disableSystemVoltageMeasure();
+        PMU.disableTemperatureMeasure();
+
+        Serial.println("[Minimal] Sleeping 60s on the timer alone. No ext1, no holds.");
+        Serial.flush();
+        esp_sleep_enable_timer_wakeup(60ULL * 1000000ULL);
+        esp_deep_sleep_start();
     }
 #endif
 
