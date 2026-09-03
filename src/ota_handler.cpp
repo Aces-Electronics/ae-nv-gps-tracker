@@ -25,6 +25,61 @@ static const uint8_t OTA_MUX = 1;
 // exchanges the transfer costs.
 static const size_t OTA_CHUNK = 1024;
 
+// The modem UART is the bottleneck, and it is the reason downloads die.
+//
+// TinyGSM drains a socket byte at a time over this link. At 115200 baud that is
+// about 11.5 KB/s, while LTE Cat-M1 delivers up to ~37 KB/s -- so the network
+// fills the modem's socket buffer roughly three times faster than it can be
+// emptied. That is exactly what "+CAURC: buffer full" reports, and a 680 KB
+// image needs 59 seconds of pure UART time at 115200 before any AT overhead.
+//
+// 921600 gives ~92 KB/s against the radio's ~37, so the UART stops being the
+// constraint rather than merely keeping pace -- 460800's ~46 KB/s would leave
+// only a 25% margin, and the whole failure mode here is a margin that ran out.
+// Both rates were verified on this hardware: +IPR accepted, link alive at the
+// new rate, and the restore clean.
+//
+// Raised only for the download and put back afterwards: AT+IPR is not persisted
+// without AT&W, so a modem left fast would be unreachable on the next boot, when
+// Serial1 comes up at 115200 again.
+static const uint32_t OTA_FAST_BAUD = 921600;
+static const uint32_t OTA_BASE_BAUD = 115200;
+
+// Switches the modem and the host UART together, then proves the link still
+// works. Returns false having already restored the base rate, so a modem that
+// does not take the new rate costs one failed AT exchange rather than a device
+// that can no longer be talked to -- which, on a tracker whose only remote fix
+// path is this very OTA, would be unrecoverable in the field.
+static bool otaSetBaud(TinyGsm& modem, uint32_t baud) {
+    modem.sendAT(GF("+IPR="), baud);
+    // The reply comes back at the OLD rate; the modem switches after sending it.
+    if (modem.waitResponse(2000L) != 1) {
+        Serial.printf("[OTA] Modem refused +IPR=%lu; staying at %lu\n",
+                      (unsigned long)baud, (unsigned long)OTA_BASE_BAUD);
+        return false;
+    }
+    delay(100);
+    Serial1.updateBaudRate(baud);
+    delay(100);
+
+    if (!modem.testAT(2000)) {
+        Serial.printf("[OTA] No response after switching to %lu; reverting.\n",
+                      (unsigned long)baud);
+        Serial1.updateBaudRate(OTA_BASE_BAUD);
+        delay(100);
+        // Best effort: if the modem did switch and we did not, this reaches it
+        // at the new rate; if it never switched, it is already listening here.
+        modem.sendAT(GF("+IPR="), OTA_BASE_BAUD);
+        modem.waitResponse(2000L);
+        Serial1.updateBaudRate(OTA_BASE_BAUD);
+        delay(100);
+        modem.testAT(2000);
+        return false;
+    }
+    Serial.printf("[OTA] Modem UART now %lu baud.\n", (unsigned long)baud);
+    return true;
+}
+
 struct OtaUrl {
     bool     https = false;
     String   host;
@@ -324,10 +379,14 @@ bool otaDownloadAndApply(TinyGsm& modem, const OtaCommand& cmd) {
     // first is silently discarded and the image is written unverified.
     Update.setMD5(cmd.md5.c_str());
 
+    // Raised for the transfer only, and restored on every exit path below.
+    const bool fastBaud = otaSetBaud(modem, OTA_FAST_BAUD);
+
     uint8_t  buf[OTA_CHUNK];
     size_t   written  = 0;
     uint32_t started  = millis();
     uint32_t lastData = millis();
+    uint32_t lastLog  = millis();
 
     while (written < (size_t)contentLength) {
         if (millis() - started > OTA_TOTAL_TIMEOUT_MS) {
@@ -353,7 +412,14 @@ bool otaDownloadAndApply(TinyGsm& modem, const OtaCommand& cmd) {
                 // One line per 64 KB. The read loop runs thousands of times and
                 // this is on the same UART the modem debug uses.
                 if ((written % 65536) < (size_t)got) {
-                    Serial.printf("[OTA] %u / %ld bytes\n", (unsigned)written, contentLength);
+                    // Rate matters more than progress here: a download that dies
+                    // at 58% did so because it could not keep up, and the only
+                    // way to know that from a log is to have measured it.
+                    const uint32_t ms = millis() - started;
+                    Serial.printf("[OTA] %u / %ld bytes  (%.1f KB/s avg)\n",
+                                  (unsigned)written, contentLength,
+                                  ms ? (written / 1024.0f) / (ms / 1000.0f) : 0.0f);
+                    lastLog = millis();
                 }
             }
             continue;
@@ -367,10 +433,25 @@ bool otaDownloadAndApply(TinyGsm& modem, const OtaCommand& cmd) {
             Serial.println("[OTA] Stalled.");
             break;
         }
-        delay(20);
+        // 2ms rather than 20. The modem's socket buffer is filling from the
+        // network the whole time this loop is idle, so sleeping a fixed 20ms per
+        // empty poll spends exactly the headroom the transfer does not have.
+        delay(2);
     }
 
     net->stop();
+
+    // Always back to the base rate: AT+IPR is not persisted, so the next boot
+    // brings Serial1 up at 115200 and a modem left fast would be unreachable.
+    if (fastBaud) otaSetBaud(modem, OTA_BASE_BAUD);
+
+    {
+        const uint32_t ms = millis() - started;
+        Serial.printf("[OTA] Transfer: %u bytes in %.1fs (%.1f KB/s)\n",
+                      (unsigned)written, ms / 1000.0f,
+                      ms ? (written / 1024.0f) / (ms / 1000.0f) : 0.0f);
+    }
+    (void)lastLog;
 
     if (written != (size_t)contentLength) {
         Serial.printf("[OTA] Short read: %u of %ld bytes.\n", (unsigned)written, contentLength);

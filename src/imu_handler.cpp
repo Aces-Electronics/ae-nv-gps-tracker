@@ -833,6 +833,27 @@ bool imuForceInterruptHigh() {
     return stillHigh;
 }
 
+bool imuReadAdc1(int16_t& raw) {
+    if (!s_present) return false;
+
+    // ADC_EN in TEMP_CFG_REG. Adafruit's begin() already sets 0x80, but this is
+    // cheap and makes the read independent of what the driver happens to do.
+    lisWrite8(0x1F, 0x80);
+
+    // OUT_ADC1_L / OUT_ADC1_H, with the auto-increment bit so both come back in
+    // one transaction -- reading them separately can straddle an update and
+    // splice the low byte of one sample onto the high byte of the next.
+    Wire1.beginTransmission(s_addr);
+    Wire1.write(0x08 | 0x80);
+    if (Wire1.endTransmission(false) != 0) return false;
+    if (Wire1.requestFrom((uint8_t)s_addr, (uint8_t)2) != 2) return false;
+
+    const uint8_t lo = Wire1.read();
+    const uint8_t hi = Wire1.read();
+    raw = (int16_t)((uint16_t)hi << 8 | lo);
+    return true;
+}
+
 void imuClearMotionInterrupt() {
     if (!s_present) return;
     (void)lisRead8(LIS3DH_REG_INT1SRC);

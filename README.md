@@ -46,7 +46,9 @@ The tracker publishes the following data via MQTT:
   "alt": -11.981,
   "speed": 0,
   "sats": 11,
-  "voltage": 0.00,           // External supply (future hardware)
+  "supply_adc_raw": 9216,    // Ski supply, raw LIS3DH aux-ADC count
+  "supply_voltage": 12.18,   // ...converted, once calibrated (absent if not)
+  "voltage": 0.00,           // USB VBUS placeholder, debug frames only
   "device_voltage": 4.177,   // Internal battery voltage
   "battery_voltage": 4.177,  // Legacy alias
   "rssi": 19,
@@ -364,6 +366,77 @@ The firmware uses robust satellite count parsing with fallback logic:
 
 No migration is needed for already-provisioned trackers: a stored 5-minute
 interval now describes the *running* case, which is what it was always for.
+
+### Ski supply voltage
+
+The daughter board divides the jetski supply into the LIS3DH's auxiliary ADC.
+With **R16 swapped to 200k** the divider is 1.8M/200k = **1/10**, mapping 8–16V
+onto 800–1600mV — which is the LIS3DH aux ADC's actual window (1200mV ±400mV).
+
+**The divider taps `SUPPLY`, downstream of the TPS1H000 switch**, so it reads
+nothing whenever the charge policy has the feed cut — which is most of the time
+by design. `powerReadSupplyRaw()` therefore closes the switch briefly (200ms
+settle, covering six time constants of 180k × 100nF as well as the switch's own
+turn-on), takes the sample, and restores the switch to exactly the state it was
+in. Leaving it closed because a measurement happened would quietly undo the
+charge cutoff.
+
+**Calibration is two-point and measured, not derived.** ST does not document
+whether the aux-ADC code is inverted, and the real ratio depends on resistor
+tolerance and an input impedance ST does not specify — so a formula from the
+schematic would be a guess wearing a unit. Measured on hardware:
+
+| point | meter | raw | 10-bit |
+|---|---|---|---|
+| low | 12.06V | 10188 | 159 |
+| high | 14.33V | −7508 | −118 |
+
+**The code is inverted** — 0V reads 32512, and the count falls as voltage rises.
+That is exactly the ambiguity the datasheet leaves open, and it is why this is
+measured. The slope works out at ~122 counts/V against ~128 predicted from the
+design, i.e. within ~5% — comfortably inside resistor tolerance.
+
+To calibrate a board, flash the `supply-cal` environment and drive it over
+serial: `L <volts>` and `H <volts>` store the two points into the same NVS keys
+the tracker reads (`sup_raw_lo`/`sup_v_lo`, `sup_raw_hi`/`sup_v_hi`). Readings
+are averaged over 16 samples, because one sample of a 10-bit ADC on a 180k
+source is noisy enough to bake that noise into the fit. `supply_voltage` is
+published only once both points exist; until then only `supply_adc_raw` goes
+out, so an uncalibrated unit reports nothing rather than something wrong.
+
+**Useful range is ~8–16V.** Below about 8V the ADC floors and the reading is
+optimistic — a flat jetski battery reads around 9V rather than as flat.
+
+Note `charge_state: "Fault"` with **no LiPo attached** is expected: the
+BQ25176J blinks STAT when it has nothing to charge.
+
+### OTA downloads
+
+Downloads used to die part-way with `+CAURC: buffer full` followed by
+`Socket closed early` — 397468 of 680816 bytes on the observed failure.
+
+The cause is arithmetic, not a bug. TinyGSM drains a socket **one byte at a
+time** over the modem UART, and at 115200 baud that is ~11.5 KB/s. LTE Cat-M1
+delivers up to ~37 KB/s, so the network fills the modem's socket buffer about
+three times faster than it can be emptied — which is precisely what
+`+CAURC: buffer full` reports. A 680 KB image also needs ≥59s of pure UART time
+at 115200 before any AT overhead.
+
+Three changes:
+
+- **The modem UART is raised to 921600 for the transfer** (~92 KB/s), so the
+  UART stops being the constraint rather than merely keeping pace. Restored to
+  115200 afterwards: `AT+IPR` is not persisted without `AT&W`, so a modem left
+  fast would be unreachable on the next boot when `Serial1` opens at 115200.
+  The switch verifies the link at the new rate and reverts on failure — the only
+  remote repair path for a fielded tracker is the OTA itself, so a half-applied
+  baud change would be unrecoverable. Both 460800 and 921600 were confirmed on
+  hardware with the `baud-test` environment.
+- **`TINY_GSM_DEBUG` is no longer in the release build.** It prints a line per
+  data URC — ~660 of them per OTA — onto the same serial port the download is
+  competing with. Use the `modem-debug` environment when AT tracing is wanted.
+- **The empty-poll delay is 2ms rather than 20ms**, and throughput is logged in
+  KB/s, so a future failure can be read rather than guessed at.
 
 ## Known Issues
 
