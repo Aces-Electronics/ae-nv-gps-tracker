@@ -203,6 +203,44 @@ void modemPowerOn() {
     // Drain any old data
     while(Serial1.available()) Serial1.read();
 
+    // Recover a modem left at a non-default baud.
+    //
+    // The OTA raises the link to 921600 for the transfer and lowers it again
+    // afterwards, but that restore only runs if the code keeps running. A reset
+    // mid-download -- power loss, a crash, a watchdog, someone pulling USB --
+    // leaves the modem fast while Serial1 comes back up at 115200, and AT+IPR
+    // does not persist, so nothing else puts it right. The symptom is garbage on
+    // the UART and "Power FAIL" from a modem that is perfectly healthy.
+    //
+    // On a fielded tracker that would be unrecoverable: the only remote repair
+    // path is an OTA, and an OTA needs the modem. So this is checked on every
+    // boot, before concluding anything about the modem's health.
+    if (!modem.testAT(1000)) {
+        static const uint32_t kRates[] = { 921600, 460800 };
+        for (uint32_t rate : kRates) {
+            Serial.printf("[Modem] No answer at 115200; trying %lu...\n", (unsigned long)rate);
+            Serial1.updateBaudRate(rate);
+            delay(100);
+            while (Serial1.available()) Serial1.read();
+            if (modem.testAT(1500)) {
+                Serial.printf("[Modem] Found it at %lu -- restoring 115200.\n", (unsigned long)rate);
+                modem.sendAT(GF("+IPR=115200"));
+                modem.waitResponse(2000L);
+                delay(100);
+                Serial1.updateBaudRate(115200);
+                delay(150);
+                while (Serial1.available()) Serial1.read();
+                Serial.printf("[Modem] Back at 115200: %s\n",
+                              modem.testAT(2000) ? "OK" : "still no answer");
+                break;
+            }
+        }
+        // Whatever happened, carry on at the rate the rest of the firmware uses.
+        Serial1.updateBaudRate(115200);
+        delay(50);
+        while (Serial1.available()) Serial1.read();
+    }
+
     if (!modem.testAT(1000)) {
         Serial.println("[Modem] PWRKEY Pulse...");
         pinMode(MODEM_PWRKEY, OUTPUT);
