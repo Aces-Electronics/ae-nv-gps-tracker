@@ -70,9 +70,10 @@ The tracker publishes the following data via MQTT:
                                //   minute: 5856 = 97h36m
   "ibr_trim": 5,               // 0x012 b2, iBR up/down position, 1..9
   "motion_sensitivity": "Medium", // Low | Medium | High -- the selected floor
-  "motion_threshold_mg": 176,  // Where the adaptive ladder currently sits
+  "motion_threshold_mg": 352,  // Where the adaptive ladder currently sits
   "motion_suppressed": 0,      // Motion wakes rate-limited away since last report
-  "interval": 1440
+  "interval": 5,               // The RUNNING interval. A parked ski ignores it
+  "next_wake_mins": 60         // When the next frame is actually due
 }
 ```
 
@@ -321,6 +322,12 @@ The firmware uses robust satellite count parsing with fallback logic:
   Medium and the value read back afterwards would not be the one sent. The
   change takes effect **immediately**, re-arming the accelerometer rather than
   waiting for the next boot, which for a parked ski would be a day away.
+
+  `motion_sensitivity` and `motion_threshold_mg` are published on **every**
+  frame, not just debug ones. They used to be gated behind `debug` directly
+  under a comment saying they existed so the adaptive logic could be seen from
+  the backend rather than a serial cable — which the gate prevented. A unit sat
+  at 528mg on a 176mg floor for an hour and nothing in the cloud said so.
 
   **TODO — web UI control.** The setting is stored in NVS (`mot_sens`), carried
   in `TrackerSettings.motion_sensitivity`, published as `motion_sensitivity`,
