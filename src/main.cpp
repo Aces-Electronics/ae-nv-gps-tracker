@@ -65,7 +65,10 @@ static const uint32_t HEARTBEAT_DEFAULT_MINS = 5;
 // A day is right in the field and useless on a bench: one change takes a day to
 // evaluate, and a heartbeat that fails leaves nothing to look at for another.
 // Overridable at compile time so the shipping default cannot be shortened by
-// accident -- see the heartbeat-test environment in platformio.ini.
+// accident. It IS currently shortened, deliberately: the default environment in
+// platformio.ini overrides this to 60 while the fleet is one dev board. That
+// line carries the note about removing it, and this value is what production
+// goes back to.
 #ifndef PARKED_INTERVAL_MINS_OVERRIDE
 #define PARKED_INTERVAL_MINS_OVERRIDE 1440
 #endif
