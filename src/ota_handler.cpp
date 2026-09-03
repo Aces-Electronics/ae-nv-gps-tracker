@@ -42,7 +42,13 @@ static const size_t OTA_CHUNK = 1024;
 // Raised only for the download and put back afterwards: AT+IPR is not persisted
 // without AT&W, so a modem left fast would be unreachable on the next boot, when
 // Serial1 comes up at 115200 again.
-static const uint32_t OTA_FAST_BAUD = 921600;
+// 460800, not 921600. Both pass a short AT exchange, but a sustained transfer
+// is a different test: 921600 leaves only 44ms of headroom even in a 4KB RX
+// buffer, and it hung twice on a real download. 460800 is ~46 KB/s against the
+// radio's ~37, which is enough to stop the UART being the constraint, and the
+// modem's own TCP flow control absorbs the bursts. Four times the original
+// throughput with margin beats eight times without it.
+static const uint32_t OTA_FAST_BAUD = 460800;
 static const uint32_t OTA_BASE_BAUD = 115200;
 
 // Switches the modem and the host UART together, then proves the link still

@@ -1517,6 +1517,13 @@ void setup() {
         // setup() opens Serial1 well below this point, so without it here the
         // test talks to a UART that was never started -- which looks exactly
         // like a modem that will not answer.
+        // 4KB rather than the 256-byte default, because the OTA raises this link
+        // to 460800 for a transfer. At 256 bytes that holds only 5.6ms of data at
+        // 460800 -- any scheduling delay longer than that drops bytes, corrupts
+        // the AT framing, and TinyGSM then waits per byte for data that will
+        // never arrive. 4KB is 89ms: a margin rather than a race. At 115200 the
+        // default was fine, which is why this never mattered until now.
+        Serial1.setRxBufferSize(4096);
         Serial1.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
         modemPowerOn();
         Serial.println("\n=== MODEM BAUD SWITCH TEST ===");
@@ -1908,6 +1915,13 @@ void setup() {
     canSnifferLoop();
 #endif
     
+    // 4KB rather than the 256-byte default, because the OTA raises this link
+    // to 460800 for a transfer. At 256 bytes that holds only 5.6ms of data at
+    // 460800 -- any scheduling delay longer than that drops bytes, corrupts
+    // the AT framing, and TinyGSM then waits per byte for data that will
+    // never arrive. 4KB is 89ms: a margin rather than a race. At 115200 the
+    // default was fine, which is why this never mattered until now.
+    Serial1.setRxBufferSize(4096);
     Serial1.begin(115200, SERIAL_8N1, MODEM_RX, MODEM_TX);
     
     loadSettings();
