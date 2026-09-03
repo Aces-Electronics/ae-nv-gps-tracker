@@ -993,7 +993,30 @@ void onDownlink(char* topic, uint8_t* payload, unsigned int length) {
 // the useful range -- and store both.
 //
 // Returns false until both points exist, so supply_voltage simply does not
-// appear rather than appearing wrong.
+// appear rather than appearing wrong -- and false again when the answer is
+// outside the window below, for the same reason.
+//
+// A two-point fit is a straight line, and a straight line has no idea where it
+// stops being a measurement. Extrapolated far enough it will answer any
+// question put to it, and the answer that matters is the open input: with
+// nothing on the supply feed the top of the divider floats, the node sits at
+// 0V, and the ADC -- which runs inverted -- pins near its positive rail. On
+// this board that is raw 32512 against a possible 32704, and the fit turns it
+// into 9.20V. Nothing about 9.20V looks like an error. It looks exactly like a
+// jetski battery somebody should be told about, which is worse than no reading
+// at all.
+//
+// Saturation can only push the code higher and so the volts lower, so an open
+// input cannot report above ~9.2V no matter what. A floor of 10.0V therefore
+// separates the two cases outright: a 12V lead-acid battery at 10.0V is flat
+// past cranking, and is still reported. The ceiling is the same argument the
+// other way -- above it the divider is faulty, not the alternator generous.
+//
+// supply_adc_raw is published either way, so a reading rejected here is still
+// on the wire for anyone who wants to argue with the window.
+static const float SUPPLY_MIN_PLAUSIBLE_V = 10.0f;
+static const float SUPPLY_MAX_PLAUSIBLE_V = 16.0f;
+
 static bool supplyRawToVolts(int16_t raw, float& volts) {
     prefs.begin("tracker", true);
     const int32_t rawLo  = prefs.getInt("sup_raw_lo", 0);
@@ -1004,7 +1027,16 @@ static bool supplyRawToVolts(int16_t raw, float& volts) {
 
     if (rawLo == rawHi || voltLo == voltHi) return false;   // not calibrated
 
-    volts = voltLo + (float)(raw - rawLo) * (voltHi - voltLo) / (float)(rawHi - rawLo);
+    const float v = voltLo + (float)(raw - rawLo) * (voltHi - voltLo) / (float)(rawHi - rawLo);
+
+    if (v < SUPPLY_MIN_PLAUSIBLE_V || v > SUPPLY_MAX_PLAUSIBLE_V) {
+        Serial.printf("[Power] Supply reads %.2fV from raw %d, outside %.1f-%.1fV: "
+                      "treating the feed as disconnected.\n",
+                      v, raw, SUPPLY_MIN_PLAUSIBLE_V, SUPPLY_MAX_PLAUSIBLE_V);
+        return false;
+    }
+
+    volts = v;
     return true;
 }
 
@@ -1241,7 +1273,9 @@ bool transmitData(bool has_fix, float lat, float lon, float speed, float alt, in
             // resistor tolerance and on an input impedance ST does not specify,
             // so a figure derived from the schematic would be a guess wearing a
             // unit. Two bench readings at known voltages turn it into volts --
-            // supplyRawToVolts() emits supply_voltage only once they exist.
+            // supplyRawToVolts() emits supply_voltage only once they exist,
+            // and only when the result could describe a real 12V system -- an
+            // open feed extrapolates to a plausible-looking 9.2V otherwise.
             //
             // Always sent when it could be read, including on a debug-off frame:
             // this is the field that the divider rework exists to produce, and a
