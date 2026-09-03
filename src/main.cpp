@@ -697,6 +697,21 @@ static void enterDeepSleep(int minutes) {
 //
 // Pure: the NVS side effects (the gps_fail counter, the pub_fail ladder) stay in
 // goToSleep(). Callers pass the fail count they expect to be acting on.
+// How long to wait after a parked heartbeat failed to reach the broker.
+//
+// Escalating, because the common cause is no coverage and retrying at the
+// normal cadence forever in a dead zone spends the battery that the cadence
+// exists to protect.
+static int publishRetryMins(unsigned int pubFails) {
+    if (pubFails == 1) return 60;
+    if (pubFails == 2) return 180;
+    if (pubFails == 3) return 360;
+    // Not PARKED_INTERVAL_MINS: that is the cadence of a HEALTHY tracker, and
+    // returning to it after four failures in a row would resume hourly retries
+    // on a unit that has just proved it cannot transmit.
+    return (PARKED_INTERVAL_MINS > 360) ? (int)PARKED_INTERVAL_MINS : 360;
+}
+
 static int sleepIntervalMins(bool skiRunning, bool gotFix, int consecutiveFails) {
     // Ahead of everything else, including the running case. A ski whose tracker
     // battery is nearly flat is worth one report a day and nothing more: at this
@@ -772,16 +787,29 @@ void goToSleep(bool got_fix, bool published) {
     if (!skiRunning && !published) {
         unsigned int pubFails = prefs.getUInt("pub_fail", 0) + 1;
         prefs.putUInt("pub_fail", pubFails);
-        int retry;
-        if (pubFails == 1)      retry = 60;
-        else if (pubFails == 2) retry = 180;
-        else if (pubFails == 3) retry = 360;
-        else                    retry = PARKED_INTERVAL_MINS;
-        if (retry < actual_interval) {
-            Serial.printf("[Uplink] Parked heartbeat did not publish (%u in a row) -> retrying in %d minutes\n",
+        const int retry = publishRetryMins(pubFails);
+
+        // Applied whether it is shorter or longer than the normal interval.
+        //
+        // This used to be guarded by `retry < actual_interval`, which was correct
+        // only while parked meant a day: 60, 180 and 360 are all shorter than 1440,
+        // so the ladder always applied and always meant "come back sooner". The
+        // moment the parked interval came down to 60 minutes that guard made the
+        // entire escalation inert -- every rung was >= 60, so none of them ever
+        // applied, and a tracker that could not transmit retried every hour
+        // forever. Which is the exact thing the comment above says this exists to
+        // prevent.
+        //
+        // Found the hard way: a SIM worked loose in the ski and the tracker spent
+        // ten hours doing ten full wake-GPS-modem cycles into nothing, on a LiPo
+        // whose charge feed the charge policy had cut. The escalation that should
+        // have stretched those ten cycles to three was switched off by a
+        // one-line inequality that stopped being true.
+        if (retry != actual_interval) {
+            Serial.printf("[Uplink] Parked heartbeat did not publish (%u in a row) -> next try in %d minutes\n",
                           pubFails, retry);
-            actual_interval = retry;
         }
+        actual_interval = retry;
     } else if (published && prefs.getUInt("pub_fail", 0) > 0) {
         Serial.println("[Uplink] Published again; clearing the retry ladder.");
         prefs.putUInt("pub_fail", 0);
@@ -2161,6 +2189,44 @@ void setup() {
     }
 
     modemPowerOn(); 
+
+    // Nothing downstream of here works without a SIM, and the failure is silent:
+    // the modem powers up, answers AT quite happily, and simply never registers.
+    // This unit spent ten hours running full wake-GPS-modem cycles into nothing
+    // because a SIM had worked loose in the ski, and not one line of the log said
+    // so. The only symptom reaching anybody was an absence of symptoms.
+    //
+    // Checked before initGNSS() so a tracker that cannot transmit does not also
+    // spend up to five minutes acquiring a fix it has nowhere to send. There is no
+    // store-and-forward here -- an unsent fix is simply discarded -- so acquiring
+    // one is pure cost.
+    const SimStatus simStatus = modem.getSimStatus();
+    if (simStatus != SIM_READY) {
+        Serial.printf("\n[Modem] !! SIM NOT READY (status %d). Nothing can be sent this wake.\n",
+                      (int)simStatus);
+        Serial.println("[Modem]    0 = absent or error, 2 = PIN locked, 3 = anti-theft locked.");
+        Serial.println("[Modem]    If this is 0, check the SIM is seated -- vibration works them loose.");
+
+        // The same ladder a failed publish uses, because this IS a failed publish:
+        // the frame never had a chance to leave. Counted the same way so a tracker
+        // with no SIM backs off instead of burning a wake an hour into a dead
+        // radio.
+        //
+        // Deliberately not routed through goToSleep(): that would also increment
+        // the GPS failure counter, and no fix was attempted. Recording one as
+        // failed would be untrue and would stretch the interval for the wrong
+        // stated reason, which is worse than not recording it at all.
+        prefs.begin("tracker", false);
+        const unsigned int pubFails = prefs.getUInt("pub_fail", 0) + 1;
+        prefs.putUInt("pub_fail", pubFails);
+        prefs.end();
+        const int retry = publishRetryMins(pubFails);
+        Serial.printf("[Uplink] No SIM (%u wake%s in a row) -> next try in %d minutes\n",
+                      pubFails, pubFails == 1 ? "" : "s", retry);
+        modemPowerOff();
+        enterDeepSleep(retry);
+    }
+
     initGNSS(); // Start GPS early
     
     if (shouldRunBLEWindow()) {
