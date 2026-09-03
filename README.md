@@ -299,14 +299,20 @@ The firmware uses robust satellite count parsing with fallback logic:
   floor of 24mg (high-pass filter settled, board at rest), so the margins are
   known rather than guessed:
 
-  | Level | Floor | Margin | For |
-  |---|---|---|---|
-  | Low | 352mg | ~15× noise | A deliberate shove; a ski somewhere lively, where less would report the weather |
-  | **Medium** | **176mg** | ~7.3× noise | **Default.** Registers ordinary handling |
-  | High | 128mg | ~5.3× noise | A quiet mooring, where a nudge should count |
+  | Level | Floor | Margin | Ceiling | For |
+  |---|---|---|---|---|
+  | Low | 704mg | ~29× noise | 2032mg | A deliberate shove; a ski somewhere lively, where less would report the weather |
+  | **Medium** | **352mg** | ~15× noise | **1408mg** | **Shipped default.** Registers ordinary handling |
+  | High | 256mg | ~11× noise | 1024mg | A quiet mooring, where a nudge should count |
 
-  All three sit exactly on the `INT1_THS` grid (16mg steps at ±2g) — 22, 11 and
-  8 counts — so none truncate. Worth checking when retuning: 56mg, for example,
+  These were **doubled** from an original 352/176/128 after the first real
+  deployment: a unit on Medium riding in a car woke nine times in 65 minutes and
+  spent the hour climbing away from a floor too low to start from. The old
+  Medium is the new Low, which is the honest description of what 176mg proved
+  to be worth.
+
+  All three sit exactly on the `INT1_THS` grid (16mg steps at ±2g) — 44, 22 and
+  16 counts — so none truncate. Worth checking when retuning: 56mg, for example,
   is not representable and would silently become 48mg, only 2× the noise floor.
 
   Settable over BLE on characteristic `beb5483e-36e1-4688-b7f5-ea07361b2051`
@@ -322,10 +328,25 @@ The firmware uses robust satellite count parsing with fallback logic:
 
 - **Adaptive threshold**, which moves in *both* directions:
 
-  **Up.** After a motion wake, GPS arbitrates: a good fix showing under 2 km/h
-  counts as unexplained, and three consecutive unexplained wakes raise the
-  threshold one step (176mg steps, 1408mg ceiling) from the selected floor. A
-  wake with *no* fix changes nothing — a garage roof is not a false positive.
+  **Up.** After a motion wake, GPS arbitrates: a fix is *travel* if it shows
+  2 km/h or more, **or** if it has moved 100m or more from the reference
+  position. Anything else counts as unexplained, and three consecutive
+  unexplained wakes raise the threshold one step. A wake with *no* fix changes
+  nothing — a garage roof is not a false positive.
+
+  Step and ceiling both **scale with the selected floor** (step = the floor,
+  ceiling = 4× it), so three unexplained wakes cost the same fraction of the
+  range at every setting. They used to be flat 176mg/1408mg — Medium's numbers
+  applied to everything — which made the control a floor and nothing else: a
+  unit on High could be walked to eleven times the sensitivity its owner asked
+  for. `INT1_THS` caps the ceiling at 2032mg (7 bits, 16mg steps at ±2g), which
+  is why Low's 2816mg is clamped.
+
+  **Position is gated on PDOP**, not HDOP. Measured on a stationary bench, two
+  fixes three seconds apart read 35m apart: one at PDOP 25.0, the other at PDOP
+  2.0. HDOP on the bad one was a respectable 3.9 — the error was almost entirely
+  vertical (VDOP 24.7), so only PDOP shows it. A DOP of `0` means the field was
+  absent, not that the fix was perfect, and is refused everywhere.
 
   **Up, faster, on rate alone.** Motion wakes inside the 120s report limit are
   counted rather than discarded. Ten of them between two reports raises the

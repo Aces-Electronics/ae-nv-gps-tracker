@@ -2,6 +2,13 @@
 
 #include <Arduino.h>
 
+// The hardest knock the part can be asked to hold out for. INT1_THS is 7 bits
+// and steps 16mg at +/-2g, so 127 * 16 is the top of the register; anything
+// above it is silently clamped inside imuEnableMotionWake(). Exposed because
+// the caller picks thresholds and needs to know where they stop meaning
+// anything -- a ladder that thinks it is still climbing past here is not.
+static const uint16_t IMU_MAX_THRESHOLD_MG = 127 * 16;   // 2032mg
+
 // The vocabulary is fixed by the telemetry contract: the README documents an
 // "orientation" field carrying exactly these strings, and the web UI shows it
 // as a label rather than parsing it. Unknown is what goes out when the IMU did

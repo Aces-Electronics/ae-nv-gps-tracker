@@ -90,19 +90,25 @@ const char* firmwareVersion() {
 // starts. Chosen against a measured noise floor of 24mg (high-pass filter
 // settled, board at rest), so the margins are known rather than guessed:
 //
-//   Low    352mg  ~15x noise  -- takes a deliberate shove. For a ski somewhere
+//   Low    704mg  ~29x noise  -- takes a deliberate shove. For a ski somewhere
 //                               lively, where less would report the weather.
-//   Medium 176mg  ~7.3x noise -- the default. Registers ordinary handling.
-//   High   128mg  ~5.3x noise -- for a quiet mooring where a nudge should count.
+//   Medium 352mg  ~15x noise  -- the shipped default. Registers ordinary handling.
+//   High   256mg  ~11x noise  -- for a quiet mooring where a nudge should count.
 //
-// All three sit exactly on the INT1_THS grid (16mg steps at +/-2g): 22, 11 and 8
+// Doubled from the original 352/176/128 after the first real deployment: a unit
+// on Medium riding in a car woke nine times in 65 minutes, and the ladder spent
+// the whole hour climbing away from a floor that was simply too low to start
+// from. The old Medium is the new Low, which is the honest description of what
+// 176mg turned out to be worth.
+//
+// All three sit exactly on the INT1_THS grid (16mg steps at +/-2g): 44, 22 and 16
 // counts, so none of them truncate. That is worth checking when retuning -- 56mg,
 // for instance, is not representable and would silently become 48mg, only 2x the
 // noise floor and closer to chasing the filter's own residue than detecting
 // anything.
-static const uint16_t MOTION_SENS_LOW_MG    = 352;
-static const uint16_t MOTION_SENS_MEDIUM_MG = 176;
-static const uint16_t MOTION_SENS_HIGH_MG   = 128;
+static const uint16_t MOTION_SENS_LOW_MG    = 704;
+static const uint16_t MOTION_SENS_MEDIUM_MG = 352;
+static const uint16_t MOTION_SENS_HIGH_MG   = 256;
 
 enum MotionSensitivity : uint8_t {
     MOTION_SENS_LOW = 0,
@@ -298,12 +304,66 @@ static const time_t MOTION_MIN_REPORT_S = 120;
 // wash from a passing boat, wind, someone leaning on the hull. Every step up
 // costs sensitivity to real theft, so the ladder is short and it drops straight
 // back to the floor the moment genuine travel is seen.
-static const uint16_t MOTION_THRESHOLD_STEP_MG = 176;
-static const uint16_t MOTION_THRESHOLD_MAX_MG  = 1408;
+// The ladder's reach, as a multiple of whichever floor the sensitivity setting
+// chose. Four, for two reasons that agree: it puts Medium's ceiling on 1408mg,
+// which is where the ceiling has been all along, and it is the largest multiple
+// that still fits inside the part.
+//
+// That second reason is not incidental. INT1_THS tops out at 2032mg (7 bits,
+// 16mg steps at +/-2g), and once the floors doubled an eightfold reach ran every
+// setting into that cap: High, Medium and Low would all have ceilinged at 2032,
+// giving reaches of 7.9x, 5.8x and 2.9x. That is the same inversion this scaling
+// exists to remove -- the MOST sensitive setting getting the MOST room to deafen
+// itself -- reintroduced through the back door by a clamp rather than by a
+// constant. Four fits, and the reach comes out even.
+static const uint16_t MOTION_CEILING_MULTIPLE = 4;
+
+// Step and ceiling both scale with the selected sensitivity. They used to be
+// flat 176 and 1408 -- which are Medium's numbers -- and that made the setting
+// a floor and nothing else: a unit on High (128mg floor) could still be walked
+// to 1408mg, eleven times what its owner asked for, and a unit on Medium could
+// pass 352mg and end up deafer than the LOW setting ever offers. Observed in
+// the field at 528mg on Medium, which is what prompted this.
+//
+//   High    128mg floor ->  1024mg ceiling
+//   Medium  176mg floor ->  1408mg ceiling   (unchanged from before)
+//   Low     352mg floor ->  2816mg, clamped to 2032mg by the register
+//
+// Scaling the step too keeps the number of rungs the same at every setting, so
+// "three unexplained wakes" costs the same fraction of the range wherever the
+// owner put the floor.
+static uint16_t motionStepMg() { return g_motionBaseMg; }
+static uint16_t motionCeilingMg() {
+    uint32_t c = (uint32_t)g_motionBaseMg * MOTION_CEILING_MULTIPLE;
+    if (c > IMU_MAX_THRESHOLD_MG) c = IMU_MAX_THRESHOLD_MG;
+    return (uint16_t)c;
+}
 
 // Consecutive unexplained motion wakes before the threshold goes up. Three,
 // because one is noise and two is a coincidence.
 static const int FALSE_WAKES_BEFORE_RAISE = 3;
+
+// Above this PDOP a fix says nothing trustworthy about where anything is.
+// Measured on this unit: a fix reporting PDOP 25.0 sat 35m from one taken three
+// seconds later at PDOP 2.0, with the board stationary on a bench. HDOP on that
+// bad fix was a respectable 3.9 -- the error was almost entirely vertical
+// (VDOP 24.7) -- which is exactly why this gate is on PDOP and not on the HDOP
+// the parser already carried. Believing that pair would have read as 35m of
+// travel and reset the threshold to its floor.
+static const float FIX_MAX_PDOP = 5.0f;
+
+// How far the tracker must have moved from its reference before that counts as
+// travel. Comfortably outside the scatter of a PDOP-gated fix, and well inside
+// anything a ski does when it actually goes somewhere.
+static const float TRAVEL_DISPLACEMENT_M = 100.0f;
+
+// Where "parked" currently is. Deliberately NOT refreshed on every stationary
+// report: holding it still is what lets a ski moved 40m at a time -- pushed up a
+// driveway, winched onto a trailer -- add up to travel, instead of reading as
+// four separate non-events. It is re-based only once travel is established.
+RTC_DATA_ATTR static float s_refLat = 0.0f;
+RTC_DATA_ATTR static float s_refLon = 0.0f;
+RTC_DATA_ATTR static bool  s_haveRefFix = false;
 
 // Under this, GPS is reporting its own noise rather than travel. A stationary
 // receiver commonly shows a knot or two.
@@ -379,7 +439,7 @@ static uint16_t loadMotionThreshold() {
     prefs.end();
 
     if (v < g_motionBaseMg)           v = g_motionBaseMg;
-    if (v > MOTION_THRESHOLD_MAX_MG)  v = MOTION_THRESHOLD_MAX_MG;
+    if (v > motionCeilingMg())        v = motionCeilingMg();
     Serial.printf("[Motion] Sensitivity %s: floor %umg, current threshold %umg\n",
                   motionSensitivityName(sens), g_motionBaseMg, v);
     return v;
@@ -441,17 +501,17 @@ static const char* wakeReasonName() {
 static bool stepMotionThreshold(bool up) {
     uint16_t next;
     if (up) {
-        if (g_motionThresholdMg >= MOTION_THRESHOLD_MAX_MG) {
-            Serial.printf("[Motion] Already at the %umg ceiling; not going deafer than this.\n",
-                          MOTION_THRESHOLD_MAX_MG);
+        if (g_motionThresholdMg >= motionCeilingMg()) {
+            Serial.printf("[Motion] Already at the %umg ceiling for this sensitivity; not going deafer.\n",
+                          motionCeilingMg());
             return false;
         }
-        next = g_motionThresholdMg + MOTION_THRESHOLD_STEP_MG;
-        if (next > MOTION_THRESHOLD_MAX_MG) next = MOTION_THRESHOLD_MAX_MG;
+        next = g_motionThresholdMg + motionStepMg();
+        if (next > motionCeilingMg()) next = motionCeilingMg();
     } else {
         if (g_motionThresholdMg <= g_motionBaseMg) return false;
-        next = (g_motionThresholdMg > g_motionBaseMg + MOTION_THRESHOLD_STEP_MG)
-                 ? (uint16_t)(g_motionThresholdMg - MOTION_THRESHOLD_STEP_MG)
+        next = (g_motionThresholdMg > g_motionBaseMg + motionStepMg())
+                 ? (uint16_t)(g_motionThresholdMg - motionStepMg())
                  : g_motionBaseMg;
     }
 
@@ -465,7 +525,20 @@ static bool stepMotionThreshold(bool up) {
     return true;
 }
 
-static void updateMotionThreshold(bool gotFix, float speedKmh) {
+// Great-circle distance in metres. Haversine rather than the cheap
+// equirectangular approximation: this runs once per wake so the cost is
+// irrelevant, and the cheap version's error grows with latitude silently.
+static float haversineMetres(float lat1, float lon1, float lat2, float lon2) {
+    const float R  = 6371000.0f;
+    const float p1 = radians(lat1), p2 = radians(lat2);
+    const float dp = p2 - p1, dl = radians(lon2 - lon1);
+    float a = sinf(dp / 2) * sinf(dp / 2) +
+              cosf(p1) * cosf(p2) * sinf(dl / 2) * sinf(dl / 2);
+    if (a > 1.0f) a = 1.0f;
+    return 2.0f * R * asinf(sqrtf(a));
+}
+
+static void updateMotionThreshold(bool gotFix, float speedKmh, float lat, float lon, float pdop) {
     const int suppressed = s_suppressedWakes;
     s_suppressedWakes = 0;
 
@@ -515,19 +588,52 @@ static void updateMotionThreshold(bool gotFix, float speedKmh) {
         return;
     }
 
-    if (speedKmh >= STATIONARY_SPEED_KMH) {
+    // Doppler speed is a single sample taken whenever the fix happened to land,
+    // which makes it a poor witness on its own: a ski under tow stopped at a
+    // light, or one being walked onto a trailer, both read as stationary.
+    // Displacement does not care when the sample was taken -- but it is only
+    // admissible when the geometry behind the fix is sound, hence the PDOP gate.
+    const bool fixTrusted = (pdop > 0.0f && pdop <= FIX_MAX_PDOP);
+    if (!fixTrusted) {
+        Serial.printf("[Motion] PDOP %.1f exceeds %.1f; fix not trusted for position.\n",
+                      pdop, FIX_MAX_PDOP);
+    } else if (!s_haveRefFix) {
+        s_refLat = lat; s_refLon = lon; s_haveRefFix = true;
+        Serial.printf("[Motion] Reference position set (PDOP %.1f).\n", pdop);
+    }
+
+    bool  travelled = (speedKmh >= STATIONARY_SPEED_KMH);
+    float movedM    = -1.0f;
+    if (!travelled && fixTrusted && s_haveRefFix) {
+        movedM = haversineMetres(s_refLat, s_refLon, lat, lon);
+        if (movedM >= TRAVEL_DISPLACEMENT_M) travelled = true;
+    }
+
+    if (travelled) {
         s_falseWakeCount = 0;
+        // Re-base: wherever it has stopped is what "parked" means from here.
+        if (fixTrusted) { s_refLat = lat; s_refLon = lon; s_haveRefFix = true; }
         if (g_motionThresholdMg != g_motionBaseMg) {
             // All the way down, not one rung: travel is proof the tracker should
             // be at its most sensitive, and the climb was built on evidence that
             // has just been contradicted outright.
-            Serial.printf("[Motion] Real travel at %.1f km/h -> threshold back to %umg\n",
-                          speedKmh, g_motionBaseMg);
+            if (movedM >= 0.0f) {
+                Serial.printf("[Motion] Real travel: %.0fm from reference -> threshold back to %umg\n",
+                              movedM, g_motionBaseMg);
+            } else {
+                Serial.printf("[Motion] Real travel at %.1f km/h -> threshold back to %umg\n",
+                              speedKmh, g_motionBaseMg);
+            }
             g_motionThresholdMg = g_motionBaseMg;
             saveMotionThreshold(g_motionThresholdMg);
             imuEnableMotionWake(g_motionThresholdMg);
         }
         return;
+    }
+
+    if (movedM >= 0.0f) {
+        Serial.printf("[Motion] %.0fm from reference (needs %.0fm) - not travel.\n",
+                      movedM, TRAVEL_DISPLACEMENT_M);
     }
 
     s_falseWakeCount++;
@@ -654,7 +760,7 @@ void goToSleep(bool got_fix, bool published) {
     enterDeepSleep(actual_interval);
 }
 // --- Custom CGNSINF Parser for SIM7080G ---
-bool parseCGNSINF(String raw, float* lat, float* lon, float* speed, float* alt, int* sats, float* hdop) {
+bool parseCGNSINF(String raw, float* lat, float* lon, float* speed, float* alt, int* sats, float* hdop, float* pdop) {
     // Expected: <run>,<fix>,<time>,<lat>,<lon>,<alt>,<speed>,<course>,<mode>,<reserved1>,<hdop>,<pdop>,<vdop>,<reserved2>,<sats_view>,<sats_used>,...
     // Raw Example: 1,,20260216002433.000,-28.025790,153.387616,-12.593,0.00,,1,,5.3,9.7,8.2,,5,,64.8,158.2
     
@@ -696,6 +802,10 @@ bool parseCGNSINF(String raw, float* lat, float* lon, float* speed, float* alt, 
     *alt = parts[5].toFloat();
     *speed = parts[6].toFloat();
     *hdop = parts[10].toFloat();
+    // Field 11. Verified against this modem's own output: a line reporting
+    // HDOP 1.8 / PDOP 2.0 / VDOP 1.0 satisfies PDOP^2 = HDOP^2 + VDOP^2 to
+    // within 0.06, as does 3.9 / 25.0 / 24.7. The layout is what it claims.
+    *pdop = parts[11].toFloat();
     
     // Sats Logic: Use 'Used' (15) if present, else 'In View' (14)
     if (parts[15].length() > 0) {
@@ -887,7 +997,7 @@ String getIMEIWithRetry() {
     return fallback;
 }
 
-bool getPreciseLocation(float* lat, float* lon, float* speed, float* alt, int* sats, float* hdop) {
+bool getPreciseLocation(float* lat, float* lon, float* speed, float* alt, int* sats, float* hdop, float* pdop) {
     Serial.println("[Lifecycle] Acquiring GPS Fix...");
     strip.setPixelColor(0, 255, 165, 0); // Orange
     strip.show();
@@ -904,14 +1014,21 @@ bool getPreciseLocation(float* lat, float* lon, float* speed, float* alt, int* s
             res.trim();
             Serial.printf("[GPS-RAW] [%s]\n", res.c_str());
             
-            float f_lat=0, f_lon=0, f_speed=0, f_alt=0, f_acc=0;
+            float f_lat=0, f_lon=0, f_speed=0, f_alt=0, f_acc=0, f_pdop=0;
             int f_sats=0;
             
-            if (parseCGNSINF(res, &f_lat, &f_lon, &f_speed, &f_alt, &f_sats, &f_acc)) {
-                Serial.printf("[GPS] Valid! Lat=%.4f Lon=%.4f Sats=%d HDOP=%.2f\n", f_lat, f_lon, f_sats, f_acc);
-                *lat = f_lat; *lon = f_lon; *speed = f_speed; *alt = f_alt; *sats = f_sats; *hdop = f_acc;
+            if (parseCGNSINF(res, &f_lat, &f_lon, &f_speed, &f_alt, &f_sats, &f_acc, &f_pdop)) {
+                Serial.printf("[GPS] Valid! Lat=%.4f Lon=%.4f Sats=%d HDOP=%.2f PDOP=%.2f\n", f_lat, f_lon, f_sats, f_acc, f_pdop);
+                *lat = f_lat; *lon = f_lon; *speed = f_speed; *alt = f_alt; *sats = f_sats; *hdop = f_acc; *pdop = f_pdop;
 
-                if (f_acc < 1.5 || (f_acc < 2.5 && f_sats >= 4)) {
+                // A DOP of 0 is the field being absent, not a perfect fix.
+                // It parses to 0.0 and sails through every "< 1.5" test here,
+                // so an unqualifiable fix used to lock instantly and then be
+                // published as the best kind there is. Unknown quality cannot
+                // clear a quality bar. The cost of refusing it is that such a
+                // fix keeps the acquisition loop running to its timeout and is
+                // then reported as no fix, which is the honest answer.
+                if (f_acc > 0.0f && (f_acc < 1.5f || (f_acc < 2.5f && f_sats >= 4))) {
                     locked = true;
                     break; 
                 }
@@ -1928,8 +2045,8 @@ void setup() {
         if (modem.waitResponse(800L, "+CGNSINF: ") == 1) {
             String res = modem.stream.readStringUntil('\n');
             res.trim();
-            float la, lo, sp, al, hd; int st;
-            if (parseCGNSINF(res, &la, &lo, &sp, &al, &st, &hd)) {
+            float la, lo, sp, al, hd, pd; int st;
+            if (parseCGNSINF(res, &la, &lo, &sp, &al, &st, &hd, &pd)) {
                 gpsKmh = sp; gpsSats = st; gpsHdop = hd;
             }
         }
@@ -1988,9 +2105,9 @@ void setup() {
         runBLEWindow(15000);
     }
     
-    float lat=0, lon=0, speed=0, alt=0, hdop=99; 
+    float lat=0, lon=0, speed=0, alt=0, hdop=99, pdop=99; 
     int sats=0;
-    bool has_fix = getPreciseLocation(&lat, &lon, &speed, &alt, &sats, &hdop);
+    bool has_fix = getPreciseLocation(&lat, &lon, &speed, &alt, &sats, &hdop, &pdop);
     
     modem.sendAT("+CGNSPWR=0");
     modem.waitResponse();
@@ -2004,7 +2121,7 @@ void setup() {
 
     // After the report, so a threshold change is decided on the same fix that
     // was just published and re-arms before this wake ends.
-    updateMotionThreshold(has_fix, speed);
+    updateMotionThreshold(has_fix, speed, lat, lon, pdop);
 
     goToSleep(has_fix, published);
 }
