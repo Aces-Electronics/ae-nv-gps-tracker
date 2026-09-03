@@ -25,6 +25,17 @@ static const uint8_t OTA_MUX = 1;
 // exchanges the transfer costs.
 static const size_t OTA_CHUNK = 1024;
 
+// How much of the image to ask for at a time, and how hard to try per slice.
+//
+// 32KB is a compromise: small enough that the modem's socket buffer is never
+// asked to hold more than it can while the UART drains it, large enough that a
+// 680KB image is ~21 requests rather than hundreds. Each slice is buffered
+// whole before being written to flash, because Update.write() cannot be rewound
+// -- a slice that fails half way has to be re-fetched, not resumed.
+static const size_t  OTA_SLICE          = 32768;
+static const uint8_t OTA_SLICE_ATTEMPTS = 3;
+
+
 // The modem UART is the bottleneck, and it is the reason downloads die.
 //
 // TinyGSM drains a socket byte at a time over this link. At 115200 baud that is
@@ -295,6 +306,91 @@ static TinyGsmClient* otaClient(TinyGsm& modem, bool https) {
     return plain;
 }
 
+// Fetches [start, start+want) into buf via a Range request.
+//
+// Returns the bytes read in got, and the image's full size in total (parsed
+// from Content-Range, so the caller learns it from the first slice and needs no
+// separate HEAD). A fresh connection per slice on purpose: it gives the modem a
+// clean socket each time and means a wedged one is abandoned rather than
+// carried into the next slice.
+static bool fetchSlice(TinyGsmClient* net, const OtaUrl& u,
+                       size_t start, size_t want,
+                       uint8_t* buf, size_t& got, long& total) {
+    got = 0;
+    net->setTimeout(2000);
+
+    if (!net->connect(u.host.c_str(), u.port, OTA_CONNECT_TIMEOUT_S)) {
+        Serial.println("[OTA] Connect failed.");
+        return false;
+    }
+
+    String req = "GET " + u.path + " HTTP/1.1\r\n";
+    req += "Host: " + u.host + "\r\n";
+    req += "User-Agent: ae-gps-tracker/";
+    req += FIRMWARE_VERSION;
+    req += "\r\n";
+    req += "Accept: application/octet-stream\r\n";
+    req += "Range: bytes=" + String((uint32_t)start) + "-" + String((uint32_t)(start + want - 1)) + "\r\n";
+    req += "Connection: close\r\n\r\n";
+    net->print(req);
+
+    String statusLine = net->readStringUntil('\n');
+    statusLine.trim();
+
+    // 206 is what a Range request should get. A 200 means the server ignored the
+    // header and is about to send the WHOLE image -- which is the very thing
+    // that overruns the modem, so it is refused rather than half-read.
+    if (statusLine.indexOf(" 206") < 0) {
+        Serial.printf("[OTA] Expected 206, got: %s\n", statusLine.c_str());
+        net->stop();
+        return false;
+    }
+
+    long sliceLen = -1;
+    while (net->connected() || net->available()) {
+        String line = net->readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) break;   // end of headers
+        String lower = line;
+        lower.toLowerCase();
+        if (lower.startsWith("content-length:")) {
+            sliceLen = line.substring(line.indexOf(':') + 1).toInt();
+        } else if (lower.startsWith("content-range:")) {
+            const int slash = line.lastIndexOf('/');
+            if (slash > 0) total = line.substring(slash + 1).toInt();
+        }
+    }
+
+    if (sliceLen <= 0 || (size_t)sliceLen > want) {
+        Serial.printf("[OTA] Bad slice length %ld (wanted %u)\n", sliceLen, (unsigned)want);
+        net->stop();
+        return false;
+    }
+
+    const uint32_t started  = millis();
+    uint32_t       lastData = millis();
+    while (got < (size_t)sliceLen) {
+        const int avail = net->available();
+        if (avail > 0) {
+            const size_t room = (size_t)sliceLen - got;
+            size_t take = (size_t)avail < room ? (size_t)avail : room;
+            const int n = net->read(buf + got, take);
+            if (n > 0) { got += n; lastData = millis(); }
+            continue;
+        }
+        if (!net->connected() && net->available() == 0) break;
+        if (millis() - lastData > OTA_STALL_TIMEOUT_MS) {
+            Serial.println("[OTA] Slice stalled.");
+            break;
+        }
+        if (millis() - started > OTA_TOTAL_TIMEOUT_MS) break;
+        delay(2);
+    }
+
+    net->stop();
+    return got == (size_t)sliceLen;
+}
+
 bool otaDownloadAndApply(TinyGsm& modem, const OtaCommand& cmd) {
     OtaUrl u;
     if (!parseUrl(cmd.url, u)) {
@@ -313,177 +409,115 @@ bool otaDownloadAndApply(TinyGsm& modem, const OtaCommand& cmd) {
     // The md5 from the MQTT command is what makes the image trustworthy, which
     // is why otaParseCommand() refuses a command without one.
     TinyGsmClient* net = otaClient(modem, u.https);
-    // Raise the UART BEFORE the socket is opened.
-    //
-    // Doing it after the connection was streaming hung the device outright: the
-    // modem already had data queued (+CAURC: buffer full arrives while the HTTP
-    // headers are still being parsed), and changing the rate mid-stream corrupts
-    // the framing. TinyGSM's modemRead() then waits up to setTimeout() PER BYTE
-    // -- ten seconds each, a thousand bytes a chunk -- so the transfer never
-    // returns and the stall check below never gets to run. Observed as seven
-    // minutes of complete silence after the switch.
-    //
-    // Nothing is in flight here, so the switch is safe.
+
+    // Raised before any socket exists. Doing it once a connection was streaming
+    // hung the device outright: the modem already had data queued, and changing
+    // the rate mid-stream corrupts the AT framing, after which TinyGSM waits
+    // setTimeout() PER BYTE for data that never comes.
     const bool fastBaud = otaSetBaud(modem, OTA_FAST_BAUD);
 
-    // Scope guard rather than a restore at the end.
-    //
-    // There are five early returns between here and the end of this function --
-    // connect failure, header failure, a bad content length, an Update.begin()
-    // failure -- and every one of them would otherwise leave the modem fast
-    // while the next boot opens Serial1 at 115200. modemPowerOn() can recover
-    // from that, but only after a reboot, and relying on remembering five exit
-    // paths is how the sixth one gets missed.
+    // Scope guard, not a restore at the end. There are several early returns
+    // below and each would otherwise leave the modem fast while the next boot
+    // opens Serial1 at 115200. modemPowerOn() can recover from that, but only
+    // after a reboot, and remembering every exit path is how one gets missed.
     struct BaudGuard {
         TinyGsm& modem;
         bool     active;
         ~BaudGuard() { if (active) otaSetBaud(modem, OTA_BASE_BAUD); }
     } baudGuard{modem, fastBaud};
 
-    // 2s, not 10. TinyGSM's modemRead() waits this long PER BYTE, so the socket
-    // timeout multiplies by the chunk size when a stream goes bad: at 10s and a
-    // 1024-byte chunk that is nearly three hours inside a single read() call,
-    // which is why the mid-stream baud switch presented as a total hang rather
-    // than as the stall the loop below is meant to catch. The stall and overall
-    // timeouts are only checked between chunks, so they cannot rescue a read
-    // that never returns.
+    // The image is taken in slices, not in one stream.
     //
-    // 2s is still ~180x the 11ms a 1024-byte chunk takes at 921600, so it is not
-    // tight for a slow link -- it just stops one bad chunk costing hours. The
-    // real fix is not corrupting the stream in the first place, above.
-    net->setTimeout(2000);
-
-    if (!net->connect(u.host.c_str(), u.port, OTA_CONNECT_TIMEOUT_S)) {
-        Serial.println("[OTA] Connect failed.");
+    // Served whole, 680KB arrives from the network far faster than the modem can
+    // hand it to the MCU over the UART. Its socket buffer overflows
+    // ("+CAURC: buffer full"), and the transfer dies part-way -- as a closed
+    // socket at 58% or a stall at 37%, depending on how it loses. Raising the
+    // UART from 11.5 to 21 KB/s helped and did not fix it, because the mismatch
+    // is between the network and the MODEM: TCP's window sits between the server
+    // and the modem's buffer, with this firmware behind it. Nothing the read
+    // loop does can slow the sender.
+    //
+    // A bounded Range request is the one place that backpressure can be applied.
+    // Each slice is a complete request whose size is chosen here, the modem
+    // drains between slices, and a slice that fails is retried on its own rather
+    // than costing the whole download.
+    uint8_t* slice = (uint8_t*)malloc(OTA_SLICE);
+    if (!slice) {
+        Serial.println("[OTA] Cannot allocate the slice buffer.");
         return false;
     }
+    struct SliceFree { uint8_t* p; ~SliceFree() { free(p); } } sliceFree{slice};
 
-    String req = "GET " + u.path + " HTTP/1.1\r\n";
-    req += "Host: " + u.host + "\r\n";
-    req += "User-Agent: ae-gps-tracker/";
-    req += FIRMWARE_VERSION;
-    req += "\r\n";
-    req += "Accept: application/octet-stream\r\n";
-    req += "Connection: close\r\n\r\n";
-    net->print(req);
-
-    String statusLine = net->readStringUntil('\n');
-    statusLine.trim();
-    Serial.printf("[OTA] %s\n", statusLine.c_str());
-    if (statusLine.indexOf(" 200") < 0) {
-        // Redirects are not followed on purpose. /api/ota/<file> answers 200
-        // directly; a 3xx here means the URL in the command is not the one the
-        // backend meant to hand out, and guessing at the target is how a device
-        // ends up flashing an error page.
-        Serial.println("[OTA] Server did not answer 200; aborting.");
-        net->stop();
-        return false;
-    }
-
-    long contentLength = -1;
-    while (net->connected() || net->available()) {
-        String line = net->readStringUntil('\n');
-        line.trim();
-        if (line.length() == 0) break;  // end of headers
-        String lower = line;
-        lower.toLowerCase();
-        if (lower.startsWith("content-length:")) {
-            contentLength = line.substring(line.indexOf(':') + 1).toInt();
-        }
-    }
-
-    if (contentLength <= 0) {
-        Serial.println("[OTA] No Content-Length; cannot size the write.");
-        net->stop();
-        return false;
-    }
-    Serial.printf("[OTA] Image is %ld bytes\n", contentLength);
-
-    // Repeated from otaShouldApply() rather than trusted: Update.begin() picks
-    // its own target with esp_ota_get_next_update_partition(NULL), which on a
-    // single-slot table hands back the running partition, and begin() does not
-    // check for that. Getting here with the wrong caller ordering would erase
-    // the running image, so the last thing before begin() confirms the target.
-    const esp_partition_t* target  = esp_ota_get_next_update_partition(NULL);
-    const esp_partition_t* current = esp_ota_get_running_partition();
-    if (target == NULL || current == NULL || target->address == current->address) {
-        Serial.println("[OTA] Refusing to write: the only app slot is the one we are running from.");
-        net->stop();
-        return false;
-    }
-
-    if (!Update.begin((size_t)contentLength, U_FLASH)) {
-        Serial.printf("[OTA] Update.begin failed: %s\n", Update.errorString());
-        net->stop();
-        return false;
-    }
-
-    // AFTER begin(), never before: begin() resets the expected digest
-    // (Updater.cpp sets _target_md5 = emptyString), so a setMD5() call made
-    // first is silently discarded and the image is written unverified.
-    Update.setMD5(cmd.md5.c_str());
-
-    uint8_t  buf[OTA_CHUNK];
+    long     contentLength = -1;   // learned from the first slice's Content-Range
     size_t   written  = 0;
     uint32_t started  = millis();
-    uint32_t lastData = millis();
-    uint32_t lastLog  = millis();
+    bool     begun    = false;
 
-    while (written < (size_t)contentLength) {
+    while (contentLength < 0 || written < (size_t)contentLength) {
         if (millis() - started > OTA_TOTAL_TIMEOUT_MS) {
             Serial.println("[OTA] Overall timeout.");
             break;
         }
 
-        int avail = net->available();
-        if (avail > 0) {
-            size_t want = (size_t)avail < OTA_CHUNK ? (size_t)avail : OTA_CHUNK;
-            size_t room = (size_t)contentLength - written;
-            if (want > room) want = room;
+        const size_t remaining = (contentLength < 0)
+                                   ? OTA_SLICE
+                                   : (size_t)contentLength - written;
+        const size_t want = remaining < OTA_SLICE ? remaining : OTA_SLICE;
 
-            int got = net->read(buf, want);
-            if (got > 0) {
-                if (Update.write(buf, got) != (size_t)got) {
-                    Serial.printf("[OTA] Flash write failed: %s\n", Update.errorString());
-                    break;
-                }
-                written += got;
-                lastData = millis();
-
-                // One line per 64 KB. The read loop runs thousands of times and
-                // this is on the same UART the modem debug uses.
-                if ((written % 65536) < (size_t)got) {
-                    // Rate matters more than progress here: a download that dies
-                    // at 58% did so because it could not keep up, and the only
-                    // way to know that from a log is to have measured it.
-                    const uint32_t ms = millis() - started;
-                    Serial.printf("[OTA] %u / %ld bytes  (%.1f KB/s avg)\n",
-                                  (unsigned)written, contentLength,
-                                  ms ? (written / 1024.0f) / (ms / 1000.0f) : 0.0f);
-                    lastLog = millis();
-                }
+        size_t got   = 0;
+        long   total = -1;
+        bool   ok    = false;
+        for (uint8_t attempt = 1; attempt <= OTA_SLICE_ATTEMPTS && !ok; attempt++) {
+            ok = fetchSlice(net, u, written, want, slice, got, total);
+            if (!ok) {
+                Serial.printf("[OTA] Slice at %u failed (attempt %u/%u)\n",
+                              (unsigned)written, attempt, OTA_SLICE_ATTEMPTS);
+                delay(1000);
             }
-            continue;
+        }
+        if (!ok) break;
+
+        if (contentLength < 0) {
+            if (total <= 0) {
+                Serial.println("[OTA] Server did not report a total size.");
+                break;
+            }
+            contentLength = total;
+            Serial.printf("[OTA] Image is %ld bytes, in %u-byte slices\n",
+                          contentLength, (unsigned)OTA_SLICE);
+
+            // Repeated from otaShouldApply() rather than trusted: Update.begin()
+            // picks its own target with esp_ota_get_next_update_partition(NULL),
+            // which on a single-slot table hands back the running partition, and
+            // begin() does not check for that.
+            const esp_partition_t* target  = esp_ota_get_next_update_partition(NULL);
+            const esp_partition_t* current = esp_ota_get_running_partition();
+            if (target == NULL || current == NULL || target->address == current->address) {
+                Serial.println("[OTA] Refusing to write: the only app slot is the one we are running from.");
+                break;
+            }
+            if (!Update.begin((size_t)contentLength, U_FLASH)) {
+                Serial.printf("[OTA] Update.begin failed: %s\n", Update.errorString());
+                break;
+            }
+            begun = true;
+            // AFTER begin(), never before: begin() resets the expected digest
+            // (Updater.cpp sets _target_md5 = emptyString), so a setMD5() made
+            // first is silently discarded and the image written unverified.
+            Update.setMD5(cmd.md5.c_str());
         }
 
-        if (!net->connected() && net->available() == 0) {
-            Serial.println("[OTA] Socket closed early.");
+        if (Update.write(slice, got) != got) {
+            Serial.printf("[OTA] Flash write failed: %s\n", Update.errorString());
             break;
         }
-        if (millis() - lastData > OTA_STALL_TIMEOUT_MS) {
-            Serial.println("[OTA] Stalled.");
-            break;
-        }
-        // 2ms rather than 20. The modem's socket buffer is filling from the
-        // network the whole time this loop is idle, so sleeping a fixed 20ms per
-        // empty poll spends exactly the headroom the transfer does not have.
-        delay(2);
+        written += got;
+
+        const uint32_t ms = millis() - started;
+        Serial.printf("[OTA] %u / %ld bytes  (%.1f KB/s)\n",
+                      (unsigned)written, contentLength,
+                      ms ? (written / 1024.0f) / (ms / 1000.0f) : 0.0f);
     }
-
-    net->stop();
-
-    // The base rate is restored by baudGuard's destructor on every path out of
-    // this function, including the early returns above.
 
     {
         const uint32_t ms = millis() - started;
@@ -491,7 +525,9 @@ bool otaDownloadAndApply(TinyGsm& modem, const OtaCommand& cmd) {
                       (unsigned)written, ms / 1000.0f,
                       ms ? (written / 1024.0f) / (ms / 1000.0f) : 0.0f);
     }
-    (void)lastLog;
+
+    if (!begun) return false;
+
 
     if (written != (size_t)contentLength) {
         Serial.printf("[OTA] Short read: %u of %ld bytes.\n", (unsigned)written, contentLength);
