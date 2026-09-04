@@ -77,6 +77,56 @@ static const uint32_t PARKED_INTERVAL_MINS   = PARKED_INTERVAL_MINS_OVERRIDE;
 OtaCommand g_otaCmd;
 bool g_otaPending = false;
 
+// --- Telemetry ------------------------------------------------------------
+//
+// One report, cut into sections. MQTT sends the lot; BLE sends one section per
+// characteristic, because a characteristic value stops at 512 bytes and a
+// verbose frame is about twice that. See buildTelemetry().
+static const uint8_t TLM_DEVICE   = 1 << 0;  // identity, firmware, uplink cadence
+static const uint8_t TLM_POSITION = 1 << 1;
+static const uint8_t TLM_POWER    = 1 << 2;
+static const uint8_t TLM_MOTION   = 1 << 3;  // wake reason, IMU, threshold ladder
+static const uint8_t TLM_ENGINE   = 1 << 4;  // CAN decodes off the ski's bus
+static const uint8_t TLM_ALL      = 0x1F;
+
+// The per-wake readings a report is built from. Everything else buildTelemetry()
+// needs it takes from globals, as the code it was extracted from did.
+//
+// These are passed in rather than sampled inside the builder because several of
+// them are expensive or have side effects -- powerReadSupplyRaw() briefly closes
+// the ski's supply switch -- and the BLE window samples them on a slower clock
+// than it redraws on.
+struct TelemetryInputs {
+    bool  has_fix = false;
+    float lat = 0, lon = 0, speed = 0, alt = 0, hdop = 0;
+    int   sats = 0;
+
+    ImuReading  imu;
+    PowerStatus power;
+
+    bool    haveSupply = false;
+    int16_t supplyRaw  = 0;
+
+    float batt_volts = 0;
+    float vbus_volts = 0;
+    int   soc_pct    = -1;   // -1 means no cell fitted, not an empty one
+
+    int   rssi_dbm   = -113; // dBm, converted from CSQ by the caller
+
+    // The stored consecutive-GPS-failure count, as next_wake_mins is derived
+    // from it. Passed in rather than read inside the builder because the builder
+    // runs once a second while the BLE window is open, and `prefs` is a single
+    // global object that the BLE settings callback also opens for writing -- from
+    // the NimBLE host task. Opening it on both would be two tasks sharing one
+    // handle, which is exactly the kind of fault that only shows up in the field.
+    unsigned int gps_fail_stored = 0;
+};
+
+void buildTelemetry(JsonDocument& doc, const TelemetryInputs& in,
+                    uint8_t sections, bool verbose);
+
+String getIMEIWithRetry();
+
 // CI passes the release number in as OTA_VERSION; a bench build has none. An
 // empty string is reported as-is rather than as a made-up number, because the
 // backend matches an OTA command against exactly this value and a placeholder
@@ -944,15 +994,90 @@ static void logGPSProgress(const char* tag, const String& raw) {
     Serial.printf("[GPS] %s Fix=%s SatsView=%s\n", tag, fix.c_str(), sv.c_str());
 }
 
-void pollGPSDiagnostic() {
+// One +CGNSINF poll, decoded rather than only logged.
+//
+// It used to parse the line, print it and throw the result away. That is the
+// whole reason the app's tracker screen showed nothing: the GPS and status
+// characteristics were created, advertised and subscribed to, and no code path
+// in this firmware ever wrote either of them, so the app displayed its own
+// defaults -- zeroes -- and looked like a tracker with no data rather than one
+// that was never asked.
+//
+// `out`, when given, receives whatever the line carries: a full fix if there is
+// one, and the satellites-in-view count either way.
+void pollGPSDiagnostic(TrackerStatus* out = nullptr) {
     modem.sendAT("+CGNSINF");
-    if (modem.waitResponse(1000L, "+CGNSINF: ") == 1) {
-        String res = modem.stream.readStringUntil('\n');
-        res.trim();
-        Serial.printf("[GPS-RAW] [%s]\n", res.c_str());
-        logGPSProgress("Background...", res);
+    if (modem.waitResponse(1000L, "+CGNSINF: ") != 1) return;
+
+    String res = modem.stream.readStringUntil('\n');
+    res.trim();
+    Serial.printf("[GPS-RAW] [%s]\n", res.c_str());
+    logGPSProgress("Background...", res);
+
+    if (!out) return;
+
+    // Read before the fix test, because it is the field that has something to
+    // say while the test is still failing.
+    out->sats_in_view = cgnsinfField(res, 14).toInt();
+
+    float lat = 0, lon = 0, speed = 0, alt = 0, hdop = 0, pdop = 0;
+    int sats = 0;
+    if (parseCGNSINF(res, &lat, &lon, &speed, &alt, &sats, &hdop, &pdop)) {
+        out->gps_fix = true;
+        out->lat   = lat;
+        out->lon   = lon;
+        out->speed = speed;
+        out->sats  = sats;
+        out->hdop  = hdop;
+    } else {
+        // Cleared rather than left stale. parseCGNSINF() also rejects the
+        // modem's "centre of Australia" placeholder, and holding the last
+        // accepted fix on screen after the modem has gone back to searching
+        // would present a position the device is no longer claiming.
+        out->gps_fix = false;
+        out->lat = out->lon = out->speed = out->hdop = 0;
+        out->sats = 0;
     }
 }
+
+// Publishes the whole report over BLE, one characteristic per section.
+//
+// Deliberately built from the same function the MQTT frame comes from, so the
+// app's debug screen cannot drift from what the device actually reports. A
+// field added to buildTelemetry() appears here without anything being changed.
+static void pushDiagnostics(const TelemetryInputs& tin) {
+    struct SectionMap { uint8_t section; DiagSection characteristic; };
+    static const SectionMap kMap[] = {
+        { TLM_DEVICE,   DiagSection::Device   },
+        { TLM_POSITION, DiagSection::Position },
+        { TLM_POWER,    DiagSection::Power    },
+        { TLM_MOTION,   DiagSection::Motion   },
+        { TLM_ENGINE,   DiagSection::Engine   },
+    };
+
+    for (const SectionMap& m : kMap) {
+        JsonDocument doc;
+        // Verbose unconditionally. settings.debug_payload decides what is worth
+        // paying for over the cellular link; it has nothing to say about what a
+        // phone already standing next to the ski may look at, and a debug screen
+        // that hides fields is not one.
+        buildTelemetry(doc, tin, m.section, true);
+        String json;
+        serializeJson(doc, json);
+        ble.updateDiagnostics(m.characteristic, json);
+    }
+}
+
+// How long a connected client can hold the config window open.
+//
+// The window's own duration is a timeout for nobody turning up; a client that
+// has turned up extends it for as long as it stays, because a settings screen
+// being read is not idle time. This is the ceiling on that extension, and it is
+// the reason the extension is safe: without it, a phone left connected in
+// somebody's pocket would hold a battery-powered tracker out of deep sleep
+// indefinitely, which is the one failure mode here that costs more than an
+// inconvenience.
+static const unsigned long BLE_WINDOW_MAX_MS = 5UL * 60UL * 1000UL;
 
 // The BLE window is the only way in to change settings, but on a scheduled wake
 // there is nobody standing there to use it -- and 15s of advertising is a large
@@ -1004,24 +1129,157 @@ void runBLEWindow(unsigned long duration_ms) {
     ble.begin(bleName, settings, PMU.getBattVoltage() / 1000.0, PMU.getBatteryPercent());
     Serial.println("[BLE] Advertising...");
 
+    const unsigned long opened = millis();
     unsigned long start = millis();
-    unsigned long last_gps_poll = 0;
+    unsigned long last_sample = 0;
+    bool was_connected = false;
+
+    // Carried across iterations so a push always sends the most recent reading
+    // of everything, not only of whatever was sampled this tick.
+    TrackerStatus snap;
+    TelemetryInputs tin;
+
+    // Read once, here, rather than on every push: it cannot change while this
+    // window is open, and `prefs` must not be opened from the loop -- see
+    // TelemetryInputs::gps_fail_stored.
+    prefs.begin("tracker", true);
+    tin.gps_fail_stored = prefs.getUInt("gps_fail", 0);
+    prefs.end();
+
+    // The IMU, charger and CAN bus are read on this slower clock; see the
+    // comment at the call site for why they cannot go on the redraw.
+    static const unsigned long SLOW_SAMPLE_PERIOD_MS = 30000;
+    unsigned long last_slow_sample = 0;
+
     strip.setPixelColor(0, 0, 0, 255); // Blue
     strip.show();
 
     while (millis() - start < duration_ms) {
         ble.loop();
+
+        const bool connected = ble.isConnected();
+
         if (digitalRead(0) == LOW) {
             Serial.println("[BLE] Boot Button Pressed - Extending Window!");
             start = millis(); // Reset timer if interact
         }
-        
-        if (millis() - last_gps_poll > 5000) {
-            pollGPSDiagnostic();
-            last_gps_poll = millis();
+
+        // A connected client holds the window open.
+        //
+        // Without this the window closed on its own schedule regardless: a
+        // connect, service discovery and a bond take a good part of 15 seconds
+        // between them, so the app was routinely disconnected mid-session by
+        // the device deinitialising BLE underneath it. The ceiling below is why
+        // this is safe to do -- see BLE_WINDOW_MAX_MS.
+        if (connected) {
+            if (!was_connected) {
+                Serial.println("[BLE] Client connected - holding the window open.");
+                // Push on this very iteration rather than waiting for the next
+                // tick. A phone finishes discovery and takes its initial read of
+                // every characteristic within about 800ms of connecting, and the
+                // sample clock can be most of a second from firing -- so it read
+                // back the "{}" these are seeded with, and the debug screen
+                // opened on "No diagnostics yet" for a device that was connected
+                // and had plenty to say. Measured, not theorised: every section
+                // came back empty on a fast reconnect.
+                last_sample = 0;
+            }
+            start = millis();
+            if (millis() - opened > BLE_WINDOW_MAX_MS) {
+                Serial.printf("[BLE] Window ceiling (%lus) reached with a client still "
+                              "connected - closing anyway.\n", BLE_WINDOW_MAX_MS / 1000);
+                break;
+            }
+        } else if (was_connected) {
+            Serial.println("[BLE] Client gone - window closes on schedule.");
+        }
+        was_connected = connected;
+
+        // Sample and push on one cadence. Every query here goes out over the
+        // same Serial1 the GPS poll uses, so giving them separate timers would
+        // only interleave AT round trips without making anything more current.
+        //
+        // 1Hz for somebody watching a screen; back to the old 5s when nobody
+        // is, where the poll exists only to keep the serial log moving.
+        if (millis() - last_sample > (connected ? 1000UL : 5000UL)) {
+            last_sample = millis();
+            pollGPSDiagnostic(&snap);
+
+            if (connected) {
+                const float batt = PMU.getBattVoltage() / 1000.0f;
+                const int   soc  = PMU.getBatteryPercent();
+
+                // CSQ as the modem reports it (0-31, 99 = unknown), NOT the dBm
+                // the MQTT frame carries. The app's signal formatter reads this
+                // field as CSQ, and converting here would show a healthy -70dBm
+                // link as "Unknown". The diagnostics frame gets the dBm, because
+                // that is what the same field means everywhere else.
+                const int csq = modem.getSignalQuality();
+
+                snap.battery_voltage = batt;
+                // -1 means no cell is fitted, not an empty one. Sent as 0
+                // rather than verbatim: the app has no reading for a negative
+                // percentage and would render it as "-1%", which looks like a
+                // measurement.
+                snap.battery_soc = soc < 0 ? 0 : soc;
+                snap.rssi = csq;
+                snap.gsm_status = "Net: " + String((int)modem.getRegistrationStatus());
+
+                ble.updateGps(snap);
+                ble.updateStatus(snap);
+
+                // The expensive readings, on their own clock. powerRead()
+                // spends ~700ms watching STAT for a blink, powerReadSupplyRaw()
+                // briefly closes the ski's supply switch to take its reading,
+                // and canReadEngine() listens for a second. On a 1Hz redraw
+                // those would between them eat the interval and chatter a FET
+                // at the user for as long as the screen stayed open. Sampled
+                // immediately on connect so the cards are not blank, then
+                // rarely.
+                if (last_slow_sample == 0 ||
+                    millis() - last_slow_sample > SLOW_SAMPLE_PERIOD_MS) {
+                    last_slow_sample = millis();
+
+                    // Identity. getIMEIWithRetry() rather than a single
+                    // getIMEI(): the bare call answers "OK" or nothing while the
+                    // modem is busy, which is most of this window -- GNSS is
+                    // running and being polled on the same UART. A single shot
+                    // was tried first and the diagnostics went out with an empty
+                    // mac and a model of "AE Tracker - ", once a second, retrying
+                    // forever against a UART the GPS poll needed.
+                    if (imei.length() == 0) imei = getIMEIWithRetry();
+
+                    tin.imu   = imuRead();
+                    tin.power = powerRead();
+
+                    bool supplyWasEnabled = false;
+                    tin.haveSupply = powerReadSupplyRaw(tin.supplyRaw, supplyWasEnabled);
+
+                    // Almost always a parked ski with a silent bus, which is
+                    // itself the answer the Engine card should show. canEnd()
+                    // afterwards puts the transceiver back in standby rather
+                    // than leaving it drawing current until the window closes.
+                    g_engine = canReadEngine(1000);
+                    canEnd();
+                }
+
+                tin.has_fix = snap.gps_fix;
+                tin.lat     = snap.lat;
+                tin.lon     = snap.lon;
+                tin.speed   = snap.speed;
+                tin.sats    = snap.sats;
+                tin.hdop    = snap.hdop;
+
+                tin.batt_volts = batt;
+                tin.vbus_volts = PMU.getVbusVoltage() / 1000.0f;
+                tin.soc_pct    = soc;
+                tin.rssi_dbm   = (csq == 99) ? -113 : (csq * 2) - 113;
+
+                pushDiagnostics(tin);
+            }
         }
 
-        if (ble.isConnected()) {
+        if (connected) {
              strip.setPixelColor(0, 0, 255, 255); // Cyan
         } else {
              // Blink Blue
@@ -1234,6 +1492,206 @@ static bool supplyRawToVolts(int16_t raw, float& volts) {
     return true;
 }
 
+// Everything a wake knows, gathered so it can be reported.
+//
+// Extracted from transmitData() so the MQTT frame and the BLE diagnostics
+// characteristics are built by one piece of code rather than by two lists that
+// agree right up until somebody adds a field to one of them. What the app's
+// debug screen shows is therefore what this device publishes, by construction,
+// and not a second opinion about it.
+//
+// The sections exist because a BLE characteristic value stops at 512 bytes and
+// a full verbose frame is roughly twice that. Every field belongs to exactly
+// one section, decided here, so a field added later cannot quietly fail to
+// reach BLE -- it has to be given a home. They are also the groups the app
+// draws, which is not a coincidence: they are the seams somebody reading the
+// screen already thinks along.
+void buildTelemetry(JsonDocument& doc, const TelemetryInputs& in,
+                    uint8_t sections, bool verbose) {
+    // `verbose` rather than settings.debug_payload directly, because the two
+    // callers mean different things by it. That setting decides what is worth
+    // paying for over the cellular link; it has no bearing on what a phone
+    // standing next to the ski is allowed to see, and the whole point of the
+    // debug screen is that it shows everything. So MQTT passes the setting and
+    // BLE passes true.
+    const bool dbg = verbose;
+
+    if (sections & TLM_DEVICE) {
+        doc["mac"] = imei;
+        // The key the worker reads for every other product
+        // (backend-worker/src/index.ts:2154). Nothing has ever set it here, which
+        // is why both enrolled trackers have an empty firmware_version column and
+        // why an OTA command aimed at one could never be resolved.
+        doc["fw_version"] = firmwareVersion();
+
+        String suffix = settings.name;
+        if (suffix.length() == 0) {
+            suffix = imei;
+            if (suffix.length() > 6) suffix = suffix.substring(suffix.length() - 6);
+        }
+        doc["model"] = "AE Tracker - " + suffix;
+
+        // Which frame this is. Published ALWAYS, and it is the single most
+        // important field here: without it a missing coolant_raw is
+        // ambiguous between "debug is off" and "the ski's bus was asleep",
+        // and the wrong one of those sends somebody out to the ski.
+        //
+        // It reports the SETTING, not this call's `verbose` -- a BLE frame is
+        // always verbose, and saying so would tell a reader nothing about how
+        // the tracker is configured to report when nobody is standing there.
+        doc["debug"] = settings.debug_payload;
+        if (g_cfgApplied) doc["cfg_applied"] = true;
+
+        doc["rssi"] = in.rssi_dbm;
+
+        doc["interval"] = settings.report_interval_mins;
+
+        // When the next frame is actually due -- the running interval above
+        // is only half the answer, and it is the half that misleads: a
+        // parked ski ignores it entirely. Recomputed from the same inputs
+        // goToSleep() will use rather than guessed.
+        //
+        // The failed-publish retry ladder in goToSleep() can shorten this,
+        // but only when the publish failed -- and then no frame arrives to
+        // carry the number, so what is delivered is always right.
+        const int gpsFails = in.has_fix ? 0 : ((int)in.gps_fail_stored + 1);
+        doc["next_wake_mins"] = sleepIntervalMins(g_engine.busAlive, in.has_fix, gpsFails);
+    }
+
+    if (sections & TLM_POSITION) {
+        // Absent rather than zero, on the same reasoning that keeps rpm
+        // out of a parked ski's report. lat/lon default to 0,0 when the
+        // acquisition times out, and 0,0 is not a null -- it is a real
+        // coordinate in the Gulf of Guinea that a map will plot without
+        // complaint, several thousand kilometres from anything this device
+        // will ever see. A report with no position should say so and let
+        // the backend keep the last known one, rather than assert a
+        // position that is wrong.
+        //
+        // The flag goes out either way, so "no fix this wake" is a fact the
+        // report carries rather than something inferred from missing keys.
+        doc["fix"] = in.has_fix;
+        if (in.has_fix) {
+            doc["lat"] = in.lat;
+            doc["lon"] = in.lon;
+            doc["speed"] = in.speed;
+            doc["sats"] = in.sats;
+            // Altitude and HDOP describe the quality of the fix rather than
+            // the fix. Kept for debug, where a suspect position needs them.
+            if (dbg) {
+                doc["alt"] = in.alt;
+                doc["hdop"] = in.hdop;
+            }
+        }
+    }
+
+    if (sections & TLM_POWER) {
+        doc["device_voltage"] = in.batt_volts;
+        if (dbg) {
+            // USB VBUS, not the ski's supply -- the divider cannot read the
+            // ski yet. Debug-only until it means what its name suggests.
+            doc["voltage"] = in.vbus_volts;
+            // Legacy alias for device_voltage. Nothing new should read it.
+            doc["battery_voltage"] = in.batt_volts;
+        }
+        // The AXP2101 keeps a fuel gauge and this reads it, but it answers
+        // -1 when isBatteryConnect() is false rather than failing. Publishing
+        // that verbatim put "-1%" on the dashboard, which reads as a
+        // measurement rather than as an absent battery -- and a tracker
+        // running from USB with no cell fitted is exactly the bench case
+        // where it happens.
+        if (in.soc_pct >= 0) doc["soc"] = in.soc_pct;
+
+        doc["charge_state"] = chargeStateName(in.power.state);
+        if (dbg) doc["supply_enabled"] = in.power.supplyEnabled;
+
+        // Ski supply, read through the daughter board's divider by the
+        // LIS3DH aux ADC. Published RAW, not as volts: ST does not document
+        // whether the ADC code is inverted, and the real ratio depends on
+        // resistor tolerance and on an input impedance ST does not specify,
+        // so a figure derived from the schematic would be a guess wearing a
+        // unit. Two bench readings at known voltages turn it into volts --
+        // supplyRawToVolts() emits supply_voltage only once they exist,
+        // and only when the result could describe a real 12V system -- an
+        // open feed extrapolates to a plausible-looking 9.2V otherwise.
+        //
+        // Always sent when it could be read, including on a debug-off frame:
+        // this is the field that the divider rework exists to produce, and a
+        // raw count nobody can see is not worth taking.
+        if (in.haveSupply) {
+            doc["supply_adc_raw"] = in.supplyRaw;
+            float supplyVolts;
+            if (supplyRawToVolts(in.supplyRaw, supplyVolts)) {
+                doc["supply_voltage"] = supplyVolts;
+            }
+        }
+    }
+
+    if (sections & TLM_MOTION) {
+        // Always emitted, "Unknown" included: the field has been in the
+        // documented payload all along, and a key that appears only on
+        // boards with a working IMU is harder for the backend to reason
+        // about than one that is always there.
+        doc["wake_reason"] = wakeReasonName();
+        if (dbg) doc["orientation"] = orientationName(in.imu.orientation);
+
+        // Vehicle frame, so the backend never has to know how the board is
+        // mounted. Two decimals is well inside what a +/-2g part resolves.
+        if (dbg && in.imu.valid) {
+            doc["accel_up"]   = roundf(in.imu.up   * 100) / 100.0f;
+            doc["accel_fwd"]  = roundf(in.imu.fwd  * 100) / 100.0f;
+            doc["accel_stbd"] = roundf(in.imu.stbd * 100) / 100.0f;
+        }
+
+        // Published so the adaptive logic can be seen working from the
+        // backend rather than only from a serial cable -- which is what the
+        // dbg gate that used to be here prevented, defeating the sentence
+        // above it. This board sat at 528mg on a 176mg floor for an hour and
+        // nothing in the cloud said so.
+        doc["motion_threshold_mg"] = g_motionThresholdMg;
+        // The setting, alongside where the ladder currently sits. Both are
+        // wanted: the first is what somebody chose, the second is what the
+        // ski decided, and a support question about false wakes needs to
+        // tell them apart.
+        doc["motion_sensitivity"] = motionSensitivityName(settings.motion_sensitivity);
+        // Wakes since the last report that were rate-limited away. Published
+        // because it is the one number that explains a tracker reporting
+        // often, or a battery going down faster than the interval suggests,
+        // and it is invisible from the reports themselves. Read before
+        // updateMotionThreshold() clears it -- transmitData() runs first.
+        // Exception to the debug rule: a non-zero count is the only thing that
+        // explains a tracker reporting more often than its interval or a
+        // battery going down faster than it should. Sending it when it is
+        // zero is what would be noise, so it goes out only when it is not.
+        if (dbg || s_suppressedWakes > 0) doc["motion_suppressed"] = s_suppressedWakes;
+    }
+
+    if (sections & TLM_ENGINE) {
+        // Engine data, only when the ski's bus was actually awake. Sending
+        // rpm=0 for a parked ski would be indistinguishable from a running
+        // engine at a standstill, so absent means absent.
+        doc["engine_bus"] = g_engine.busAlive;
+        doc["ski_running"] = g_engine.busAlive;
+        if (g_engine.rpmValid)  doc["rpm"] = g_engine.rpm;
+        // Raw because the scaling is genuinely unknown -- see
+        // docs/can/seadoo-can.md. Better an honest count than a fabricated
+        // temperature nobody can check.
+        // Engine hours ride in the normal frame. They are a confirmed decode,
+        // they change slowly, and they are the one engine number an owner
+        // actually wants between rides.
+        if (g_engine.hoursValid) doc["engine_minutes"] = g_engine.engineMinutes;
+
+        if (dbg) {
+            if (g_engine.tempValid) doc["engine_temp_raw"] = g_engine.tempRaw;
+            // Coolant is a confirmed signal but an unconfirmed scale, so it
+            // goes out raw for the same reason as above.
+            if (g_engine.coolantValid) doc["coolant_raw"] = g_engine.coolantRaw;
+            // Also a confirmed decode, so it goes out as the step number it is.
+            if (g_engine.trimValid) doc["ibr_trim"] = g_engine.trimPos;
+        }
+    }
+}
+
 bool transmitData(bool has_fix, float lat, float lon, float speed, float alt, int sats, float hdop) {
     bool published = false;
     Serial.println("[Lifecycle] Preparing Transmission...");
@@ -1334,176 +1792,31 @@ bool transmitData(bool has_fix, float lat, float lon, float speed, float alt, in
             }
 
             
-            JsonDocument doc;
-            doc["mac"] = imei;
-            // The key the worker reads for every other product
-            // (backend-worker/src/index.ts:2154). Nothing has ever set it here, which
-            // is why both enrolled trackers have an empty firmware_version column and
-            // why an OTA command aimed at one could never be resolved.
-            doc["fw_version"] = firmwareVersion();
-            
-            String suffix = settings.name;
-            if (suffix.length() == 0) {
-                suffix = imei;
-                if (suffix.length() > 6) suffix = suffix.substring(suffix.length() - 6);
-            }
-            doc["model"] = "AE Tracker - " + suffix;
-            
-            // Absent rather than zero, on the same reasoning that keeps rpm
-            // out of a parked ski's report. lat/lon default to 0,0 when the
-            // acquisition times out, and 0,0 is not a null -- it is a real
-            // coordinate in the Gulf of Guinea that a map will plot without
-            // complaint, several thousand kilometres from anything this device
-            // will ever see. A report with no position should say so and let
-            // the backend keep the last known one, rather than assert a
-            // position that is wrong.
-            //
-            // The flag goes out either way, so "no fix this wake" is a fact the
-            // report carries rather than something inferred from missing keys.
-            const bool dbg = settings.debug_payload;
-
-            doc["fix"] = has_fix;
-            if (has_fix) {
-                doc["lat"] = lat;
-                doc["lon"] = lon;
-                doc["speed"] = speed;
-                doc["sats"] = sats;
-                // Altitude and HDOP describe the quality of the fix rather than
-                // the fix. Kept for debug, where a suspect position needs them.
-                if (dbg) {
-                    doc["alt"] = alt;
-                    doc["hdop"] = hdop;
-                }
-            }
-
-            // Which frame this is. Published ALWAYS, and it is the single most
-            // important field here: without it a missing coolant_raw is
-            // ambiguous between "debug is off" and "the ski's bus was asleep",
-            // and the wrong one of those sends somebody out to the ski.
-            doc["debug"] = dbg;
-            if (g_cfgApplied) doc["cfg_applied"] = true;
-
-            doc["device_voltage"] = PMU.getBattVoltage() / 1000.0F;
-            if (dbg) {
-                // USB VBUS, not the ski's supply -- the divider cannot read the
-                // ski yet. Debug-only until it means what its name suggests.
-                doc["voltage"] = PMU.getVbusVoltage() / 1000.0F;
-                // Legacy alias for device_voltage. Nothing new should read it.
-                doc["battery_voltage"] = PMU.getBattVoltage() / 1000.0F;
-            }
-            // The AXP2101 keeps a fuel gauge and this reads it, but it answers
-            // -1 when isBatteryConnect() is false rather than failing. Publishing
-            // that verbatim put "-1%" on the dashboard, which reads as a
-            // measurement rather than as an absent battery -- and a tracker
-            // running from USB with no cell fitted is exactly the bench case
-            // where it happens.
-            const int socPct = PMU.getBatteryPercent();
-            if (socPct >= 0) doc["soc"] = socPct;
-
-            // Always emitted, "Unknown" included: the field has been in the
-            // documented payload all along, and a key that appears only on
-            // boards with a working IMU is harder for the backend to reason
-            // about than one that is always there.
-            doc["wake_reason"] = wakeReasonName();
-            doc["charge_state"] = chargeStateName(power.state);
-            if (dbg) {
-                doc["orientation"] = orientationName(imu.orientation);
-                doc["supply_enabled"] = power.supplyEnabled;
-            }
-
-            // Vehicle frame, so the backend never has to know how the board is
-            // mounted. Two decimals is well inside what a +/-2g part resolves.
-            if (dbg && imu.valid) {
-                doc["accel_up"]   = roundf(imu.up   * 100) / 100.0f;
-                doc["accel_fwd"]  = roundf(imu.fwd  * 100) / 100.0f;
-                doc["accel_stbd"] = roundf(imu.stbd * 100) / 100.0f;
-            }
-
-            // Engine data, only when the ski's bus was actually awake. Sending
-            // rpm=0 for a parked ski would be indistinguishable from a running
-            // engine at a standstill, so absent means absent.
-            doc["engine_bus"] = g_engine.busAlive;
-            doc["ski_running"] = g_engine.busAlive;
-            if (g_engine.rpmValid)  doc["rpm"] = g_engine.rpm;
-            // Raw because the scaling is genuinely unknown -- see
-            // docs/can/seadoo-can.md. Better an honest count than a fabricated
-            // temperature nobody can check.
-            // Engine hours ride in the normal frame. They are a confirmed decode,
-            // they change slowly, and they are the one engine number an owner
-            // actually wants between rides.
-            if (g_engine.hoursValid) doc["engine_minutes"] = g_engine.engineMinutes;
-
-            if (dbg) {
-                if (g_engine.tempValid) doc["engine_temp_raw"] = g_engine.tempRaw;
-                // Coolant is a confirmed signal but an unconfirmed scale, so it
-                // goes out raw for the same reason as above.
-                if (g_engine.coolantValid) doc["coolant_raw"] = g_engine.coolantRaw;
-                // Also a confirmed decode, so it goes out as the step number it is.
-                if (g_engine.trimValid) doc["ibr_trim"] = g_engine.trimPos;
-            }
-
-            // Published so the adaptive logic can be seen working from the
-            // backend rather than only from a serial cable -- which is what the
-            // dbg gate that used to be here prevented, defeating the sentence
-            // above it. This board sat at 528mg on a 176mg floor for an hour and
-            // nothing in the cloud said so.
-            doc["motion_threshold_mg"] = g_motionThresholdMg;
-            // The setting, alongside where the ladder currently sits. Both are
-            // wanted: the first is what somebody chose, the second is what the
-            // ski decided, and a support question about false wakes needs to
-            // tell them apart.
-            doc["motion_sensitivity"] = motionSensitivityName(settings.motion_sensitivity);
-            // Wakes since the last report that were rate-limited away. Published
-            // because it is the one number that explains a tracker reporting
-            // often, or a battery going down faster than the interval suggests,
-            // and it is invisible from the reports themselves. Read before
-            // updateMotionThreshold() clears it -- transmitData() runs first.
-            // Exception to the debug rule: a non-zero count is the only thing that
-            // explains a tracker reporting more often than its interval or a
-            // battery going down faster than it should. Sending it when it is
-            // zero is what would be noise, so it goes out only when it is not.
-            if (dbg || s_suppressedWakes > 0) doc["motion_suppressed"] = s_suppressedWakes;
-
-            // Ski supply, read through the daughter board's divider by the
-            // LIS3DH aux ADC. Published RAW, not as volts: ST does not document
-            // whether the ADC code is inverted, and the real ratio depends on
-            // resistor tolerance and on an input impedance ST does not specify,
-            // so a figure derived from the schematic would be a guess wearing a
-            // unit. Two bench readings at known voltages turn it into volts --
-            // supplyRawToVolts() emits supply_voltage only once they exist,
-            // and only when the result could describe a real 12V system -- an
-            // open feed extrapolates to a plausible-looking 9.2V otherwise.
-            //
-            // Always sent when it could be read, including on a debug-off frame:
-            // this is the field that the divider rework exists to produce, and a
-            // raw count nobody can see is not worth taking.
-            if (haveSupply) {
-                doc["supply_adc_raw"] = supplyRaw;
-                float supplyVolts;
-                if (supplyRawToVolts(supplyRaw, supplyVolts)) {
-                    doc["supply_voltage"] = supplyVolts;
-                }
-            }
+            TelemetryInputs tin;
+            tin.has_fix    = has_fix;
+            tin.lat        = lat;
+            tin.lon        = lon;
+            tin.speed      = speed;
+            tin.alt        = alt;
+            tin.sats       = sats;
+            tin.hdop       = hdop;
+            tin.imu        = imu;
+            tin.power      = power;
+            tin.haveSupply = haveSupply;
+            tin.supplyRaw  = supplyRaw;
+            tin.batt_volts = PMU.getBattVoltage() / 1000.0F;
+            tin.vbus_volts = PMU.getVbusVoltage() / 1000.0F;
+            tin.soc_pct    = PMU.getBatteryPercent();
 
             int csq = modem.getSignalQuality();
-            int dbm = (csq == 99) ? -113 : (csq * 2) - 113;
-            doc["rssi"] = dbm;
-            
-            doc["interval"] = settings.report_interval_mins;
+            tin.rssi_dbm = (csq == 99) ? -113 : (csq * 2) - 113;
 
-            // When the next frame is actually due -- the running interval above
-            // is only half the answer, and it is the half that misleads: a
-            // parked ski ignores it entirely. Recomputed from the same inputs
-            // goToSleep() will use rather than guessed.
-            //
-            // The failed-publish retry ladder in goToSleep() can shorten this,
-            // but only when the publish failed -- and then no frame arrives to
-            // carry the number, so what is delivered is always right.
             prefs.begin("tracker", true);
-            const int gpsFails = has_fix ? 0 : ((int)prefs.getUInt("gps_fail", 0) + 1);
+            tin.gps_fail_stored = prefs.getUInt("gps_fail", 0);
             prefs.end();
-            doc["next_wake_mins"] = sleepIntervalMins(g_engine.busAlive, has_fix, gpsFails);
-            
+
+            JsonDocument doc;
+            buildTelemetry(doc, tin, TLM_ALL, settings.debug_payload);            
             String payload;
             serializeJson(doc, payload);
             Serial.println("[MQTT] Publishing: " + payload);

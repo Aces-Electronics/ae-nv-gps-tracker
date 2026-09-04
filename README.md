@@ -18,7 +18,8 @@ LilyGo T-SIM7080G-S3 based GPS tracker with NB-IoT connectivity for the AE-NV ec
 - ✅ GPS tracking with satellite count and HDOP
 - ✅ NB-IoT connectivity via Telstra network
 - ✅ MQTT telemetry publishing to AE-NV backend
-- ✅ BLE configuration interface (15s window on cold boot)
+- ✅ BLE configuration and diagnostics (15s window on cold boot, held open
+  while a phone stays connected)
 - ✅ Orientation detection (Flat/Vertical/Upside Down) — needs the daughter
   board; reports `Unknown` without it
 - ✅ Configurable reporting intervals (1-60 minutes)
@@ -140,11 +141,91 @@ wants cutting before connecting to a real ski.
 
 ### Configuration
 
-The tracker can be configured via BLE during the 15-second window on cold boot:
+The tracker can be configured via BLE during the 15-second window on cold boot,
+or by holding the boot button through a reset. A connected client holds the
+window open for as long as it stays, up to a five-minute ceiling — 15 seconds
+is less than a connect, a service discovery and a look at the screen, so without
+that the app was routinely cut off mid-session by the device closing BLE
+underneath it. The ceiling is what stops a phone left connected in somebody's
+pocket from holding the tracker out of deep sleep indefinitely.
 
 - **Report Interval**: 1-60 minutes
 - **Home Location**: Set via web UI
 - **Admin Mode**: Forces 1-minute intervals for testing
+
+#### BLE characteristics
+
+Service `4fafc203-1fb5-459e-8fcc-c5c9c331914b`.
+
+| Characteristic | UUID suffix | Direction | Payload |
+| --- | --- | --- | --- |
+| GPS | `…2030` | read/notify | `lat,lon,speed,sats,hdop,sats_in_view,fix` |
+| Status | `…2031` | read/notify | `volts,soc,csq,Net: <creg>` |
+| Name | `…2040` | read/write | device name suffix |
+| Interval | `…2050` | read/write | uint32 LE, minutes |
+| Motion sensitivity | `…2051` | read/write | one byte, 0 Low / 1 Medium / 2 High |
+| Verbose telemetry | `…2052` | read/write | one byte, 0 off / non-zero on |
+| Diagnostics: Device | `…2060` | read/notify | JSON |
+| Diagnostics: Position | `…2061` | read/notify | JSON |
+| Diagnostics: Power | `…2062` | read/notify | JSON |
+| Diagnostics: Motion | `…2063` | read/notify | JSON |
+| Diagnostics: Engine | `…2064` | read/notify | JSON |
+| Pairing | `ACDC1234-…-1234567890CB` | read (encrypted) | trigger only |
+
+Plus APN (`ae000101-…`) and the MQTT broker/user/pass characteristics
+(`…2645`/`…2646`/`…2647`).
+
+#### Pairing and what is gated
+
+Bonding with MITM protection and Secure Connections, with a six-digit passkey
+derived from the last three bytes of the Wi-Fi base MAC — the same derivation
+every other AE product uses, and the same one the app displays.
+
+This was previously off: the source said `// Security DISABLED for verification`,
+which meant the PIN the app showed on the tracker screen was decoration. Nothing
+ever asked for it, and anyone within radio range during a config window could
+rewrite the APN, the broker and the MQTT credentials.
+
+What is gated, and what is not:
+
+- **Open** — the GPS and status characteristics. Someone close enough to read
+  these over BLE is close enough to see the ski, so gating them buys little, and
+  leaving them open means the app's basic screen works without a bond.
+- **Encrypted (`READ_ENC`)** — all five diagnostics sections.
+- **Encrypted (`WRITE_ENC`, and `READ_ENC` where readable)** — every
+  configuration characteristic: name, APN, broker, MQTT user and password,
+  interval, motion sensitivity, verbose telemetry.
+
+The app reads the pairing characteristic on connect purely to force the link to
+encrypt before it subscribes to anything — a subscribe on an encrypted
+characteristic across an unencrypted link fails, and it fails quietly. That read
+is service-agnostic in the app, so exposing the characteristic is all that was
+needed on this side.
+
+The device has no display, so the PIN comes from the app: it is shown against
+the device while it is being connected to (which is when the OS prompts for it)
+and on the tracker's own screen afterwards. It is also printed to the serial
+console on every connect.
+
+The GPS line's last two fields were appended to what was a five-field format,
+so an older app reads the first five and ignores the rest. `sats_in_view` is the
+number that moves during acquisition — `sats` counts the ones used in a fix and
+sits at zero until there is one, so a screen showing only that looks broken for
+two minutes and then works.
+
+The five diagnostics characteristics carry the whole telemetry report, section
+by section, refreshed once a second while a client is connected. They are built
+by `buildTelemetry()` — the same function that builds the MQTT frame — so what
+the app's debug screen shows is what the device publishes, by construction. They
+are sectioned because a BLE characteristic value stops at 512 bytes and a full
+verbose report is about twice that; `buildTelemetry()` decides which section each
+field belongs to, so a field added later has to be given a home rather than
+quietly failing to reach BLE.
+
+Unlike the MQTT frame, the diagnostics are **always verbose**. The
+`debug_payload` setting decides what is worth paying for over the cellular link;
+it has nothing to say about what a phone already standing next to the ski may
+look at.
 
 ## Debugging & Troubleshooting
 
@@ -233,7 +314,8 @@ The firmware uses robust satellite count parsing with fallback logic:
 ### Power Management
 
 - **Active Mode**: GPS acquisition + MQTT publish
-- **BLE Window**: 90 seconds on boot for configuration
+- **BLE Window**: 15 seconds on cold boot, extended while a client is
+  connected, to a five-minute ceiling
 - **Charge cutoff**: the jetski feed is cut above **4.10V** and restored below
   **3.70V**, decided at report time against the PMU's battery reading and
   latched across sleep in RTC memory.

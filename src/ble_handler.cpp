@@ -2,6 +2,14 @@
 #include <Arduino.h>
 #include "esp_mac.h"
 
+// Mirrors NimBLEServer.cpp's own guarded include: the short path only exists on
+// ESP-IDF component builds, and these are PlatformIO/Arduino builds.
+#if defined(CONFIG_NIMBLE_CPP_IDF)
+#include "services/gatt/ble_svc_gatt.h"
+#elif __has_include("nimble/nimble/host/services/gatt/include/services/gatt/ble_svc_gatt.h")
+#include "nimble/nimble/host/services/gatt/include/services/gatt/ble_svc_gatt.h"
+#endif
+
 // Correct UUIDs matching ae-ble-app/lib/models/tracker.dart
 const char* BLEHandler::SERVICE_UUID        = "4fafc203-1fb5-459e-8fcc-c5c9c331914b"; // Updated Service UUID
 
@@ -19,6 +27,28 @@ const char* BLEHandler::APN_CHAR_UUID       = "ae000101-1fb5-459e-8fcc-c5c9c3319
 const char* BLEHandler::INTERVAL_CHAR_UUID  = "beb5483e-36e1-4688-b7f5-ea07361b2050";
 const char* BLEHandler::MOTION_SENS_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b2051";
 const char* BLEHandler::DEBUG_PAYLOAD_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b2052";
+
+const char* BLEHandler::PAIRING_CHAR_UUID = "ACDC1234-5678-90AB-CDEF-1234567890CB";
+
+uint32_t generatePinFromMac() {
+    uint8_t mac[6];
+    // esp_read_mac rather than the BLE address: this reads the Wi-Fi base MAC,
+    // which is what the app derives its displayed PIN from. The BLE address is
+    // that value plus two in the last byte, so deriving from it would produce a
+    // PIN that never matches the one on screen.
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    const uint32_t val = ((uint32_t)mac[3] << 16) | ((uint32_t)mac[4] << 8) | mac[5];
+    return val % 1000000;
+}
+
+// Indexed by DiagSection, so the order here IS the enum's order.
+const char* BLEHandler::DIAG_CHAR_UUIDS[(size_t)DiagSection::Count] = {
+    "beb5483e-36e1-4688-b7f5-ea07361b2060", // Device
+    "beb5483e-36e1-4688-b7f5-ea07361b2061", // Position
+    "beb5483e-36e1-4688-b7f5-ea07361b2062", // Power
+    "beb5483e-36e1-4688-b7f5-ea07361b2063", // Motion
+    "beb5483e-36e1-4688-b7f5-ea07361b2064", // Engine
+};
 
 
 class TrackerBLECallbacks : public BLECharacteristicCallbacks {
@@ -97,6 +127,29 @@ public:
 
     void onConnect(BLEServer* pServer, ble_gap_conn_desc* desc) {
         Serial.printf("BLE client connected (ID: %d). Scheduling Params Update (Delayed)...\n", desc->conn_handle);
+        // Printed on every connect, including ones that reuse an existing bond.
+        // Worded explicitly because reading it as "pairing happened" made a bond
+        // that was working look like it was re-pairing every time.
+        Serial.printf("[BLE SEC] PIN (only needed if pairing): %06u\n",
+                      (unsigned)generatePinFromMac());
+
+        // Tell the client its cached attribute table may be stale.
+        //
+        // This firmware added six characteristics to the service -- five
+        // diagnostics sections and the pairing trigger -- and a phone that has
+        // connected to this tracker before may still be holding the old table.
+        // Without this it would discover neither the diagnostics it is meant to
+        // subscribe to nor the pairing characteristic that encrypts the link,
+        // and the failure would be silent: an empty debug screen and config
+        // writes that fail with an encryption error.
+        //
+        // Sent unconditionally rather than gated on a stored schema version the
+        // way the shunt does it. The shunt gates it because it is connected to
+        // constantly and a re-discovery on every connect is real cost; this
+        // radio is only up during a config window on a cold boot, so the
+        // bookkeeping would cost more than it saves.
+        Serial.println("[BLE] Indicating Service Changed (attribute table may be cached)");
+        ble_svc_gatt_changed(0x0001, 0xffff);
         if(pHandler) pHandler->scheduleConnParamsUpdate(desc->conn_handle);
     }
 
@@ -115,13 +168,27 @@ public:
 BLEHandler::BLEHandler() : pServer(nullptr), pService(nullptr), _settings(nullptr) {
     _pendingConnHandle = 0;
     _connTime = 0;
+    for (size_t i = 0; i < (size_t)DiagSection::Count; i++) pDiagChars[i] = nullptr;
+    pPairingChar = nullptr;
 }
 
 void BLEHandler::begin(const String& deviceName, TrackerSettings& settings, float batteryVoltage, int batterySoc) {
     _settings = &settings;
-    
-    // Security DISABLED for verification
-    
+
+    // Bonding, MITM and Secure Connections, with a passkey the device displays
+    // and the phone types. Matches every other AE product.
+    //
+    // This was previously off entirely -- the source said "Security DISABLED for
+    // verification" -- which meant the PIN the app printed on the tracker screen
+    // was decoration: nothing ever asked for it, and anyone within radio range
+    // during a config window could rewrite the APN, the broker and the MQTT
+    // credentials. DISPLAY_ONLY is what makes the phone prompt for it.
+    const uint32_t passkey = generatePinFromMac();
+    BLEDevice::setSecurityAuth(true, true, true);
+    BLEDevice::setSecurityPasskey(passkey);
+    BLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
+    Serial.printf("[BLE SEC] Pairing PIN: %06u\n", (unsigned)passkey);
+
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new ServerCallbacks(this));
     pService = pServer->createService(SERVICE_UUID);
@@ -137,53 +204,88 @@ void BLEHandler::begin(const String& deviceName, TrackerSettings& settings, floa
     pStatusChar = pService->createCharacteristic(STATUS_CHAR_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
     
     // Name (Read | Write)
-    pNameChar = pService->createCharacteristic(NAME_CHAR_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+    pNameChar = pService->createCharacteristic(NAME_CHAR_UUID,
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC |
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC);
     pNameChar->setCallbacks(cb);
     pNameChar->setValue(_settings->name.c_str());
 
     // Broker (Read | Write)
-    pBrokerChar = pService->createCharacteristic(BROKER_CHAR_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+    pBrokerChar = pService->createCharacteristic(BROKER_CHAR_UUID,
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC |
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC);
     pBrokerChar->setCallbacks(cb);
     pBrokerChar->setValue(_settings->mqtt_broker.c_str());
 
     // User (Read | Write)
-    pUserChar = pService->createCharacteristic(USER_CHAR_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+    pUserChar = pService->createCharacteristic(USER_CHAR_UUID,
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC |
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC);
     pUserChar->setCallbacks(cb);
     pUserChar->setValue(_settings->mqtt_user.c_str());
     
     // Pass (Write Only)
-    pPassChar = pService->createCharacteristic(PASS_CHAR_UUID, NIMBLE_PROPERTY::WRITE);
+    pPassChar = pService->createCharacteristic(PASS_CHAR_UUID,
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC);
     pPassChar->setCallbacks(cb);
     
     // WiFi SSID (Read | Write)
-    pWifiSsidChar = pService->createCharacteristic(WIFI_SSID_CHAR_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+    pWifiSsidChar = pService->createCharacteristic(WIFI_SSID_CHAR_UUID,
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC |
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC);
     pWifiSsidChar->setCallbacks(cb);
     pWifiSsidChar->setValue("N/A"); // Default
 
     // -- Custom/Legacy Characteristics --
 
     // APN (Read | Write) - Crucial for SIM7080G
-    pApnChar = pService->createCharacteristic(APN_CHAR_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+    pApnChar = pService->createCharacteristic(APN_CHAR_UUID,
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC |
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC);
     pApnChar->setCallbacks(cb);
     pApnChar->setValue(_settings->apn.c_str());
 
     // Interval (Read | Write)
-    pIntervalChar = pService->createCharacteristic(INTERVAL_CHAR_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+    pIntervalChar = pService->createCharacteristic(INTERVAL_CHAR_UUID,
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC |
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC);
     pIntervalChar->setCallbacks(cb);
     pIntervalChar->setValue((uint8_t*)&_settings->report_interval_mins, 4);
 
     // Motion sensitivity (Read | Write), one byte: 0 Low, 1 Medium, 2 High.
-    pMotionSensChar = pService->createCharacteristic(MOTION_SENS_CHAR_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+    pMotionSensChar = pService->createCharacteristic(MOTION_SENS_CHAR_UUID,
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC |
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC);
     pMotionSensChar->setCallbacks(cb);
     pMotionSensChar->setValue((uint8_t*)&_settings->motion_sensitivity, 1);
 
 
     // Debug payload (Read | Write), one byte: 0 essentials only, non-zero verbose.
-    pDebugPayloadChar = pService->createCharacteristic(DEBUG_PAYLOAD_CHAR_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+    pDebugPayloadChar = pService->createCharacteristic(DEBUG_PAYLOAD_CHAR_UUID,
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC |
+        NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_ENC);
     pDebugPayloadChar->setCallbacks(cb);
     {
         uint8_t dbg = _settings->debug_payload ? 1 : 0;
         pDebugPayloadChar->setValue(&dbg, 1);
+    }
+
+    // Pairing. Never read for its contents -- the app reads it on connect
+    // purely to force the link to encrypt before it subscribes to anything,
+    // because a subscribe on an encrypted characteristic across an unencrypted
+    // link fails, and it fails quietly.
+    pPairingChar = pService->createCharacteristic(
+        PAIRING_CHAR_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC);
+    pPairingChar->setValue("AE");
+
+    // Diagnostics. Seeded with an empty object rather than left unset: an
+    // unwritten characteristic reads back as zero bytes, which the app cannot
+    // tell from a device that has nothing to say, and "{}" parses.
+    for (size_t i = 0; i < (size_t)DiagSection::Count; i++) {
+        pDiagChars[i] = pService->createCharacteristic(
+            DIAG_CHAR_UUIDS[i],
+            NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::NOTIFY);
+        pDiagChars[i]->setValue("{}");
     }
 
     pService->start();
@@ -232,31 +334,57 @@ bool BLEHandler::isConnected() {
 }
 
 void BLEHandler::updateStatus(const TrackerStatus& status) {
-    if (pStatusChar) {
-        // App expects "volts,rssi,status" or now "volts,soc,rssi,status"
-        char buf[128]; 
-        snprintf(buf, sizeof(buf), "%.2f,%d,%d,%s", status.battery_voltage, status.battery_soc, status.rssi, status.gsm_status.c_str());
-        
-        size_t len = strlen(buf);
-        pStatusChar->setValue((uint8_t*)buf, len); 
-        pStatusChar->notify();
-    }
+    if (!pStatusChar) return;
+
+    // "volts,soc,rssi,status". The status field is last and is allowed to
+    // contain commas -- the app rejoins everything from the fourth field on --
+    // so nothing may be appended after it. Anything new goes in the diagnostics
+    // characteristic instead.
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%.2f,%d,%d,%s",
+             status.battery_voltage, status.battery_soc, status.rssi,
+             status.gsm_status.c_str());
+
+    pStatusChar->setValue((uint8_t*)buf, strlen(buf));
+    pStatusChar->notify();
 }
 
 void BLEHandler::updateGps(const TrackerStatus& status) {
-    if (pGpsChar) {
-        // App expects "lat,lng,speed,sats,hdop"
-        char buf[128];
-        snprintf(buf, sizeof(buf), "%.6f,%.6f,%.2f,%d,%.2f", status.lat, status.lon, status.speed, status.sats, status.hdop);
-        
-        size_t len = strlen(buf);
-        Serial.printf("[BLE-DEBUG] GPS Payload (%d bytes): %s [HEX: ", len, buf);
-        for(size_t i=0; i<len; i++) Serial.printf("%02X ", buf[i]);
-        Serial.println("]");
-        
-        pGpsChar->setValue((uint8_t*)buf, len); // Explicit length
-        pGpsChar->notify();
+    if (!pGpsChar) return;
+
+    // "lat,lon,speed,sats,hdop,sats_in_view,fix".
+    //
+    // The first five are the original contract and keep their meaning. The last
+    // two are appended rather than inserted so an app built against the old
+    // format is unaffected: it splits on commas and reads the first five, and
+    // extra fields fall off the end. Without them an unlocked tracker is
+    // indistinguishable from a broken one -- every field reads zero either way.
+    char buf[128];
+    snprintf(buf, sizeof(buf), "%.6f,%.6f,%.2f,%d,%.2f,%d,%d",
+             status.lat, status.lon, status.speed, status.sats, status.hdop,
+             status.sats_in_view, status.gps_fix ? 1 : 0);
+
+    pGpsChar->setValue((uint8_t*)buf, strlen(buf));
+    pGpsChar->notify();
+}
+
+void BLEHandler::updateDiagnostics(DiagSection section, const String& json) {
+    const size_t idx = (size_t)section;
+    if (idx >= (size_t)DiagSection::Count || !pDiagChars[idx]) return;
+
+    // 512 is the ceiling on an attribute value in the ATT spec, so this is the
+    // hard limit and not a tuning choice. Refused loudly rather than trimmed:
+    // buildTelemetry() splits the report into sections precisely so this cannot
+    // happen, and if it does the fix is to move a field, which needs somebody to
+    // know about it.
+    if (json.length() > 512) {
+        Serial.printf("[BLE] Diagnostics section %u is %u bytes, over the 512 limit - not sent.\n",
+                      (unsigned)idx, (unsigned)json.length());
+        pDiagChars[idx]->setValue("{\"error\":\"section too large\"}");
+    } else {
+        pDiagChars[idx]->setValue((uint8_t*)json.c_str(), json.length());
     }
+    pDiagChars[idx]->notify();
 }
 
 void BLEHandler::setSettingsCallback(std::function<void(const TrackerSettings&)> callback) {
