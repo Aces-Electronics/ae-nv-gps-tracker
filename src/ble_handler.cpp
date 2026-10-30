@@ -1,6 +1,7 @@
 #include "ble_handler.h"
 #include <Arduino.h>
 #include "esp_mac.h"
+#include "ble_pin.h"
 
 // Mirrors NimBLEServer.cpp's own guarded include: the short path only exists on
 // ESP-IDF component builds, and these are PlatformIO/Arduino builds.
@@ -32,13 +33,13 @@ const char* BLEHandler::PAIRING_CHAR_UUID = "ACDC1234-5678-90AB-CDEF-1234567890C
 
 uint32_t generatePinFromMac() {
     uint8_t mac[6];
-    // esp_read_mac rather than the BLE address: this reads the Wi-Fi base MAC,
-    // which is what the app derives its displayed PIN from. The BLE address is
-    // that value plus two in the last byte, so deriving from it would produce a
-    // PIN that never matches the one on screen.
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    const uint32_t val = ((uint32_t)mac[3] << 16) | ((uint32_t)mac[4] << 8) | mac[5];
-    return val % 1000000;
+    // The BLE address, the one a phone sees, not the Wi-Fi base MAC. The app derives the
+    // PIN it displays from that address minus two, so deriving from the same address is
+    // what makes the two agree. This used to read the base MAC on the belief that the BLE
+    // address is base + 2; on the ESP32-S3 with the Arduino 2.0.17 core it is base + 1, so
+    // the PIN on screen was one off from the passkey and pairing was refused. See ble_pin.h.
+    esp_read_mac(mac, ESP_MAC_BT);
+    return blePinFromBtMac(mac);
 }
 
 // Indexed by DiagSection, so the order here IS the enum's order.
