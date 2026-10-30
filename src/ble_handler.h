@@ -150,9 +150,10 @@ public:
     void scheduleConnParamsUpdate(uint16_t connHandle);
 };
 
-// The six-digit pairing PIN, derived from the last three bytes of the Wi-Fi
-// base MAC. The same derivation the app uses to display it, and the same one
-// every other AE product uses -- see MacUtils.generatePinFromMac.
+// The six-digit pairing PIN, derived from this device's BLE address minus two in the
+// last byte -- the same derivation the app uses to display it (MacUtils.generatePinFromMac
+// of getWifiMacFromBleMac). Not from the Wi-Fi base MAC: that only matches where Bluetooth
+// is base + 2, and on the ESP32-S3 it is base + 1. See ble_pin.h.
 uint32_t generatePinFromMac();
 
 #endif
